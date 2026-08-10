@@ -95,10 +95,8 @@ class DrawingClient:
         network_retry_count = 0
         last_error_msg = None
 
-        while (
-            exception_retry_count <= output_exception_retries
-            and network_retry_count <= max_retries
-        ):
+        # 首次尝试 + 最多 max_retries 次网络重试，异常重试独立计数
+        while True:
             try:
                 if api_protocol == "images":
                     result = await self._call_images_api(prompt, images_data)
@@ -127,13 +125,15 @@ class DrawingClient:
                     kw in last_error_msg for kw in exception_keywords if kw
                 )
                 if is_exception:
-                    exception_retry_count += 1
-                    if exception_retry_count <= output_exception_retries:
+                    if exception_retry_count < output_exception_retries:
+                        exception_retry_count += 1
                         logger.info(
                             f"[Comic] 命中异常关键词，开始第 {exception_retry_count} 次内容重试..."
                         )
                         await asyncio.sleep(retry_delay)
                         continue
+                    # 内容重试耗尽
+                    break
                 else:
                     status_match = re.search(r"HTTP (\d{3})", last_error_msg)
                     status_code = int(status_match.group(1)) if status_match else None
@@ -144,13 +144,15 @@ class DrawingClient:
                     )
                     if not is_retryable_network_error:
                         break
-                    network_retry_count += 1
-                    if network_retry_count <= max_retries:
+                    if network_retry_count < max_retries:
+                        network_retry_count += 1
                         logger.info(
                             f"[Comic] 网络或服务报错，开始第 {network_retry_count} 次网络重试..."
                         )
                         await asyncio.sleep(retry_delay)
                         continue
+                    # 网络重试耗尽
+                    break
 
         logger.error("[Comic] 画图重试次数耗尽或请求失败，任务终止。")
         return None, last_error_msg
