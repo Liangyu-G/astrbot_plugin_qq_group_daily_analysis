@@ -886,8 +886,6 @@ class GroupDailyAnalysis(Star):
             if self._terminating:
                 return
             try:
-                import base64
-
                 comic_bytes = await self.comic_service.generate_comic(
                     topics, group_id, umo
                 )
@@ -895,8 +893,14 @@ class GroupDailyAnalysis(Star):
                     logger.info(f"群 {group_id} 漫画生成成功，准备发送和上传相册...")
                     import time
 
-                    output_format = self.config_manager.get_drawing_output_format().lower()
-                    ext = ".jpg" if output_format in {"jpg", "jpeg"} else f".{output_format}"
+                    output_format = (
+                        self.config_manager.get_drawing_output_format().lower()
+                    )
+                    ext = (
+                        ".jpg"
+                        if output_format in {"jpg", "jpeg"}
+                        else f".{output_format}"
+                    )
 
                     comic_dir = StarTools.get_data_dir(PLUGIN_NAME) / "comic_cache"
                     comic_dir.mkdir(parents=True, exist_ok=True)

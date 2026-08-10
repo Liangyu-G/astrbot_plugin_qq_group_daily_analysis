@@ -43,9 +43,7 @@ class ComicApplicationService:
         logger.info(f"[Comic] 开始为群 {group_id} 生成每日漫画...")
 
         # 1. 提取分镜和金句
-        storyboards, _ = await self.llm_analyzer.analyze_comic_storyboards(
-            topics, umo
-        )
+        storyboards, _ = await self.llm_analyzer.analyze_comic_storyboards(topics, umo)
 
         if not storyboards:
             logger.warning(
