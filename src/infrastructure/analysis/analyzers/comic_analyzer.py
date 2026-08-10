@@ -134,13 +134,7 @@ class ComicStoryboardAnalyzer(BaseAnalyzer[dict, list[dict]]):
                 if len(storyboards) > 0 and isinstance(storyboards[0], dict):
                     if "storyboards" in storyboards[0]:
                         storyboards = storyboards[0]["storyboards"]
-                    elif "scene" in storyboards[0]:
-                        pass  # This is correct
-            elif isinstance(storyboards, dict):
-                if "storyboards" in storyboards:
-                    storyboards = storyboards["storyboards"]
-                elif "scene" in storyboards:
-                    storyboards = [storyboards]
+                    # else: storyboards[0] 已含 "scene"，直接使用
 
         if isinstance(storyboards, list):
             return [item for item in storyboards if isinstance(item, dict)], usage

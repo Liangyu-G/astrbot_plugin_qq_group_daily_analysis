@@ -154,7 +154,7 @@ class DrawingClient:
                     # 网络重试耗尽
                     break
 
-        logger.error("[Comic] 画图重试次数耗尽或请求失败，任务终止。")
+        logger.debug("[Comic] 画图重试次数耗尽或请求失败，任务终止。")
         return None, last_error_msg
 
     async def _call_images_api(
@@ -224,7 +224,8 @@ class DrawingClient:
                 f"(model={model}, size={resolved_size}, aspect_ratio={ar}, "
                 f"reference_bytes={len(img_bytes)})..."
             )
-            async with httpx.AsyncClient(timeout=timeout) as client:
+            api_timeout = httpx.Timeout(connect=20.0, read=timeout, write=20.0, pool=20.0)
+            async with httpx.AsyncClient(timeout=api_timeout) as client:
                 resp = await client.post(
                     target_url, headers=headers, data=multipart_data, files=files
                 )
@@ -232,7 +233,8 @@ class DrawingClient:
             logger.info(
                 f"[Comic] 发起 Images API 请求 -> {target_url} (model={model}, size={resolved_size}, aspect_ratio={ar})..."
             )
-            async with httpx.AsyncClient(timeout=timeout) as client:
+            api_timeout = httpx.Timeout(connect=20.0, read=timeout, write=20.0, pool=20.0)
+            async with httpx.AsyncClient(timeout=api_timeout) as client:
                 resp = await client.post(target_url, headers=headers, json=payload)
 
         if resp.status_code != 200:
@@ -301,7 +303,8 @@ class DrawingClient:
             f"(model={model}, aspect_ratio={aspect_ratio}, "
             f"reference_bytes={reference_bytes})..."
         )
-        async with httpx.AsyncClient(timeout=timeout) as client:
+        api_timeout = httpx.Timeout(connect=20.0, read=timeout, write=20.0, pool=20.0)
+        async with httpx.AsyncClient(timeout=api_timeout) as client:
             resp = await client.post(target_url, headers=headers, json=payload)
 
         if not 200 <= resp.status_code < 300:
@@ -406,7 +409,8 @@ class DrawingClient:
             f"(model={model}, image_size={image_size}, "
             f"aspect_ratio={aspect_ratio}, reference_bytes={reference_bytes})..."
         )
-        async with httpx.AsyncClient(timeout=timeout) as client:
+        api_timeout = httpx.Timeout(connect=20.0, read=timeout, write=20.0, pool=20.0)
+        async with httpx.AsyncClient(timeout=api_timeout) as client:
             resp = await client.post(target_url, headers=headers, json=payload)
 
         if not 200 <= resp.status_code < 300:
@@ -512,7 +516,8 @@ class DrawingClient:
             f"[Comic] 发起 Chat API 请求 -> {target_url} (model={model}, size={resolved_size}, aspect_ratio={ar})..."
         )
 
-        async with httpx.AsyncClient(timeout=timeout) as client:
+        api_timeout = httpx.Timeout(connect=20.0, read=timeout, write=20.0, pool=20.0)
+        async with httpx.AsyncClient(timeout=api_timeout) as client:
             resp = await client.post(target_url, headers=headers, json=payload)
 
             if resp.status_code != 200:

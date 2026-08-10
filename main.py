@@ -519,14 +519,18 @@ class GroupDailyAnalysis(Star):
                 try:
                     if is_comic:
                         album_name = self.config_manager.get_comic_album_name()
+                        # 漫画相册与报告相册共用同一个 strict_mode 配置，
+                        # 若日后需要独立控制，可为漫画单独添加配置项。
+                        strict_mode = self.config_manager.get_group_album_strict_mode()
                     else:
                         album_name = self.config_manager.get_group_album_name()
-                    strict_mode = self.config_manager.get_group_album_strict_mode()
+                        strict_mode = self.config_manager.get_group_album_strict_mode()
 
+                    upload_label = "漫画相册" if is_comic else "群相册"
                     # 严格模式下，名称为空时提前拦截，不再依赖适配器判断
                     if strict_mode and not album_name:
                         logger.info(
-                            f"群相册严格模式开启：未设置目标相册名称，停止上传以防止操作群 {group_id} 的默认相册。"
+                            f"{upload_label}严格模式开启：未设置目标相册名称，停止上传以防止操作群 {group_id} 的默认相册。"
                         )
                     elif hasattr(adapter, "upload_group_album"):
                         # 查找和兜底逻辑统一由适配器处理：
@@ -829,7 +833,13 @@ class GroupDailyAnalysis(Star):
         topics = analysis_result.get("topics", [])
         statistics = analysis_result.get("statistics")
         if not topics and statistics:
-            topics = getattr(statistics, "topics", [])
+            raw = getattr(statistics, "topics", [])
+            # statistics.topics 可能是 domain 对象列表，统一转为 dict
+            topics = [
+                t if isinstance(t, dict)
+                else {"topic": getattr(t, "topic", ""), "detail": getattr(t, "detail", "")}
+                for t in (raw if isinstance(raw, list) else [])
+            ]
 
         if topics:
             comic_topics = []
@@ -911,10 +921,10 @@ class GroupDailyAnalysis(Star):
                     with open(comic_file_path, "wb") as f:
                         f.write(comic_bytes)
 
-                    if self._terminating:
-                        return
-
                     try:
+                        if self._terminating:
+                            return
+
                         # 发送图片到群聊
                         adapter = self.bot_manager.get_adapter(platform_id)
                         if adapter and hasattr(adapter, "send_image"):

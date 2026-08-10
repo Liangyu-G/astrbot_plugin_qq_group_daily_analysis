@@ -119,7 +119,8 @@ class ComicApplicationService:
         try:
             path_str = path_or_url.strip()
             if path_str.startswith("http://") or path_str.startswith("https://"):
-                async with httpx.AsyncClient(timeout=30.0) as client:
+                proxy = self.config_manager.get_drawing_download_proxy() or None
+                async with httpx.AsyncClient(timeout=30.0, proxy=proxy) as client:
                     resp = await client.get(path_str)
                     resp.raise_for_status()
                     content_type = resp.headers.get("Content-Type", "")
