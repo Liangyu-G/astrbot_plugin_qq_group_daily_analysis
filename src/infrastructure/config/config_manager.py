@@ -281,6 +281,10 @@ class ConfigManager:
         """获取金句分析专用 Provider ID"""
         return self._get_group("llm").get("golden_quote_provider_id", "")
 
+    def get_quality_provider_id(self) -> str:
+        """获取聊天质量分析专用 Provider ID"""
+        return self._get_group("llm").get("quality_provider_id", "")
+
     def get_keep_original_persona(self) -> bool:
         """获取是否继承会话原始人格设定"""
         return self._get_group("analysis_features").get("keep_original_persona", False)
@@ -394,6 +398,7 @@ class ConfigManager:
             "topic_analysis_prompts",
             "user_title_analysis_prompts",
             "golden_quote_analysis_prompts",
+            "comic_analysis_prompts",
         ):
             target_group = self._get_group("prompts").get(group, {})
         else:
@@ -440,6 +445,11 @@ class ConfigManager:
             "golden_quote_analysis_prompts",
             "golden_quote_v2_prompt",
             self.set_golden_quote_analysis_prompt,
+        )
+        modified |= self._upgrade_config_item(
+            "comic_analysis_prompts",
+            "comic_storyboard_prompt",
+            self.set_comic_storyboard_prompt,
         )
 
         # 2. 文件名格式升级
@@ -507,6 +517,14 @@ class ConfigManager:
         if "golden_quote_analysis_prompts" not in prompts:
             prompts["golden_quote_analysis_prompts"] = {}
         prompts["golden_quote_analysis_prompts"]["golden_quote_v2_prompt"] = prompt
+        self.config.save_config()
+
+    def set_comic_storyboard_prompt(self, prompt: str):
+        """设置漫画场景分析提示词模板"""
+        prompts = self._ensure_group("prompts")
+        if "comic_analysis_prompts" not in prompts:
+            prompts["comic_analysis_prompts"] = {}
+        prompts["comic_analysis_prompts"]["comic_storyboard_prompt"] = prompt
         self.config.save_config()
 
     def set_output_format(self, format_types: str | list[str]):
@@ -798,10 +816,21 @@ class ConfigManager:
         self._ensure_group("incremental")["incremental_report_immediately"] = enabled
         self.config.save_config()
 
+    def get_incremental_interval_minutes(self) -> int:
+        """获取增量分析间隔（分钟）"""
+        return self._get_group("incremental").get("incremental_interval_minutes", 120)
+
+    def get_incremental_max_daily_analyses(self) -> int:
+        """获取每天最大增量分析次数"""
+        return self._get_group("incremental").get("incremental_max_daily_analyses", 8)
+
+    def get_incremental_safe_limit(self) -> int:
+        """获取单次增量分析的安全分析/同步上限 (Safe Count)"""
+        return self._get_group("incremental").get("incremental_safe_limit", 2000)
+
     def get_incremental_min_messages(self) -> int:
         """获取触发增量分析的最小消息数阈值"""
-        value = self._get_group("incremental").get("incremental_min_messages", 300)
-        return max(1, int(value))
+        return self._get_group("incremental").get("incremental_min_messages", 20)
 
     def get_incremental_topics_per_batch(self) -> int:
         """获取单次增量分析提取的最大话题数"""
@@ -810,6 +839,112 @@ class ConfigManager:
     def get_incremental_quotes_per_batch(self) -> int:
         """获取单次增量分析提取的最大金句数"""
         return self._get_group("incremental").get("incremental_quotes_per_batch", 3)
+
+    def get_incremental_active_start_hour(self) -> int:
+        """获取增量分析活跃时段起始小时（24小时制）"""
+        return self._get_group("incremental").get("incremental_active_start_hour", 8)
+
+    def get_incremental_active_end_hour(self) -> int:
+        """获取增量分析活跃时段结束小时（24小时制）"""
+        return self._get_group("incremental").get("incremental_active_end_hour", 23)
+
+    def get_incremental_stagger_seconds(self) -> int:
+        """获取多群增量分析的交错间隔（秒），避免 API 压力"""
+        return self._get_group("incremental").get("incremental_stagger_seconds", 30)
+
+    # ========== 每日群漫画配置 ==========
+
+    def get_enable_daily_comic(self) -> bool:
+        """获取是否开启每日群漫画功能"""
+        return self._get_group("daily_comic").get("enable_daily_comic", False)
+
+    def get_drawing_api_url(self) -> str:
+        """获取绘图 API 地址，空值由所选协议补全默认地址。"""
+        return self._get_group("daily_comic").get("drawing_api_url", "")
+
+    def get_drawing_api_key(self) -> str:
+        """获取绘图API Key"""
+        return self._get_group("daily_comic").get("drawing_api_key", "")
+
+    def get_drawing_model(self) -> str:
+        group = self._get_group("daily_comic")
+        return group.get("drawing_model", "gpt-image-2")
+
+    def get_drawing_api_protocol(self) -> str:
+        group = self._get_group("daily_comic")
+        return group.get("drawing_api_protocol", "images")
+
+    def get_drawing_output_exception_retries(self) -> int:
+        group = self._get_group("daily_comic")
+        return int(group.get("drawing_output_exception_retries", 3))
+
+    def get_drawing_output_exception_retry_keywords(self) -> list[str]:
+        group = self._get_group("daily_comic")
+        keywords = group.get("drawing_output_exception_retry_keywords", [])
+        if not isinstance(keywords, list):
+            keywords = []
+        return [str(k) for k in keywords if str(k).strip()]
+
+    def get_drawing_retry_delay(self) -> int:
+        group = self._get_group("daily_comic")
+        return int(group.get("drawing_retry_delay", 2))
+
+    def get_drawing_network_retries(self) -> int:
+        group = self._get_group("daily_comic")
+        return int(group.get("drawing_network_retries", 2))
+
+    def get_drawing_download_proxy(self) -> str:
+        group = self._get_group("daily_comic")
+        return group.get("drawing_download_proxy", "").strip()
+
+    def get_drawing_image_size(self) -> str:
+        group = self._get_group("daily_comic")
+        return group.get("drawing_image_size", "1024x1024")
+
+    def get_drawing_aspect_ratio(self) -> str:
+        return self._get_group("daily_comic").get("drawing_aspect_ratio", "16:9")
+
+    def get_drawing_image_quality(self) -> str:
+        group = self._get_group("daily_comic")
+        return group.get("drawing_image_quality", "high")
+
+    def get_drawing_background(self) -> str:
+        return self._get_group("daily_comic").get("drawing_background", "auto")
+
+    def get_drawing_output_format(self) -> str:
+        return self._get_group("daily_comic").get("drawing_output_format", "png")
+
+    def get_drawing_timeout(self) -> int:
+        return int(self._get_group("daily_comic").get("drawing_timeout", 600))
+
+    def get_enable_comic_album_upload(self) -> bool:
+        group = self._get_group("qq_group_upload")
+        return bool(group.get("enable_comic_album_upload", False))
+
+    def get_comic_album_name(self) -> str:
+        return str(
+            self._get_group("qq_group_upload").get("comic_album_name", "daily_analysis")
+        ).strip()
+
+    def get_drawing_reference_image(self) -> str:
+        return str(
+            self._get_group("daily_comic").get("drawing_reference_image", "")
+        ).strip()
+
+    def get_comic_storyboard_prompt(
+        self, style: str = "comic_storyboard_prompt"
+    ) -> str:
+        """获取分镜生成提示词模板"""
+        val = self._get_group("daily_comic").get("comic_storyboard_prompt", "")
+        if val:
+            return val
+        prompts_config = self._get_group("prompts").get("comic_analysis_prompts", {})
+        return prompts_config.get(style, "")
+
+    def get_comic_drawing_prompt(self, style: str = "comic_drawing_prompt") -> str:
+        """获取绘画提示词生成模板"""
+        prompts_config = self._get_group("prompts").get("comic_analysis_prompts", {})
+        return prompts_config.get(style, "")
 
     def save_config(self):
         """保存配置到AstrBot配置系统"""
