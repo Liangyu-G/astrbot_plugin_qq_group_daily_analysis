@@ -224,7 +224,9 @@ class DrawingClient:
                 f"(model={model}, size={resolved_size}, aspect_ratio={ar}, "
                 f"reference_bytes={len(img_bytes)})..."
             )
-            api_timeout = httpx.Timeout(connect=20.0, read=timeout, write=20.0, pool=20.0)
+            api_timeout = httpx.Timeout(
+                connect=20.0, read=timeout, write=20.0, pool=20.0
+            )
             async with httpx.AsyncClient(timeout=api_timeout) as client:
                 resp = await client.post(
                     target_url, headers=headers, data=multipart_data, files=files
@@ -233,7 +235,9 @@ class DrawingClient:
             logger.info(
                 f"[Comic] 发起 Images API 请求 -> {target_url} (model={model}, size={resolved_size}, aspect_ratio={ar})..."
             )
-            api_timeout = httpx.Timeout(connect=20.0, read=timeout, write=20.0, pool=20.0)
+            api_timeout = httpx.Timeout(
+                connect=20.0, read=timeout, write=20.0, pool=20.0
+            )
             async with httpx.AsyncClient(timeout=api_timeout) as client:
                 resp = await client.post(target_url, headers=headers, json=payload)
 

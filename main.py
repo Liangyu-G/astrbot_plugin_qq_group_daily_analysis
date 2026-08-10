@@ -836,8 +836,12 @@ class GroupDailyAnalysis(Star):
             raw = getattr(statistics, "topics", [])
             # statistics.topics 可能是 domain 对象列表，统一转为 dict
             topics = [
-                t if isinstance(t, dict)
-                else {"topic": getattr(t, "topic", ""), "detail": getattr(t, "detail", "")}
+                t
+                if isinstance(t, dict)
+                else {
+                    "topic": getattr(t, "topic", ""),
+                    "detail": getattr(t, "detail", ""),
+                }
                 for t in (raw if isinstance(raw, list) else [])
             ]
 
