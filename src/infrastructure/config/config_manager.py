@@ -916,14 +916,6 @@ class ConfigManager:
         self, style: str = "comic_storyboard_prompt"
     ) -> str:
         """获取分镜生成提示词模板"""
-        val = self._get_group("daily_comic").get("comic_storyboard_prompt", "")
-        if val:
-            return val
-        prompts_config = self._get_group("prompts").get("comic_analysis_prompts", {})
-        return prompts_config.get(style, "")
-
-    def get_comic_drawing_prompt(self, style: str = "comic_drawing_prompt") -> str:
-        """获取绘画提示词生成模板"""
         prompts_config = self._get_group("prompts").get("comic_analysis_prompts", {})
         return prompts_config.get(style, "")
 

@@ -2,8 +2,6 @@ import mimetypes
 import random
 from pathlib import Path
 
-import httpx
-
 from ...infrastructure.analysis.llm_analyzer import LLMAnalyzer
 from ...infrastructure.config.config_manager import ConfigManager
 from ...infrastructure.drawing.drawing_client import (
@@ -67,7 +65,7 @@ class ComicApplicationService:
             logger.error("[Comic] 提取到的场景提示词为空，取消漫画生成。")
             return None, None
 
-        logger.info(f"[Comic] 生成漫画 Prompt:\n{scene_prompt}")
+        logger.debug(f"[Comic] 漫画 Prompt 已生成，长度: {len(scene_prompt)}")
 
         # 3. 处理参考图
         images_data = None
@@ -141,16 +139,11 @@ class ComicApplicationService:
         try:
             path_str = path_or_url.strip()
             if path_str.startswith("http://") or path_str.startswith("https://"):
-                proxy = self.config_manager.get_drawing_download_proxy() or None
-                async with httpx.AsyncClient(timeout=30.0, proxy=proxy) as client:
-                    resp = await client.get(path_str)
-                    resp.raise_for_status()
-                    content_type = resp.headers.get("Content-Type", "")
-                    mime_type = content_type.split(";", 1)[0].strip().lower()
-                    if not mime_type.startswith("image/"):
-                        guessed_type, _ = mimetypes.guess_type(path_str)
-                        mime_type = guessed_type or "image/jpeg"
-                    return resp.content, mime_type
+                image_bytes = await self.drawing_client.download_public_image(path_str)
+                if not image_bytes:
+                    return None
+                guessed_type, _ = mimetypes.guess_type(path_str)
+                return image_bytes, guessed_type or "image/jpeg"
             else:
                 local_path = Path(path_str).expanduser()
 

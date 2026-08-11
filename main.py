@@ -386,7 +386,8 @@ class GroupDailyAnalysis(Star):
 
         try:
             adapter = self.bot_manager.get_adapter(event.get_platform_id())
-            if adapter and hasattr(adapter, "remember_user_profile"):
+            remember_user_profile = getattr(adapter, "remember_user_profile", None)
+            if callable(remember_user_profile):
                 raw_avatar = (
                     author.get("avatar")
                     if isinstance(author, dict)
@@ -397,7 +398,7 @@ class GroupDailyAnalysis(Star):
                     if isinstance(author, dict)
                     else getattr(author, "username", None)
                 )
-                adapter.remember_user_profile(
+                remember_user_profile(
                     member_openid,
                     nickname=str(raw_nickname or event.get_sender_name() or ""),
                     avatar_url=str(raw_avatar or ""),
@@ -758,7 +759,10 @@ class GroupDailyAnalysis(Star):
         analysis_result = result["analysis_result"]
         adapter = result["adapter"]
         output_format = self.config_manager.get_output_format()[0]
-        is_qq_official = adapter.get_platform_name() == "qq_official"
+        is_qq_official = adapter.get_platform_name() in {
+            "qq_official",
+            "qq_official_webhook",
+        }
         report_sent = False
 
         # 定义获取回调
@@ -832,8 +836,6 @@ class GroupDailyAnalysis(Star):
 
                         # 若用户配置为空，使用默认目录
                         if not html_output_dir:
-                            from astrbot.api.star import StarTools
-
                             html_output_dir = os.path.join(
                                 StarTools.get_data_dir(PLUGIN_NAME),
                                 "self_hosted_html_reports",
@@ -1244,14 +1246,17 @@ class GroupDailyAnalysis(Star):
         if action == "enable":
             async for result in self._handle_settings_enable(event, group_id):
                 yield result
+            return
         elif action == "disable":
             async for result in self._handle_settings_disable(event, group_id):
                 yield result
+            return
 
         elif action == "reload":
             self.auto_scheduler.schedule_jobs(self.context)
             await self._refresh_incremental_target_states()
             yield event.plain_result("✅ 已重新加载配置并重启定时任务")
+            return
 
         elif action == "test":
             check_target = getattr(event, "unified_msg_origin", None)
@@ -1286,6 +1291,7 @@ class GroupDailyAnalysis(Star):
                 yield event.plain_result("📊 该群的分析任务正在执行中，请稍后再试哦~")
             except Exception as e:
                 yield event.plain_result(f"❌ 自动分析测试失败: {str(e)}")
+            return
 
         elif action == "incremental_debug":
             current_state = self.config_manager.get_incremental_report_immediately()
@@ -1293,6 +1299,7 @@ class GroupDailyAnalysis(Star):
             self.config_manager.set_incremental_report_immediately(new_state)
             status_text = "已启用" if new_state else "已禁用"
             yield event.plain_result(f"✅ 增量分析立即报告模式: {status_text}")
+            return
 
         elif action == "filter_bot":
             current = self.config_manager.get_filter_bot_messages()
@@ -1300,6 +1307,7 @@ class GroupDailyAnalysis(Star):
             self.config_manager.set_filter_bot_messages(new_state)
             status_text = "已启用" if new_state else "已禁用"
             yield event.plain_result(f"✅ 过滤机器人消息: {status_text}")
+            return
 
         else:  # status
             check_target = getattr(event, "unified_msg_origin", None)

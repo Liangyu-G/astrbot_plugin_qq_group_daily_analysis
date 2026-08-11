@@ -228,7 +228,7 @@ class DrawingClient:
             files = {"image[]": (f"image.{ext}", img_bytes, mime)}
 
             logger.info(
-                f"[Comic] 发起 Images API 请求 (含图) -> {target_url} "
+                f"[Comic] 发起 Images API 请求 (含图) -> {self._sanitize_url(target_url)} "
                 f"(model={model}, size={resolved_size}, aspect_ratio={ar}, "
                 f"reference_bytes={len(img_bytes)})..."
             )
@@ -241,7 +241,7 @@ class DrawingClient:
                 )
         else:
             logger.info(
-                f"[Comic] 发起 Images API 请求 -> {target_url} (model={model}, size={resolved_size}, aspect_ratio={ar})..."
+                f"[Comic] 发起 Images API 请求 -> {self._sanitize_url(target_url)} (model={model}, size={resolved_size}, aspect_ratio={ar})..."
             )
             api_timeout = httpx.Timeout(
                 connect=20.0, read=timeout, write=20.0, pool=20.0
@@ -311,7 +311,7 @@ class DrawingClient:
             target_url = target_url.removesuffix("/edits") + "/generations"
 
         logger.info(
-            f"[Comic] 发起 Grok Images API 请求 -> {target_url} "
+            f"[Comic] 发起 Grok Images API 请求 -> {self._sanitize_url(target_url)} "
             f"(model={model}, aspect_ratio={aspect_ratio}, "
             f"reference_bytes={reference_bytes})..."
         )
@@ -417,7 +417,7 @@ class DrawingClient:
         }
 
         logger.info(
-            f"[Comic] 发起 Gemini Interactions API 请求 -> {target_url} "
+            f"[Comic] 发起 Gemini Interactions API 请求 -> {self._sanitize_url(target_url)} "
             f"(model={model}, image_size={image_size}, "
             f"aspect_ratio={aspect_ratio}, reference_bytes={reference_bytes})..."
         )
@@ -525,7 +525,7 @@ class DrawingClient:
         }
 
         logger.info(
-            f"[Comic] 发起 Chat API 请求 -> {target_url} (model={model}, size={resolved_size}, aspect_ratio={ar})..."
+            f"[Comic] 发起 Chat API 请求 -> {self._sanitize_url(target_url)} (model={model}, size={resolved_size}, aspect_ratio={ar})..."
         )
 
         api_timeout = httpx.Timeout(connect=20.0, read=timeout, write=20.0, pool=20.0)
@@ -622,7 +622,7 @@ class DrawingClient:
                     ("http://", "https://")
                 ):
                     last_download_url = candidate
-                    image = await self._download_image(candidate)
+                    image = await self.download_public_image(candidate)
                 elif candidate.startswith("data:image/"):
                     image = self._decode_data_uri(candidate)
                 elif candidate.startswith("base64://"):
@@ -716,8 +716,8 @@ class DrawingClient:
     # 图片下载整体超时（秒），防止代理服务器慢速发送导致无限等待
     IMAGE_DOWNLOAD_TOTAL_TIMEOUT = 90
 
-    async def _download_image(self, url: str) -> bytes | None:
-        """从公网 URL 下载大小受限的图片，带整体超时保护。"""
+    async def download_public_image(self, url: str) -> bytes | None:
+        """从公网 URL 下载已校验且大小受限的图片。"""
         try:
             return await asyncio.wait_for(
                 self._download_image_inner(url),
@@ -735,7 +735,7 @@ class DrawingClient:
         download_timeout = httpx.Timeout(connect=20.0, read=60.0, write=20.0, pool=20.0)
         proxy = self.config_manager.get_drawing_download_proxy() or None
         if proxy:
-            logger.debug(f"[Comic] 图片下载使用代理: {proxy}")
+            logger.debug(f"[Comic] 图片下载使用代理: {self._sanitize_url(proxy)}")
         async with httpx.AsyncClient(
             timeout=download_timeout,
             follow_redirects=False,
