@@ -89,7 +89,9 @@ class ComicApplicationService:
                 scene_prompt, images_data=images_data
             )
         except ImageDownloadFailedError as exc:
-            logger.warning(f"[Comic] 图片下载失败，保留 fallback URL: {exc.fallback_url}")
+            logger.warning(
+                f"[Comic] 图片下载失败，保留 fallback URL: {exc.fallback_url}"
+            )
             return None, exc.fallback_url
 
         exception_keywords = (
