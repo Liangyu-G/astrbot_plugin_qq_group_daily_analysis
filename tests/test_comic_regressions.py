@@ -91,6 +91,44 @@ def load_comic_service_method(name: str):
     return getattr(namespace["ComicServiceHarness"], name)
 
 
+def load_config_manager_class():
+    """加载漫画参考图相关配置方法，避免测试依赖 AstrBot 运行时。"""
+    config_path = (
+        Path(__file__).parents[1]
+        / "src"
+        / "infrastructure"
+        / "config"
+        / "config_manager.py"
+    )
+    module = ast.parse(
+        config_path.read_text(encoding="utf-8"), filename=str(config_path)
+    )
+    config_class = next(
+        node
+        for node in module.body
+        if isinstance(node, ast.ClassDef) and node.name == "ConfigManager"
+    )
+    required_names = {"__init__", "_get_group", "get_drawing_reference_image"}
+    methods = [
+        node
+        for node in config_class.body
+        if isinstance(node, ast.FunctionDef) and node.name in required_names
+    ]
+    isolated_class = ast.ClassDef(
+        name="ConfigManagerHarness",
+        bases=[],
+        keywords=[],
+        body=methods,
+        decorator_list=[],
+    )
+    isolated_module = ast.fix_missing_locations(
+        ast.Module(body=[isolated_class], type_ignores=[])
+    )
+    namespace = {"AstrBotConfig": object, "logger": Mock()}
+    exec(compile(isolated_module, str(config_path), "exec"), namespace)
+    return namespace["ConfigManagerHarness"]
+
+
 def test_analysis_settings_returns_after_non_status_action():
     """非状态命令不应继续渲染只在 status 分支赋值的变量。"""
     analysis_settings = load_main_method("analysis_settings")
@@ -153,21 +191,46 @@ def test_qq_official_webhook_uses_official_report_capabilities():
     asyncio.run(scenario())
 
 
-def test_remote_reference_image_uses_restricted_drawing_client_downloader():
-    """远程参考图必须通过绘图客户端下载，避免绕过 URL 与大小限制。"""
+def test_uploaded_reference_image_is_loaded_from_plugin_data_dir(tmp_path: Path):
+    """已选参考图只允许从插件数据目录读取。"""
     fetch_reference_image = load_comic_service_method("_fetch_reference_image")
-    drawing_client = SimpleNamespace(
-        download_public_image=AsyncMock(return_value=b"\x89PNG\r\n\x1a\nimage")
-    )
+    image_path = tmp_path / "files" / "daily_comic" / "drawing_reference_image"
+    image_path.mkdir(parents=True)
+    (image_path / "reference.png").write_bytes(b"\x89PNG\r\n\x1a\nimage")
     service = SimpleNamespace(
-        drawing_client=drawing_client,
+        plugin_data_dir=tmp_path,
     )
 
     result = asyncio.run(
-        fetch_reference_image(service, "https://example.com/reference.png")
+        fetch_reference_image(
+            service,
+            "files/daily_comic/drawing_reference_image/reference.png",
+        )
     )
 
     assert result == (b"\x89PNG\r\n\x1a\nimage", "image/png")
-    drawing_client.download_public_image.assert_awaited_once_with(
-        "https://example.com/reference.png"
+
+
+def test_reference_image_migrates_old_config_and_uses_last_selected_file():
+    """旧字符串配置应迁移为空，原生文件列表取最后一次选择。"""
+    config_manager_class = load_config_manager_class()
+
+    class Config(dict):
+        save_config = Mock()
+
+    config = Config(
+        daily_comic={"drawing_reference_image": "https://example.com/a.png"}
+    )
+    config_manager = config_manager_class(config)
+
+    assert config["daily_comic"]["drawing_reference_image"] == []
+    config.save_config.assert_called_once()
+
+    config["daily_comic"]["drawing_reference_image"] = [
+        "files/daily_comic/drawing_reference_image/first.png",
+        "files/daily_comic/drawing_reference_image/selected.webp",
+    ]
+    assert (
+        config_manager.get_drawing_reference_image()
+        == "files/daily_comic/drawing_reference_image/selected.webp"
     )

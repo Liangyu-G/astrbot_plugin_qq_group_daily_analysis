@@ -354,7 +354,7 @@
             },
             "drawing_prompt_provider_id": {
                 "type": "string",
-                "description": "画图提示词专用 Provider ID",
+                "description": "用于每日群漫画区域的功能，画图提示词专用 Provider ID",
                 "_special": "select_provider",
                 "default": "",
                 "hint": "专门用于生成漫画分镜、画图提示词及失败后的提示词重写。推荐最低使用 DeepSeek V4 Flash，避免使用角色扮演能力较弱的模型。留空则使用主 LLM Provider"
@@ -459,10 +459,11 @@
                 "hint": "开启后，每次群分析报告成功发送后，会自动提取聊天话题并在后台通过绘图模型生成包含话题元素的漫画并发送到群聊。"
             },
             "drawing_reference_image": {
-                "description": "参考图 (URL/本地路径)",
-                "type": "string",
-                "default": "",
-                "hint": "填写角色参考图的 URL、本地图片文件路径或本地图片目录路径。推荐传入与插件指定人格相符的角色图片。填写目录时会随机选择其中一张有效图片，并作为图生图参考图传给绘图接口。"
+                "description": "漫画参考图",
+                "type": "file",
+                "default": [],
+                "file_types": ["jpg", "jpeg", "png", "webp"],
+                "hint": "上传后点击 + 将图片设为参考图。已添加多张时，最后添加的一张会用于图生图。"
             },
             "drawing_api_url": {
                 "description": "绘图 API URL",

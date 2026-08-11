@@ -125,7 +125,10 @@ class GroupDailyAnalysis(Star):
         )
         self.drawing_client = DrawingClient(self.config_manager)
         self.comic_service = ComicApplicationService(
-            self.llm_analyzer, self.drawing_client, self.config_manager
+            self.llm_analyzer,
+            self.drawing_client,
+            self.config_manager,
+            plugin_data_dir,
         )
 
         # 消息处理服务

@@ -1,5 +1,4 @@
 import mimetypes
-import random
 from pathlib import Path
 
 from ...infrastructure.analysis.llm_analyzer import LLMAnalyzer
@@ -24,10 +23,12 @@ class ComicApplicationService:
         llm_analyzer: LLMAnalyzer,
         drawing_client: DrawingClient,
         config_manager: ConfigManager,
+        plugin_data_dir: Path,
     ):
         self.llm_analyzer = llm_analyzer
         self.drawing_client = drawing_client
         self.config_manager = config_manager
+        self.plugin_data_dir = plugin_data_dir
 
     async def generate_comic(
         self,
@@ -69,15 +70,17 @@ class ComicApplicationService:
 
         # 3. 处理参考图
         images_data = None
-        ref_img_path_or_url = self.config_manager.get_drawing_reference_image()
-        if ref_img_path_or_url:
-            reference_image = await self._fetch_reference_image(ref_img_path_or_url)
+        reference_image_path = self.config_manager.get_drawing_reference_image()
+        if reference_image_path:
+            reference_image = await self._fetch_reference_image(reference_image_path)
             if reference_image:
                 images_data = [reference_image]
-                logger.info(f"[Comic] 成功加载参考图: {ref_img_path_or_url}")
+                logger.info(
+                    f"[Comic] 成功加载 WebUI 参考图: {Path(reference_image_path).name}"
+                )
             else:
                 logger.warning(
-                    f"[Comic] 无法加载参考图: {ref_img_path_or_url}，将不使用参考图。"
+                    f"[Comic] 无法加载 WebUI 参考图: {Path(reference_image_path).name}，将不使用参考图。"
                 )
 
         # 4. 调用绘图 API，捕获"有 URL 但下载失败"的情况
@@ -126,49 +129,29 @@ class ComicApplicationService:
         return final_comic_bytes, fallback_url
 
     async def _fetch_reference_image(
-        self, path_or_url: str
+        self, relative_path: str
     ) -> tuple[bytes, str] | None:
-        """从 URL 或本地路径获取图片数据及 MIME 类型。
+        """从插件上传目录获取已选参考图。
 
         Args:
-            path_or_url: 图片 URL、本地文件路径或本地目录路径。
+            relative_path: WebUI 保存的插件数据目录相对路径。
 
         Returns:
             图片字节和 MIME 类型；加载失败时返回 None。
         """
         try:
-            path_str = path_or_url.strip()
-            if path_str.startswith("http://") or path_str.startswith("https://"):
-                image_bytes = await self.drawing_client.download_public_image(path_str)
-                if not image_bytes:
-                    return None
-                guessed_type, _ = mimetypes.guess_type(path_str)
-                return image_bytes, guessed_type or "image/jpeg"
-            else:
-                local_path = Path(path_str).expanduser()
+            plugin_data_dir = self.plugin_data_dir.resolve()
+            image_path = (plugin_data_dir / relative_path).resolve()
+            image_path.relative_to(plugin_data_dir)
+            if not image_path.is_file():
+                logger.warning(f"[Comic] 找不到已选参考图: {relative_path}")
+                return None
 
-                if local_path.is_file():
-                    guessed_type, _ = mimetypes.guess_type(local_path.name)
-                    return local_path.read_bytes(), guessed_type or "image/jpeg"
-                elif local_path.is_dir():
-                    valid_exts = {".png", ".jpg", ".jpeg", ".webp", ".gif"}
-                    files = [
-                        path
-                        for path in local_path.iterdir()
-                        if path.is_file() and path.suffix.lower() in valid_exts
-                    ]
-                    if files:
-                        chosen = random.choice(files)
-                        guessed_type, _ = mimetypes.guess_type(chosen.name)
-                        return chosen.read_bytes(), guessed_type or "image/jpeg"
-                    else:
-                        logger.warning(
-                            f"[Comic] 参考图目录 {path_str} 中没有有效的图片文件。"
-                        )
-                        return None
-                else:
-                    logger.warning(f"[Comic] 找不到本地参考图: {path_str}")
-                    return None
-        except Exception as e:
-            logger.error(f"[Comic] 获取参考图失败 {path_or_url}: {e}")
+            guessed_type, _ = mimetypes.guess_type(image_path.name)
+            if not guessed_type or not guessed_type.startswith("image/"):
+                logger.warning(f"[Comic] 已选参考图不是支持的图片文件: {relative_path}")
+                return None
+            return image_path.read_bytes(), guessed_type
+        except (OSError, ValueError) as exc:
+            logger.error(f"[Comic] 获取已选参考图失败 {relative_path}: {exc}")
             return None

@@ -26,6 +26,12 @@ class ConfigManager:
 
     def __init__(self, config: AstrBotConfig):
         self.config = config
+        daily_comic = self._get_group("daily_comic")
+        if isinstance(daily_comic.get("drawing_reference_image"), str):
+            # 旧版使用 URL 或本地路径字符串；新版仅接受 WebUI 上传的文件列表。
+            daily_comic["drawing_reference_image"] = []
+            self.config.save_config()
+            logger.info("已清除旧版漫画参考图配置，请在 WebUI 重新选择图片。")
 
     def _get_group(self, group: str) -> dict:
         """获取指定分组的配置字典，不存在时返回空字典"""
@@ -908,9 +914,17 @@ class ConfigManager:
         ).strip()
 
     def get_drawing_reference_image(self) -> str:
-        return str(
-            self._get_group("daily_comic").get("drawing_reference_image", "")
-        ).strip()
+        """获取当前选中的漫画参考图相对路径。"""
+        reference_images = self._get_group("daily_comic").get(
+            "drawing_reference_image", []
+        )
+        if not isinstance(reference_images, list):
+            return ""
+
+        for reference_image in reversed(reference_images):
+            if isinstance(reference_image, str) and reference_image.strip():
+                return reference_image.strip()
+        return ""
 
     def get_comic_storyboard_prompt(
         self, style: str = "comic_storyboard_prompt"
