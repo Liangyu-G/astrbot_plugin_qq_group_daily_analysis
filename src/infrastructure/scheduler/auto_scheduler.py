@@ -512,14 +512,17 @@ class AutoScheduler:
             # 获取分析结果及适配器
             analysis_result = result["analysis_result"]
             adapter = result["adapter"]
+            dispatch_platform_id = (
+                adapter.platform_id
+                if hasattr(adapter, "platform_id")
+                else target_platform_id
+            )
 
             # 调度导出并发送报告
             report_sent = await self.report_dispatcher.dispatch(
                 group_id,
                 analysis_result,
-                adapter.platform_id
-                if hasattr(adapter, "platform_id")
-                else target_platform_id,
+                dispatch_platform_id,
             )
 
             result["analysis_success"] = True
@@ -529,6 +532,19 @@ class AutoScheduler:
                 result["reason"] = "report_delivery_failed"
                 logger.error(f"群 {group_id} 自动分析完成，但报告发送失败")
                 return result
+
+            comic_trigger = getattr(
+                getattr(self, "plugin_instance", None),
+                "_try_trigger_comic_generation",
+                None,
+            )
+            if callable(comic_trigger):
+                try:
+                    comic_trigger(group_id, dispatch_platform_id, analysis_result)
+                except Exception as exc:
+                    logger.error(
+                        f"群 {group_id} 触发定时报告漫画失败: {exc}", exc_info=True
+                    )
 
             logger.info(f"群 {group_id} 自动分析及报告发送成功")
             return result
@@ -964,6 +980,19 @@ class AutoScheduler:
                 result["reason"] = "report_delivery_failed"
                 logger.error(f"群 {group_id} 最终报告生成完成，但报告发送失败")
                 return result
+
+            comic_trigger = getattr(
+                getattr(self, "plugin_instance", None),
+                "_try_trigger_comic_generation",
+                None,
+            )
+            if callable(comic_trigger):
+                try:
+                    comic_trigger(group_id, dispatch_platform_id, analysis_result)
+                except Exception as exc:
+                    logger.error(
+                        f"群 {group_id} 触发增量报告漫画失败: {exc}", exc_info=True
+                    )
 
             # 清理过期批次（保留 2 倍窗口范围的数据作为缓冲）
             try:
