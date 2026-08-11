@@ -6,7 +6,10 @@ import httpx
 
 from ...infrastructure.analysis.llm_analyzer import LLMAnalyzer
 from ...infrastructure.config.config_manager import ConfigManager
-from ...infrastructure.drawing.drawing_client import DrawingClient, ImageDownloadFailedError
+from ...infrastructure.drawing.drawing_client import (
+    DrawingClient,
+    ImageDownloadFailedError,
+)
 from ...utils.logger import logger
 
 
