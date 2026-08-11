@@ -12,6 +12,10 @@ class ComicStoryboardAnalyzer(BaseAnalyzer[dict, list[dict]]):
     直接从聊天记录中提取金句并生成绘画提示词（含文字渲染要求）
     """
 
+    def get_provider_id_key(self) -> str:
+        """获取画图提示词专用 Provider ID 配置键名"""
+        return "drawing_prompt_provider_id"
+
     def get_data_type(self) -> str:
         return "comic_storyboards"
 

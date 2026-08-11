@@ -552,6 +552,7 @@ class LLMAnalyzer(IAnalysisProvider):
                 config_manager=self.config_manager,
                 prompt=prompt,
                 umo=umo,
+                provider_id_key="drawing_prompt_provider_id",
             )
             if not llm_response or not llm_response.completion_text:
                 return None

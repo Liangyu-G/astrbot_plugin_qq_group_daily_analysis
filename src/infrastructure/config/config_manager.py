@@ -285,6 +285,10 @@ class ConfigManager:
         """获取聊天质量分析专用 Provider ID"""
         return self._get_group("llm").get("quality_provider_id", "")
 
+    def get_drawing_prompt_provider_id(self) -> str:
+        """获取画图提示词专用 Provider ID"""
+        return self._get_group("llm").get("drawing_prompt_provider_id", "")
+
     def get_keep_original_persona(self) -> bool:
         """获取是否继承会话原始人格设定"""
         return self._get_group("analysis_features").get("keep_original_persona", False)

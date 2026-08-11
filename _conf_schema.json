@@ -352,6 +352,13 @@
                 "default": "",
                 "hint": "专门用于聊天质量锐评的 Provider。留空则使用主 LLM Provider"
             },
+            "drawing_prompt_provider_id": {
+                "type": "string",
+                "description": "画图提示词专用 Provider ID",
+                "_special": "select_provider",
+                "default": "",
+                "hint": "专门用于生成漫画分镜、画图提示词及失败后的提示词重写。推荐最低使用 DeepSeek V4 Flash，避免使用角色扮演能力较弱的模型。留空则使用主 LLM Provider"
+            },
             "llm_retries": {
                 "type": "int",
                 "description": "LLM 请求重试次数",
@@ -436,7 +443,7 @@
                 "type": "string",
                 "_special": "select_persona",
                 "default": "",
-                "hint": "当“强制使用插件指定人格”开启时，在此处选择系统中已定义的人设。若此处未选择，则仍会尝试识别全局默认人格。"
+                "hint": "当“强制使用插件指定人格”开启时，在此处选择系统中已定义的人设。该人格会同时作用于画图提示词生成模型。若此处未选择，则仍会尝试识别全局默认人格。"
             }
         }
     },
@@ -455,7 +462,7 @@
                 "description": "参考图 (URL/本地路径)",
                 "type": "string",
                 "default": "",
-                "hint": "填写角色参考图的 URL、本地图片文件路径或本地图片目录路径。填写目录时会随机选择其中一张有效图片，并作为图生图参考图传给绘图接口。"
+                "hint": "填写角色参考图的 URL、本地图片文件路径或本地图片目录路径。推荐传入与插件指定人格相符的角色图片。填写目录时会随机选择其中一张有效图片，并作为图生图参考图传给绘图接口。"
             },
             "drawing_api_url": {
                 "description": "绘图 API URL",
@@ -473,7 +480,7 @@
                 "description": "绘图大模型名称",
                 "type": "string",
                 "default": "gpt-image-2",
-                "hint": "填写上游实际提供的模型名称或别名，例如 gpt-image-2、gpt-image-2-test。接口路由由下方协议类型决定，不限制模型名称。"
+                "hint": "填写上游实际提供的模型名称或别名，推荐使用 gpt-image-2，例如 gpt-image-2、gpt-image-2-test。接口路由由下方协议类型决定，不限制模型名称。"
             },
             "drawing_api_protocol": {
                 "description": "API 协议类型",
