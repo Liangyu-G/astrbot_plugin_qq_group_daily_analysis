@@ -761,12 +761,12 @@ class GroupDailyAnalysis(Star):
         platform_id = result["platform_id"]
         analysis_result = result["analysis_result"]
         adapter = result["adapter"]
+        self._try_trigger_comic_generation(group_id, platform_id, analysis_result)
         output_format = self.config_manager.get_output_format()[0]
         is_qq_official = adapter.get_platform_name() in {
             "qq_official",
             "qq_official_webhook",
         }
-        report_sent = False
 
         # 定义获取回调
         async def avatar_url_getter(user_id: str) -> str | None:
@@ -801,20 +801,13 @@ class GroupDailyAnalysis(Star):
                 sent = await adapter.send_image(group_id, image_url, caption=caption)
                 if sent:
                     await self._try_upload_image(group_id, image_url, platform_id)
-                    self._try_trigger_comic_generation(
-                        group_id, platform_id, analysis_result
-                    )
                     return  # 成功发送
 
             # 如果图片生成或发送失败，直接回退到文本
             logger.warning(f"图片报告发送失败，正在发送文本回退报告。群: {group_id}")
-            sent = await self._send_text_reports(
+            await self._send_text_reports(
                 group_id, analysis_result, is_qq_official, adapter
             )
-            if sent:
-                self._try_trigger_comic_generation(
-                    group_id, platform_id, analysis_result
-                )
             return
 
         elif output_format == "html":
@@ -853,7 +846,6 @@ class GroupDailyAnalysis(Star):
                         yield event.plain_result(
                             f"📊 今日群聊分析报告已生成：\n{report_url}"
                         )
-                        report_sent = True
                         should_send_file = False  # 拦截成功，不再发文件
                     else:
                         logger.warning(
@@ -881,23 +873,15 @@ class GroupDailyAnalysis(Star):
                         yield event.chain_result(
                             [File(name=Path(html_path).name, file=html_path)]
                         )
-                        report_sent = True
-
                         if caption:
                             yield event.plain_result(caption)
-                    else:
-                        report_sent = True
             else:
                 yield event.plain_result("⚠️ HTML 生成失败。")
 
         else:
-            report_sent = await self._send_text_reports(
+            await self._send_text_reports(
                 group_id, analysis_result, is_qq_official, adapter
             )
-
-        # 异步触发漫画生成
-        if report_sent:
-            self._try_trigger_comic_generation(group_id, platform_id, analysis_result)
 
     def _try_trigger_comic_generation(
         self, group_id: str, platform_id: str | None, analysis_result: dict
@@ -907,64 +891,50 @@ class GroupDailyAnalysis(Star):
 
         umo = f"{platform_id}:GroupMessage:{group_id}" if platform_id else group_id
 
-        # 提取已分析出的话题传给漫画生成
         topics = analysis_result.get("topics", [])
         statistics = analysis_result.get("statistics")
         if not topics and statistics:
-            raw = getattr(statistics, "topics", [])
-            # statistics.topics 可能是 domain 对象列表，统一转为 dict
-            topics = [
-                t
-                if isinstance(t, dict)
-                else {
-                    "topic": getattr(t, "topic", ""),
-                    "detail": getattr(t, "detail", ""),
-                }
-                for t in (raw if isinstance(raw, list) else [])
-            ]
+            topics = getattr(statistics, "topics", [])
 
-        if topics:
-            comic_topics = []
-            for t in topics:
-                top_title = (
-                    t.get("topic", "")
-                    if isinstance(t, dict)
-                    else getattr(t, "topic", "")
+        comic_topics = []
+        for topic in topics if isinstance(topics, list) else []:
+            title = (
+                topic.get("topic", "")
+                if isinstance(topic, dict)
+                else getattr(topic, "topic", "")
+            )
+            detail = (
+                topic.get("detail", "")
+                if isinstance(topic, dict)
+                else getattr(topic, "detail", "")
+            )
+            if str(title).strip():
+                comic_topics.append(
+                    {"topic": str(title).strip(), "detail": str(detail).strip()}
                 )
-                top_detail = (
-                    t.get("detail", "")
-                    if isinstance(t, dict)
-                    else getattr(t, "detail", "")
-                )
-                if top_title:
-                    comic_topics.append({"topic": top_title, "detail": top_detail})
+        if not comic_topics:
+            logger.warning(f"群 {group_id} 没有有效话题，跳过漫画生成。")
+            return
 
-            if comic_topics:
-                task_key = f"{platform_id or 'default'}:{group_id}"
-                existing_task = self._comic_group_tasks.get(task_key)
-                if existing_task and not existing_task.done():
-                    logger.info(f"群 {group_id} 已有漫画任务等待或执行，跳过重复任务。")
-                    return
+        task_key = f"{platform_id or 'default'}:{group_id}"
+        existing_task = self._comic_group_tasks.get(task_key)
+        if existing_task and not existing_task.done():
+            logger.info(f"群 {group_id} 已有漫画任务等待或执行，跳过重复任务。")
+            return
 
-                task = asyncio.create_task(
-                    self._trigger_comic_generation(
-                        comic_topics, group_id, platform_id, umo
-                    )
-                )
-                self._comic_group_tasks[task_key] = task
-                self._background_tasks.add(task)
-                task.add_done_callback(self._background_tasks.discard)
-                task.add_done_callback(
-                    lambda completed_task: (
-                        self._comic_group_tasks.pop(task_key, None)
-                        if self._comic_group_tasks.get(task_key) is completed_task
-                        else None
-                    )
-                )
-            else:
-                logger.info(f"群 {group_id} 没有提取到有效话题标题，跳过漫画生成。")
-        else:
-            logger.info(f"群 {group_id} 没有提取到话题，跳过漫画生成。")
+        task = asyncio.create_task(
+            self._trigger_comic_generation(comic_topics, group_id, platform_id, umo)
+        )
+        self._comic_group_tasks[task_key] = task
+        self._background_tasks.add(task)
+        task.add_done_callback(self._background_tasks.discard)
+        task.add_done_callback(
+            lambda completed_task: (
+                self._comic_group_tasks.pop(task_key, None)
+                if self._comic_group_tasks.get(task_key) is completed_task
+                else None
+            )
+        )
 
     async def _trigger_comic_generation(
         self,

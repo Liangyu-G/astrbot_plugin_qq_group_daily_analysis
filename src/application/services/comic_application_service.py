@@ -13,7 +13,7 @@ from ...utils.logger import logger
 class ComicApplicationService:
     """
     负责统筹每日群漫画的生成流程：
-    1. 调用 LLMAnalyzer 生成一张包含所有金句的拼贴分镜提示词。
+    1. 调用 LLMAnalyzer 将群聊话题生成拼贴分镜提示词。
     2. 调用 DrawingClient 直接生成单张连环漫画长图。
     3. 返回图片数据供外部上传。
     """

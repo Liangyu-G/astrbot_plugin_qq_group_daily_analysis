@@ -25,7 +25,8 @@ def load_main_method(name: str):
     method = next(
         node
         for node in plugin_class.body
-        if isinstance(node, ast.AsyncFunctionDef) and node.name == name
+        if isinstance(node, (ast.AsyncFunctionDef, ast.FunctionDef))
+        and node.name == name
     )
     method.decorator_list = []
     isolated_class = ast.ClassDef(
@@ -42,6 +43,8 @@ def load_main_method(name: str):
         "AsyncGenerator": object,
         "AstrMessageEvent": object,
         "DuplicateGroupTaskError": RuntimeError,
+        "asyncio": asyncio,
+        "logger": Mock(),
     }
     exec(compile(isolated_module, str(main_path), "exec"), namespace)
     return getattr(namespace["MainMethodHarness"], name)
@@ -234,3 +237,21 @@ def test_reference_image_migrates_old_config_and_uses_last_selected_file():
         config_manager.get_drawing_reference_image()
         == "files/daily_comic/drawing_reference_image/selected.webp"
     )
+
+
+def test_comic_is_skipped_without_valid_topics():
+    """话题功能未产出有效标题时不应创建漫画任务。"""
+    trigger_comic = load_main_method("_try_trigger_comic_generation")
+    plugin = SimpleNamespace(
+        _terminating=False,
+        config_manager=SimpleNamespace(get_enable_daily_comic=Mock(return_value=True)),
+        _comic_group_tasks={},
+        _background_tasks=set(),
+        _trigger_comic_generation=AsyncMock(),
+    )
+
+    trigger_comic(plugin, "123456", "onebot-main", {"topics": [{"topic": ""}]})
+
+    plugin._trigger_comic_generation.assert_not_called()
+    assert plugin._comic_group_tasks == {}
+    assert plugin._background_tasks == set()
