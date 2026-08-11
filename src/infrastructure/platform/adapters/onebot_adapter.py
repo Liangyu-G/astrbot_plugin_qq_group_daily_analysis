@@ -155,6 +155,7 @@ class OneBotAdapter(PlatformAdapter):
         try:
             chunk_size = 100  # 每次拉取 100 条，较为稳健
             all_raw_messages = []
+            seen_raw_ids: set[str] = set()
 
             # 确定回溯的起始时间点
             if since_ts and since_ts > 0:
@@ -188,7 +189,39 @@ class OneBotAdapter(PlatformAdapter):
                     if current_anchor_id:
                         params["message_seq"] = current_anchor_id
 
-                result = await self.bot.call_action("get_group_msg_history", **params)
+                result = None
+                fetch_error = None
+                # 单页请求最多尝试三次，避免 NapCat 偶发 WebSocket 超时导致整次分析失败。
+                for attempt in range(1, 4):
+                    try:
+                        result = await self.bot.call_action(
+                            "get_group_msg_history", **params
+                        )
+                        fetch_error = None
+                        break
+                    except asyncio.CancelledError:
+                        raise
+                    except Exception as exc:
+                        fetch_error = exc
+                        if attempt < 3:
+                            logger.warning(
+                                f"OneBot 分页拉取失败，将进行第 {attempt + 1} 次尝试："
+                                f"群 {group_id}，错误：{exc}"
+                            )
+                            await asyncio.sleep(attempt)
+
+                if fetch_error is not None:
+                    if all_raw_messages:
+                        logger.warning(
+                            f"OneBot 分页拉取重试耗尽，停止继续回溯并处理已获取的 "
+                            f"{len(all_raw_messages)} 条消息：群 {group_id}，错误：{fetch_error}"
+                        )
+                    else:
+                        logger.warning(
+                            f"OneBot 分页拉取重试耗尽，且尚未获取到消息："
+                            f"群 {group_id}，错误：{fetch_error}"
+                        )
+                    break
 
                 if not result or "messages" not in result:
                     logger.debug(
@@ -221,10 +254,8 @@ class OneBotAdapter(PlatformAdapter):
                     msg_time = raw_msg.get("time", 0)
                     msg_id = str(raw_msg.get("message_id", ""))
 
-                    # 基础过滤：去重
-                    if any(
-                        str(m.get("message_id", "")) == msg_id for m in all_raw_messages
-                    ):
+                    # 使用集合去重分页重叠消息，避免消息量较大时反复线性扫描。
+                    if not msg_id or msg_id in seen_raw_ids:
                         continue
 
                     # 身份过滤（排除机器人自己）
@@ -235,6 +266,7 @@ class OneBotAdapter(PlatformAdapter):
                     # 时间范围判定
                     if start_timestamp <= msg_time <= int(datetime.now().timestamp()):
                         all_raw_messages.append(raw_msg)
+                        seen_raw_ids.add(msg_id)
 
                 # 提取锚点。
                 # SnowLuma 仅支持 message_id 作为分页锚点。

@@ -187,67 +187,95 @@ class GroupDailyAnalysis(Star):
         """平台加载完成后初始化"""
         await self._run_initialization("Platform Loaded")
 
+    async def initialize(self):
+        """在 AstrBot 插件生命周期中确认初始化已经完成。
+
+        Returns:
+            None: 初始化任务完成或恢复初始化完成后返回。
+        """
+        init_task = getattr(self, "_init_task", None)
+        if init_task is None:
+            await self._run_initialization("Plugin Lifecycle")
+            return
+
+        try:
+            # 构造函数中的任务负责避免阻塞 AstrBot 启动；生命周期入口负责等待
+            # 它完成，确保插件重载不会在平台刷新之前被判定为加载成功。
+            await asyncio.shield(init_task)
+        except asyncio.CancelledError:
+            if self._terminating:
+                raise
+            logger.warning("插件生命周期初始化任务被取消，正在执行恢复初始化。")
+            await self._run_initialization("Plugin Lifecycle Recovery")
+
+        if not self._initialized and not self._terminating:
+            logger.warning("插件初始化未完成，正在执行一次生命周期恢复初始化。")
+            await self._run_initialization("Plugin Lifecycle Recovery")
+
     async def _run_initialization(self, source: str):
-        """统一初始化逻辑"""
+        """执行插件初始化，避免阻塞平台启动流程。
+
+        Args:
+            source: 触发本次初始化的来源标识。
+
+        Returns:
+            None: 就地完成插件状态初始化或刷新。
+        """
         async with self._init_lock:
-            # 如果已经成功发现过平台，且不是来自 Platform Loaded 的强制触发，则跳过
-            if (
-                self._initialized
-                and self.bot_manager
-                and self.bot_manager.get_platform_count() > 0
-                and source != "Platform Loaded"
-            ):
-                return
-
-            # 稍微延迟，确保 context 和环境稳定
-            # 针对极少数环境，2秒可能不足以让平台管理器就绪，增加到 5秒
-            await asyncio.sleep(5)
-
-            # [加固] 如果在等待期间插件已被卸载（terminate），则直接退出
-            if not self.bot_manager:
+            if self._terminating or not self.bot_manager:
                 return
 
             try:
-                # 注册 TraceID 过滤器
-                trace_filter = TraceLogFilter()
-                if not any(
-                    isinstance(f, TraceLogFilter) for f in astrbot_logger.filters
-                ):
-                    astrbot_logger.addFilter(trace_filter)
-                    astrbot_logger.info("[Trace] TraceID 日志追踪已启用")
+                # 核心配置迁移和定时任务只执行一次。
+                if not self._initialized:
+                    # 注册 TraceID 过滤器。
+                    trace_filter = TraceLogFilter()
+                    if not any(
+                        isinstance(f, TraceLogFilter) for f in astrbot_logger.filters
+                    ):
+                        astrbot_logger.addFilter(trace_filter)
+                        astrbot_logger.info("[Trace] 已启用 TraceID 日志追踪")
 
-                logger.info(f"正在执行插件初始化 (来源: {source})...")
+                    logger.info(f"开始初始化插件（来源：{source}）...")
 
-                # 0. 自动升级旧版 prompt 模板（str.format -> string.Template）并回写配置
-                try:
-                    self.config_manager.upgrade_prompt_templates()
-                except Exception as e:
-                    logger.warning(f"自动升级 prompt 模板失败: {e}")
+                    # 升级旧版 prompt 模板并回写迁移后的配置。
+                    try:
+                        self.config_manager.upgrade_prompt_templates()
+                    except Exception as e:
+                        logger.warning(f"升级 prompt 模板失败：{e}")
 
-                try:
-                    self.config_manager.migrate_legacy_configs()
-                except Exception as e:
-                    logger.warning(f"迁移旧版配置失败: {e}")
+                    try:
+                        self.config_manager.migrate_legacy_configs()
+                    except Exception as e:
+                        logger.warning(f"迁移旧版配置失败：{e}")
 
-                # 1. 尝试发现 bot 实例
+                # AstrBot 会为每个平台调用一次此回调。平台发现只检查已创建的
+                # 平台对象，可以安全重复执行；这样后加载的平台也不会被遗漏。
                 await self.bot_manager.initialize_from_config()
 
-                # 2. 注册预览路由器
+                # 模板预览处理器依赖平台实例，因此每个平台加载时都要刷新。
                 if self.template_preview_router:
                     await self.template_preview_router.ensure_handlers_registered(
                         self.context
                     )
 
-                # 3. 强制注册定时分析任务
+                if self._initialized:
+                    logger.debug(
+                        f"插件已完成初始化，已刷新平台状态（来源：{source}）。"
+                    )
+                    return
+
+                # 插件基础设施准备完成后注册定时任务。
                 if self.auto_scheduler:
                     self.auto_scheduler.schedule_jobs(self.context)
+                    await self.auto_scheduler.start_incremental_trigger()
 
                 self._initialized = True
                 self._discovery_run = True
-                logger.info(f"插件任务注册完成 (来源: {source})")
+                logger.info(f"插件初始化完成（来源：{source}）")
 
             except Exception as e:
-                logger.error(f"插件初始化失败: {e}", exc_info=True)
+                logger.error(f"插件初始化失败：{e}", exc_info=True)
 
     async def terminate(self):
         """插件被卸载/停用时调用，清理资源"""
@@ -275,7 +303,7 @@ class GroupDailyAnalysis(Star):
             # 2. 停止各个组件 (顺序：先调度器，后底层服务)
             if self.auto_scheduler:
                 logger.debug("正在停止自动调度器...")
-                self.auto_scheduler.unschedule_jobs(self.context)
+                await self.auto_scheduler.shutdown(self.context)
 
             if self.template_preview_router:
                 await self.template_preview_router.unregister_handlers()
@@ -293,7 +321,30 @@ class GroupDailyAnalysis(Star):
         except Exception as e:
             logger.error(f"插件资源清理失败: {e}")
 
-    # ==================== Telegram 消息拦截器 ====================
+    # ==================== 群消息增量计数与事件缓存 ====================
+
+    @filter.event_message_type(
+        filter.EventMessageType.GROUP_MESSAGE,
+        priority=100,
+    )
+    async def count_incremental_group_message(self, event: AstrMessageEvent):
+        """记录目标群消息，达到配置阈值后触发增量分析。
+
+        Args:
+            event: AstrBot 群消息事件。
+
+        Returns:
+            None: 计数完成后继续消息流水线。
+        """
+        # QQ 官方和 Telegram 会在各自的持久化钩子成功后计数，避免任务先于入库启动。
+        if str(event.get_platform_name() or "").strip().lower() in {
+            "qq_official",
+            "qq_official_webhook",
+            "telegram",
+        }:
+            return
+        if self.auto_scheduler:
+            await self.auto_scheduler.record_incremental_message(event)
 
     @filter.event_message_type(filter.EventMessageType.GROUP_MESSAGE)
     @filter.platform_adapter_type(filter.PlatformAdapterType.TELEGRAM)
@@ -304,7 +355,9 @@ class GroupDailyAnalysis(Star):
         委托给 MessageProcessingService 处理
         """
         try:
-            await self.message_processing_service.process_message(event)
+            stored = await self.message_processing_service.process_message(event)
+            if stored and self.auto_scheduler:
+                await self.auto_scheduler.record_incremental_message(event)
         except (ValueError, RuntimeError) as e:
             logger.warning(f"[Telegram] 消息存储失败: {e}")
         except Exception as e:
@@ -332,7 +385,27 @@ class GroupDailyAnalysis(Star):
             return
 
         try:
-            await self.message_processing_service.process_message(event)
+            adapter = self.bot_manager.get_adapter(event.get_platform_id())
+            if adapter and hasattr(adapter, "remember_user_profile"):
+                raw_avatar = (
+                    author.get("avatar")
+                    if isinstance(author, dict)
+                    else getattr(author, "avatar", None)
+                )
+                raw_nickname = (
+                    author.get("username")
+                    if isinstance(author, dict)
+                    else getattr(author, "username", None)
+                )
+                adapter.remember_user_profile(
+                    member_openid,
+                    nickname=str(raw_nickname or event.get_sender_name() or ""),
+                    avatar_url=str(raw_avatar or ""),
+                )
+
+            stored = await self.message_processing_service.process_message(event)
+            if stored and self.auto_scheduler:
+                await self.auto_scheduler.record_incremental_message(event)
         except (ValueError, RuntimeError) as e:
             logger.warning(f"[QQOfficial] 消息存储失败: {e}")
         except Exception as e:
@@ -1177,6 +1250,7 @@ class GroupDailyAnalysis(Star):
 
         elif action == "reload":
             self.auto_scheduler.schedule_jobs(self.context)
+            await self._refresh_incremental_target_states()
             yield event.plain_result("✅ 已重新加载配置并重启定时任务")
 
         elif action == "test":
@@ -1196,8 +1270,18 @@ class GroupDailyAnalysis(Star):
             self.bot_manager.update_from_event(event)
 
             try:
-                await self.auto_scheduler._perform_auto_analysis_for_group(group_id)
-                yield event.plain_result("✅ 自动分析测试完成，请查看群消息")
+                result = await self.auto_scheduler._perform_auto_analysis_for_group(
+                    group_id
+                )
+                if isinstance(result, dict) and result.get("success"):
+                    yield event.plain_result("✅ 自动分析及报告发送成功，请查看群消息")
+                else:
+                    reason = (
+                        result.get("reason", "unknown")
+                        if isinstance(result, dict)
+                        else "invalid_result"
+                    )
+                    yield event.plain_result(f"❌ 自动分析或报告发送失败: {reason}")
             except DuplicateGroupTaskError:
                 yield event.plain_result("📊 该群的分析任务正在执行中，请稍后再试哦~")
             except Exception as e:
@@ -1240,14 +1324,8 @@ class GroupDailyAnalysis(Star):
             incremental_enabled = self.config_manager.get_incremental_enabled()
             incremental_status_text = "未启用"
             if incremental_enabled:
-                interval = self.config_manager.get_incremental_interval_minutes()
-                max_daily = self.config_manager.get_incremental_max_daily_analyses()
-                active_start = self.config_manager.get_incremental_active_start_hour()
-                active_end = self.config_manager.get_incremental_active_end_hour()
-                incremental_status_text = (
-                    f"已启用 (间隔{interval}分钟, 最多{max_daily}次/天, "
-                    f"活跃时段{active_start}:00-{active_end}:00)"
-                )
+                batch_messages = self.config_manager.get_incremental_min_messages()
+                incremental_status_text = f"已启用 (每 {batch_messages} 条消息触发)"
 
         debug_report = self.config_manager.get_incremental_report_immediately()
         debug_status = "✅ 开启" if debug_report else "❌ 关闭"
@@ -1328,8 +1406,9 @@ class GroupDailyAnalysis(Star):
             if not self.config_manager.is_group_allowed(target_id):
                 glist.append(target_id)
                 self.config_manager.set_group_list(glist)
-                yield event.plain_result(f"✅ 已将当前群加入白名单\nID: {target_id}")
                 self.auto_scheduler.schedule_jobs(self.context)
+                await self._refresh_incremental_target_states()
+                yield event.plain_result(f"✅ 已将当前群加入白名单\nID: {target_id}")
             else:
                 yield event.plain_result("ℹ️ 当前群已在白名单中")
         elif mode == "blacklist":
@@ -1344,8 +1423,9 @@ class GroupDailyAnalysis(Star):
 
             if removed:
                 self.config_manager.set_group_list(glist)
-                yield event.plain_result("✅ 已将当前群从黑名单移除")
                 self.auto_scheduler.schedule_jobs(self.context)
+                await self._refresh_incremental_target_states()
+                yield event.plain_result("✅ 已将当前群从黑名单移除")
             else:
                 yield event.plain_result("ℹ️ 当前群不在黑名单中")
         else:
@@ -1368,8 +1448,9 @@ class GroupDailyAnalysis(Star):
 
             if removed:
                 self.config_manager.set_group_list(glist)
-                yield event.plain_result("✅ 已将当前群从白名单移除")
                 self.auto_scheduler.schedule_jobs(self.context)
+                await self._refresh_incremental_target_states()
+                yield event.plain_result("✅ 已将当前群从白名单移除")
             else:
                 yield event.plain_result("ℹ️ 当前群不在白名单中")
         elif mode == "blacklist":
@@ -1377,9 +1458,16 @@ class GroupDailyAnalysis(Star):
             if self.config_manager.is_group_allowed(target_id):
                 glist.append(target_id)
                 self.config_manager.set_group_list(glist)
-                yield event.plain_result(f"✅ 已将当前群加入黑名单\nID: {target_id}")
                 self.auto_scheduler.schedule_jobs(self.context)
+                await self._refresh_incremental_target_states()
+                yield event.plain_result(f"✅ 已将当前群加入黑名单\nID: {target_id}")
             else:
                 yield event.plain_result("ℹ️ 当前群已在黑名单中")
         else:
             yield event.plain_result("ℹ️ 当前为无限制模式，如需禁用请切换到黑名单模式")
+
+    async def _refresh_incremental_target_states(self) -> None:
+        """在插件内修改名单后立即同步增量状态。"""
+        incremental_trigger = self.auto_scheduler.incremental_trigger
+        if incremental_trigger:
+            await incremental_trigger.refresh_target_states()
