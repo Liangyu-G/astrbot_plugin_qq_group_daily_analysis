@@ -6,7 +6,7 @@ import httpx
 
 from ...infrastructure.analysis.llm_analyzer import LLMAnalyzer
 from ...infrastructure.config.config_manager import ConfigManager
-from ...infrastructure.drawing.drawing_client import DrawingClient
+from ...infrastructure.drawing.drawing_client import DrawingClient, ImageDownloadFailedError
 from ...utils.logger import logger
 
 
@@ -33,12 +33,17 @@ class ComicApplicationService:
         topics: list[dict],
         group_id: str,
         umo: str | None = None,
-    ) -> bytes | None:
+    ) -> tuple[bytes | None, str | None]:
         """
-        生成漫画并返回图片字节数据
+        生成漫画并返回图片字节数据。
+
+        Returns:
+            (comic_bytes, fallback_url):
+            - comic_bytes: 生成成功时为图片字节，失败时为 None。
+            - fallback_url: 图片 API 返回了 URL 但下载失败时为该 URL，其他情况为 None。
         """
         if not self.config_manager.get_enable_daily_comic():
-            return None
+            return None, None
 
         logger.info(f"[Comic] 开始为群 {group_id} 生成每日漫画...")
 
@@ -49,7 +54,7 @@ class ComicApplicationService:
             logger.warning(
                 f"[Comic] 群 {group_id} 未能提取到任何金句分镜，取消漫画生成。"
             )
-            return None
+            return None, None
 
         logger.info("[Comic] 成功提取到全景分镜提示词，开始调用绘画 API...")
 
@@ -57,7 +62,7 @@ class ComicApplicationService:
         scene_prompt = storyboards[0].get("scene", "")
         if not scene_prompt:
             logger.error("[Comic] 提取到的场景提示词为空，取消漫画生成。")
-            return None
+            return None, None
 
         logger.info(f"[Comic] 生成漫画 Prompt:\n{scene_prompt}")
 
@@ -74,9 +79,15 @@ class ComicApplicationService:
                     f"[Comic] 无法加载参考图: {ref_img_path_or_url}，将不使用参考图。"
                 )
 
-        final_comic_bytes, last_error = await self.drawing_client.generate_image(
-            scene_prompt, images_data=images_data
-        )
+        # 4. 调用绘图 API，捕获"有 URL 但下载失败"的情况
+        fallback_url: str | None = None
+        try:
+            final_comic_bytes, last_error = await self.drawing_client.generate_image(
+                scene_prompt, images_data=images_data
+            )
+        except ImageDownloadFailedError as exc:
+            logger.warning(f"[Comic] 图片下载失败，保留 fallback URL: {exc.fallback_url}")
+            return None, exc.fallback_url
 
         exception_keywords = (
             self.config_manager.get_drawing_output_exception_retry_keywords()
@@ -94,16 +105,22 @@ class ComicApplicationService:
             )
             if new_prompt:
                 logger.info("[Comic] 获取到重写后的 Prompt，进行最后一次尝试...")
-                final_comic_bytes, _ = await self.drawing_client.generate_image(
-                    new_prompt, images_data=images_data, disable_retry=True
-                )
+                try:
+                    final_comic_bytes, _ = await self.drawing_client.generate_image(
+                        new_prompt, images_data=images_data, disable_retry=True
+                    )
+                except ImageDownloadFailedError as exc:
+                    logger.warning(
+                        f"[Comic] 重写 Prompt 后图片下载仍失败，保留 fallback URL: {exc.fallback_url}"
+                    )
+                    return None, exc.fallback_url
 
         if final_comic_bytes:
             logger.info(f"[Comic] 漫画生成成功，大小: {len(final_comic_bytes)} bytes")
         else:
             logger.error("[Comic] 漫画生成最终失败。")
 
-        return final_comic_bytes
+        return final_comic_bytes, fallback_url
 
     async def _fetch_reference_image(
         self, path_or_url: str

@@ -14,6 +14,14 @@ from ...utils.logger import logger
 from ..config.config_manager import ConfigManager
 
 
+class ImageDownloadFailedError(Exception):
+    """图片下载失败，但保留了最后一次尝试的原始 URL 供兜底发送。"""
+
+    def __init__(self, message: str, fallback_url: str | None = None):
+        super().__init__(message)
+        self.fallback_url = fallback_url
+
+
 class DrawingClient:
     """调用已配置的绘图 API 生成图片。"""
 
@@ -604,6 +612,7 @@ class DrawingClient:
 
         collect(data)
         last_download_error: Exception | None = None
+        last_download_url: str | None = None
         candidates = (
             encoded + image_fields + content_images + content_urls + fallback_urls
         )
@@ -612,6 +621,7 @@ class DrawingClient:
                 if candidate_type == "url" or candidate.startswith(
                     ("http://", "https://")
                 ):
+                    last_download_url = candidate
                     image = await self._download_image(candidate)
                 elif candidate.startswith("data:image/"):
                     image = self._decode_data_uri(candidate)
@@ -628,7 +638,9 @@ class DrawingClient:
                 logger.warning(f"[Comic] 跳过无效图片候选内容: {exc}")
 
         if last_download_error:
-            raise last_download_error
+            raise ImageDownloadFailedError(
+                str(last_download_error), fallback_url=last_download_url
+            )
         return None
 
     @staticmethod

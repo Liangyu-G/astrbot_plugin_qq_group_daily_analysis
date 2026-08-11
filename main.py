@@ -900,7 +900,7 @@ class GroupDailyAnalysis(Star):
             if self._terminating:
                 return
             try:
-                comic_bytes = await self.comic_service.generate_comic(
+                comic_bytes, fallback_url = await self.comic_service.generate_comic(
                     topics, group_id, umo
                 )
                 if comic_bytes:
@@ -948,6 +948,17 @@ class GroupDailyAnalysis(Star):
                             os.remove(comic_file_path)
                         except OSError:
                             pass
+                elif fallback_url:
+                    # 图片 API 返回了 URL 但下载失败，把链接发到群里作为兜底
+                    logger.warning(
+                        f"群 {group_id} 漫画下载失败，发送 fallback URL 到群中: {fallback_url}"
+                    )
+                    adapter = self.bot_manager.get_adapter(platform_id)
+                    if adapter and hasattr(adapter, "send_text"):
+                        await adapter.send_text(
+                            group_id,
+                            f"✨ 今日群聊趣味漫画已生成，但图片下载失败，请点击链接查看：\n{fallback_url}",
+                        )
             except Exception as e:
                 logger.error(
                     f"群 {group_id} 生成/上传漫画时发生错误: {e}", exc_info=True
