@@ -5,10 +5,22 @@ Bot实例管理模块 - 基础设施层
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+import fnmatch
+from collections.abc import Mapping, Sequence
+from typing import TYPE_CHECKING, TypeGuard
 
+from ...shared.constants import PLUGIN_NAME
 from ...utils.logger import logger
 from . import PlatformAdapter, PlatformAdapterFactory
+
+if TYPE_CHECKING:
+    from astrbot.api.all import Context
+    from astrbot.api.event import AstrMessageEvent
+    from astrbot.core.astrbot_config_mgr import AstrBotConfigManager
+    from astrbot.core.platform.manager import PlatformManager
+
+    from ...domain.repositories.plugin_host_repository import PluginHostProtocol
+    from ..config.config_manager import ConfigManager
 
 
 class BotManager:
@@ -19,7 +31,17 @@ class BotManager:
     实现跨平台支持。
     """
 
-    def __init__(self, config_manager):
+    config_manager: ConfigManager
+    _bot_instances: dict[str, object]
+    _adapters: dict[str, PlatformAdapter]
+    _platforms: dict[str, object]
+    _bot_self_ids: list[str]
+    _context: Context | None
+    _is_initialized: bool
+    _default_platform: str
+    _plugin_instance: PluginHostProtocol | None
+
+    def __init__(self, config_manager: ConfigManager) -> None:
         self.config_manager = config_manager
         self._bot_instances: dict[str, object] = {}  # {platform_id: bot_instance}
         self._adapters: dict[
@@ -27,12 +49,16 @@ class BotManager:
         ] = {}  # {platform_id: PlatformAdapter} - DDD 集成
         self._platforms: dict[str, object] = {}  # 存储平台对象以访问配置
         self._bot_self_ids: list[str] = []  # 支持多个机器人账号 ID (原 _bot_qq_ids)
-        self._context: object | None = None
+        self._context = None
         self._is_initialized = False
-        self._default_platform = "default"  # 默认平台
-        self._plugin_instance: object | None = None  # 插件实例引用，用于适配器回调
+        self._default_platform = (
+            "default"  # AstrBot 初始未命名平台时的缺省标识占位符（非业务默认）
+        )
+        self._plugin_instance: PluginHostProtocol | None = (
+            None  # 插件实例引用，用于适配器回调
+        )
 
-    def set_context(self, context):
+    def set_context(self, context: Context | None) -> None:
         """设置AstrBot上下文，并传递给所有支持的适配器"""
         self._context = context
 
@@ -41,11 +67,25 @@ class BotManager:
             if hasattr(adapter, "set_context"):
                 adapter.set_context(context)
 
-    def set_plugin_instance(self, plugin_instance: object):
+    def set_plugin_instance(self, plugin_instance: PluginHostProtocol | None) -> None:
         """设置插件实例引用"""
         self._plugin_instance = plugin_instance
 
-    def set_bot_instance(self, bot_instance, platform_id=None, platform_name=None):
+    @property
+    def plugin_instance(self) -> PluginHostProtocol | None:
+        """当前绑定的插件实例。
+
+        适配器创建时会把它注入 config（见 set_bot_instance），供群注册表等
+        需要回查插件状态的能力使用；调度器等外部构造适配器时也应传入同一个实例。
+        """
+        return self._plugin_instance
+
+    def set_bot_instance(
+        self,
+        bot_instance: object,
+        platform_id: str | None = None,
+        platform_name: str | None = None,
+    ) -> None:
         """
         设置bot实例，支持指定平台ID
 
@@ -97,7 +137,9 @@ class BotManager:
             if bot_self_id and bot_self_id not in self._bot_self_ids:
                 self._bot_self_ids.append(str(bot_self_id))
 
-    def set_bot_self_ids(self, bot_self_ids):
+    def set_bot_self_ids(
+        self, bot_self_ids: list[str | int] | str | int | None
+    ) -> None:
         """设置机器人 ID 列表（支持单个 ID 或 ID 列表）"""
         if isinstance(bot_self_ids, list):
             self._bot_self_ids = [str(uid) for uid in bot_self_ids if uid]
@@ -109,7 +151,7 @@ class BotManager:
             if hasattr(adapter, "bot_self_ids"):
                 adapter.bot_self_ids = self._bot_self_ids.copy()
 
-    def get_bot_instance(self, platform_id=None):
+    def get_bot_instance(self, platform_id: str | None = None) -> object | None:
         """获取指定平台的bot实例，如果不指定则返回第一个可用的实例"""
         if platform_id:
             # 如果指定了平台ID，尝试获取
@@ -126,7 +168,7 @@ class BotManager:
         if self._bot_instances:
             # 如果只有一个实例，直接返回
             if len(self._bot_instances) == 1:
-                return list(self._bot_instances.values())[0]
+                return next(iter(self._bot_instances.values()))
 
             # 如果有多个实例，必须指定 platform_id
             logger.error(
@@ -143,11 +185,9 @@ class BotManager:
         """尝试从已存储的平台对象中刷新 bot 实例 (Lazy Load)"""
         for platform_id, platform in self._platforms.items():
             bot_client = None
-            # Lark 平台优先使用 API client，避免拿到仅支持长连接的 ws client
-            bot_client = getattr(platform, "lark_api", None)
             # 优先尝试 get_client()
             get_client = getattr(platform, "get_client", None)
-            if not bot_client and callable(get_client):
+            if callable(get_client):
                 bot_client = get_client()
 
             # 如果 get_client() 返回 None，尝试直接访问属性
@@ -169,13 +209,18 @@ class BotManager:
                 metadata_obj = getattr(platform, "metadata", None)
                 if metadata_obj is not None:
                     # 优先使用 type
-                    type_val = getattr(metadata_obj, "type", None)
-                    if isinstance(type_val, str):
-                        platform_name = type_val
+                    if isinstance(metadata_obj, Mapping):
+                        platform_name = metadata_obj.get("type") or metadata_obj.get(
+                            "name"
+                        )
                     else:
-                        name_val = getattr(metadata_obj, "name", None)
-                        if isinstance(name_val, str):
-                            platform_name = name_val
+                        type_val = getattr(metadata_obj, "type", None)
+                        if isinstance(type_val, str):
+                            platform_name = type_val
+                        else:
+                            name_val = getattr(metadata_obj, "name", None)
+                            if isinstance(name_val, str):
+                                platform_name = name_val
 
                 # 兼容不同版本的元数据获取
                 if not platform_name:
@@ -187,10 +232,8 @@ class BotManager:
                         except Exception:
                             pass
 
-                # 后备检测：如果不支持名称
-                if not platform_name or not PlatformAdapterFactory.is_supported(
-                    str(platform_name)
-                ):
+                # 仅当未从元数据获取到平台名称时，尝试从 bot 实例后备检测
+                if not platform_name and bot_client:
                     detected = self._detect_platform_name(bot_client)
                     if detected:
                         platform_name = detected
@@ -198,7 +241,7 @@ class BotManager:
                 self.set_bot_instance(bot_client, platform_id, platform_name)
                 logger.info(f"已刷新/发现平台 {platform_id} 的 bot 实例 (变动或懒加载)")
 
-    def get_all_bot_instances(self) -> dict:
+    def get_all_bot_instances(self) -> dict[str, object]:
         """获取所有已加载的bot实例 {platform_id: bot_instance}"""
         return self._bot_instances.copy()
 
@@ -236,23 +279,22 @@ class BotManager:
 
         return True
 
-    def _get_platform_id_from_instance(self, bot_instance):
+    def _get_platform_id_from_instance(self, bot_instance: object) -> str:
         """从bot实例获取平台ID"""
-        if hasattr(bot_instance, "platform") and isinstance(bot_instance.platform, str):
-            return bot_instance.platform
+        platform = getattr(bot_instance, "platform", None)
+        if isinstance(platform, str):
+            return platform
         return self._default_platform
 
-    def _detect_platform_name(self, bot_instance) -> str | None:
-        """
-        从 bot 实例检测平台名称，用于创建适配器。
+    def _detect_platform_name(self, bot_instance: object) -> str | None:
+        """从 bot 实例检测平台名称，用于创建适配器。
 
         返回平台名称如 'aiocqhttp', 'discord' 等。
         """
         # 优先使用 platform 属性
-        if hasattr(bot_instance, "platform"):
-            platform = bot_instance.platform
-            if isinstance(platform, str):
-                return platform
+        platform = getattr(bot_instance, "platform", None)
+        if isinstance(platform, str):
+            return platform
 
         # 检查已知的 API 特征（平台无关的方式）
         # OneBot/aiocqhttp 特征: 有 call_action 方法
@@ -279,45 +321,86 @@ class BotManager:
     # ==================== DDD 集成方法 ====================
 
     def get_adapter(self, platform_id: str | None = None) -> PlatformAdapter | None:
+        """获取指定平台的 PlatformAdapter（精准匹配）。
+
+        仅支持：
+        1. 平台实例 ID 精确匹配（如 'aiocqhttp_1'、'nuits'）
+        2. 大小写与首尾空格不敏感匹配
+        3. 标准协议类型名称匹配（如传入 'aiocqhttp'、'telegram' 时匹配对应协议适配器实例）
+
+        若未指定 platform_id 或未精准匹配到任何有效适配器，返回 None。
         """
-        获取指定平台的 PlatformAdapter。
+        # 如果没有任何适配器，尝试全局刷新一次
+        if not self._adapters:
+            self._refresh_from_stored_platforms()
 
-        这是 DDD 架构操作的主要方法。
-        """
-        if platform_id:
-            # 无论是否存在适配器，都尝试检测一次 client 是否有变（如重启后 session 变化）
-            if platform_id in self._platforms:
-                self._refresh_from_stored_platforms()
-
-            return self._adapters.get(platform_id)
-
-        if self._adapters:
-            if len(self._adapters) == 1:
-                return list(self._adapters.values())[0]
-
+        if not platform_id:
             logger.warning(
-                f"存在多个适配器 {list(self._adapters.keys())}，但未指定 platform_id。"
+                "[BotManager] get_adapter 调用未提供 platform_id，无法确定使用哪个适配器。请明确指定 platform_id。"
             )
             return None
 
-        # 如果没有任何适配器，尝试全局刷新一次
-        self._refresh_from_stored_platforms()
-        if self._adapters:
-            if platform_id:
-                return self._adapters.get(platform_id)
-            if len(self._adapters) == 1:
-                return list(self._adapters.values())[0]
+        clean_id = str(platform_id).strip()
+        if not clean_id:
+            return None
 
+        # 检查存储的平台实例是否有最新变动
+        if clean_id in self._platforms:
+            self._refresh_from_stored_platforms()
+
+        # 1. 精确匹配平台实例 ID
+        if clean_id in self._adapters:
+            return self._adapters[clean_id]
+
+        # 2. 大小写与空格不敏感匹配
+        clean_id_lower = clean_id.lower()
+        for k, adp in self._adapters.items():
+            if k.strip().lower() == clean_id_lower:
+                return adp
+
+        # 3. 通过 PlatformAdapterFactory 注册类型匹配（当调用方传入标准协议名如 aiocqhttp/telegram 时）
+        if PlatformAdapterFactory.is_supported(clean_id_lower):
+            expected_adapter_cls = PlatformAdapterFactory.get_adapter_class(
+                clean_id_lower
+            )
+            if expected_adapter_cls:
+                for k, adp in self._adapters.items():
+                    if isinstance(adp, expected_adapter_cls):
+                        logger.info(
+                            f"[BotManager] 平台类型 '{platform_id}' 精准匹配到已注册适配器 '{k}'"
+                        )
+                        return adp
+
+        logger.warning(
+            f"[BotManager] 未找到匹配平台 '{platform_id}' 的适配器。当前已有适配器列表: {list(self._adapters.keys())}"
+        )
         return None
 
-    def get_all_adapters(self) -> dict:
+    def get_adapter_platform_id(self, adapter: PlatformAdapter | object) -> str:
+        """获取适配器对应的真实平台实例 ID（如 'nuits'）"""
+        if not adapter:
+            return ""
+        # 1. 优先从 _adapters 映射表反查实例 ID
+        for p_id, adp in self._adapters.items():
+            if adp is adapter:
+                return str(p_id)
+        # 2. 从 adapter 属性读取
+        p_id = getattr(adapter, "platform_id", None)
+        if callable(p_id):
+            p_id = p_id()
+        if p_id:
+            return str(p_id)
+        # 3. 兜底读取 platform_name
+        return str(getattr(adapter, "platform_name", "") or "")
+
+    def get_all_adapters(self) -> dict[str, PlatformAdapter]:
         """获取所有 PlatformAdapter 实例 {platform_id: adapter}"""
         return self._adapters.copy()
 
     def has_adapter(self, platform_id: str | None = None) -> bool:
         """检查指定平台是否有适配器"""
         if platform_id:
-            return platform_id in self._adapters
+            return self.get_adapter(platform_id) is not None
         return bool(self._adapters)
 
     def can_analyze(self, platform_id: str | None = None) -> bool:
@@ -333,7 +416,9 @@ class BotManager:
 
         同时为每个发现的 bot 创建对应的 PlatformAdapter。
         """
-        platform_manager = getattr(self._context, "platform_manager", None)
+        platform_manager: PlatformManager | None = getattr(
+            self._context, "platform_manager", None
+        )
         get_insts = getattr(platform_manager, "get_insts", None)
         if self._context is None or not callable(get_insts):
             return {}
@@ -358,9 +443,8 @@ class BotManager:
         for platform in platforms:
             # 获取bot实例
             bot_client = None
-            bot_client = getattr(platform, "lark_api", None)
             platform_get_client = getattr(platform, "get_client", None)
-            if not bot_client and callable(platform_get_client):
+            if callable(platform_get_client):
                 bot_client = platform_get_client()
 
             if not bot_client:
@@ -414,11 +498,8 @@ class BotManager:
                         if isinstance(dict_name, str):
                             platform_name = dict_name
 
-                # 验证此平台名称是否受支持，如果不支持，尝试从bot实例检测（如果可用）
-                if (
-                    not platform_name
-                    or not PlatformAdapterFactory.is_supported(str(platform_name))
-                ) and bot_client:
+                # 仅当未从元数据获取到平台名称时，尝试从 bot 实例后备检测
+                if not platform_name and bot_client:
                     detected = self._detect_platform_name(bot_client)
                     if detected:
                         platform_name = detected
@@ -483,7 +564,7 @@ class BotManager:
             "ready_for_auto_analysis": self.is_ready_for_auto_analysis(),
         }
 
-    def update_from_event(self, event):
+    def update_from_event(self, event: AstrMessageEvent) -> bool:
         """从事件更新bot实例（用于手动命令）"""
         # 兼容不同平台的 bot 实例属性名 (OneBot 使用 bot, Discord 使用 client)
         bot_instance = getattr(event, "bot", None) or getattr(event, "client", None)
@@ -504,12 +585,7 @@ class BotManager:
             bot_self_id = None
             if hasattr(event, "get_self_id"):
                 val = event.get_self_id()
-                if (
-                    val
-                    and isinstance(val, (str, int))
-                    and not callable(val)
-                    and "partial" not in str(val)
-                ):
+                if val and not callable(val) and "partial" not in str(val):
                     bot_self_id = str(val)
 
             if not bot_self_id:
@@ -526,31 +602,67 @@ class BotManager:
             return True
         return False
 
-    def _extract_bot_self_id(self, bot_instance):
-        """从bot实例中提取自身ID（单个）"""
+    def _extract_bot_self_id(self, bot_instance: object) -> str | None:
+        """从 Bot 客户端实例中提取自身唯一标识 ID（单个目标）。
+
+        Args:
+            bot_instance: 平台 Bot 客户端实例。
+
+        Returns:
+            提取到的机器人字符串 ID，未获取到时返回 None。
+        """
         return self._extract_bot_self_id_impl(bot_instance)
 
-    def _extract_bot_self_id_impl(self, bot_instance):
-        """从bot实例中提取ID（通用实现）"""
-        # 尝试多种方式获取bot ID，并严格限制类型为 str/int 且不可调用，防止 OneBot (aiocqhttp) 动态代理返回 functools.partial
-        if hasattr(bot_instance, "self_id") and bot_instance.self_id:
-            val = bot_instance.self_id
-            if isinstance(val, (str, int)) and not callable(val):
+    def _extract_bot_self_id_impl(self, bot_instance: object) -> str | None:
+        """跨平台 SDK 通用 Bot ID 提取实现。
+
+        适配以下平台的属性特征：
+        1. OneBot / aiocqhttp: `self_id`, `user_id`
+        2. python-telegram-bot: `id`
+        3. Discord.py: `client.user.id`
+        4. Telegram 兜底: token 前缀 (`<bot_id>:<secret>`，initialize() 之前可用)
+
+        严格限制类型为不可调用的 str 或 int，防止 OneBot (aiocqhttp)
+        动态属性代理返回 functools.partial 等对象导致误匹配。
+
+        Args:
+            bot_instance: 平台 Bot 客户端实例。
+
+        Returns:
+            提取到的机器人字符串 ID，无法识别时返回 None。
+        """
+        # 1. 直接属性匹配 (OneBot: self_id / user_id, Telegram: id)
+        for attr in ("self_id", "user_id", "id"):
+            try:
+                val = getattr(bot_instance, attr, None)
+            except Exception as e:
+                # python-telegram-bot 的 ExtBot.id / ExtBot.user 是 property，
+                # initialize() 之前访问会抛 RuntimeError；getattr 的默认值只兜
+                # AttributeError 不兜异常，放任传播会整体拖垮插件初始化。
+                logger.debug(f"[BotManager] 读取客户端属性 {attr} 失败，跳过: {e}")
+                continue
+            if val and isinstance(val, (str, int)) and not callable(val):
                 return str(val)
-        if hasattr(bot_instance, "user_id") and bot_instance.user_id:
-            val = bot_instance.user_id
-            if isinstance(val, (str, int)) and not callable(val):
+
+        # 2. 嵌套用户对象匹配 (Discord.py: client.user.id)
+        try:
+            user = getattr(bot_instance, "user", None)
+        except Exception as e:
+            logger.debug(f"[BotManager] 读取客户端属性 user 失败，跳过: {e}")
+            user = None
+        if user is not None:
+            val = getattr(user, "id", None)
+            if val and isinstance(val, (str, int)) and not callable(val):
                 return str(val)
-        # Discord.py style: client.user.id
-        if hasattr(bot_instance, "user") and hasattr(bot_instance.user, "id"):
-            val = bot_instance.user.id
-            if isinstance(val, (str, int)) and not callable(val):
-                return str(val)
-        # python-telegram-bot style: bot.id
-        if hasattr(bot_instance, "id") and bot_instance.id:
-            val = bot_instance.id
-            if isinstance(val, (str, int)) and not callable(val):
-                return str(val)
+
+        # 3. Telegram 兜底：bot token 形如 "<bot_id>:<secret>"，initialize() 之前也能
+        #    拿到自身 ID，避免 Telegram 平台在启动阶段无法登记 bot_self_ids。
+        token = getattr(bot_instance, "token", None)
+        if isinstance(token, str) and ":" in token:
+            prefix = token.split(":", 1)[0]
+            if prefix.isdigit():
+                return prefix
+
         return None
 
     def validate_for_message_fetching(self, group_id: str) -> bool:
@@ -566,22 +678,160 @@ class BotManager:
         # 检查是否在ID列表中
         return sender_id_str in self._bot_self_ids
 
-    def is_plugin_enabled(self, platform_id: str, plugin_name: str) -> bool:
-        """检查指定平台是否启用了该插件"""
-        if platform_id not in self._platforms:
+    @staticmethod
+    def _is_valid_plugin_set(
+        val: object,
+    ) -> TypeGuard[Sequence[str] | set[str] | str | None]:
+        """检查值是否是真实有效的 plugin_set 数据类型（排除未配置的 Mock 对象）。"""
+        if val is None:
             return True
+        if isinstance(val, (str, list, tuple, set)):
+            type_name = type(val).__name__
+            module_name = getattr(type(val), "__module__", "")
+            return "mock" not in module_name.lower() and "Mock" not in type_name
+        return False
 
-        platform = self._platforms[platform_id]
-        platform_config = getattr(platform, "config", None)
-        if not isinstance(platform_config, dict):
-            return True
+    @staticmethod
+    def _check_plugin_set(
+        plugin_set: Sequence[str] | set[str] | str | None, plugin_name: str
+    ) -> bool:
+        """根据 AstrBot plugin_set 规则判定插件是否被启用。
 
-        plugin_set = platform_config.get("plugin_set", ["*"])
+        - plugin_set 为 None：视为未配置/禁用 (False)
+        - plugin_set 包含 '*'：启用所有插件 (True)
+        - plugin_set 为字符串或列表：匹配 plugin_name (忽略大小写)
+        """
+        target_name = plugin_name.strip().lower()
+        if isinstance(plugin_set, str):
+            val = plugin_set.strip().lower()
+            if not val:
+                return False
+            if val == "*" or fnmatch.fnmatchcase(target_name, val):
+                return True
+            return val == target_name
 
-        if plugin_set is None:
-            return False
+        if isinstance(plugin_set, (list, tuple, set)):
+            for item in plugin_set:
+                pat = str(item).strip().lower()
+                if not pat:
+                    continue
+                if pat == "*" or fnmatch.fnmatchcase(target_name, pat):
+                    return True
 
-        if "*" in plugin_set:
-            return True
+        return False
 
-        return plugin_name in plugin_set
+    def is_plugin_enabled(
+        self,
+        platform_id: str | None,
+        plugin_name: str = PLUGIN_NAME,
+        group_id: str | int | None = None,
+    ) -> bool:
+        """检查指定平台/群组在 AstrBot 配置中是否启用了该插件。
+
+        支持多配置文件 (ACM/UCR) 路由解析：
+        1. 优先通过 Context 中的 astrbot_config_mgr (ACM) 获取目标 UMO 对应的 AstrBotConfig。
+        2. 读取配置文件中的 plugin_set 配置项进行鉴权判定。
+        3. 兜底兼容平台实例内嵌配置与全局配置。
+
+        Args:
+            platform_id: 平台实例 ID。
+            plugin_name: 插件名称，默认为 PLUGIN_NAME。
+            group_id: 可选的群聊 ID，用于精准会话级 UMO 匹配。
+
+        Returns:
+            bool: 插件是否在对应的配置文件中被启用。
+        """
+        pid = str(platform_id or "").strip()
+        gid = str(group_id or "").strip() if group_id is not None else ""
+
+        # 1. 优先通过 AstrBot 核心多配置管理器 (ACM) 检查 UMO 级配置
+        if self._context is not None:
+            acm: AstrBotConfigManager | None = getattr(
+                self._context, "astrbot_config_mgr", None
+            )
+            if acm is not None and hasattr(acm, "get_conf"):
+                umo: str | None = None
+                if pid and gid:
+                    umo = f"{pid}:GroupMessage:{gid}"
+                elif pid:
+                    umo = f"{pid}::"
+
+                try:
+                    conf = acm.get_conf(umo)
+                    plugin_set = (
+                        conf.get("plugin_set", Ellipsis)
+                        if hasattr(conf, "get")
+                        else Ellipsis
+                    )
+                    if plugin_set is not Ellipsis and self._is_valid_plugin_set(
+                        plugin_set
+                    ):
+                        enabled = self._check_plugin_set(plugin_set, plugin_name)
+                        logger.debug(
+                            f"[BotManager鉴权] UMO '{umo}' 通过 AstrBotConfigManager 匹配到 Profile 配置: "
+                            f"plugin_set={plugin_set} -> 判定结果: {'启用' if enabled else '禁用'}"
+                        )
+                        return enabled
+                except Exception as e:
+                    logger.debug(
+                        f"[BotManager] 通过 ACM 查询 UMO {umo} 插件配置失败: {e}"
+                    )
+
+        # 2. 检查存储的平台实例配置 (兼容独立注入/单测场景)
+        if pid and pid in self._platforms:
+            platform = self._platforms[pid]
+            platform_config = getattr(platform, "config", None)
+            if isinstance(platform_config, dict) and "plugin_set" in platform_config:
+                plugin_set = platform_config["plugin_set"]
+                if self._is_valid_plugin_set(plugin_set):
+                    enabled = self._check_plugin_set(plugin_set, plugin_name)
+                    logger.debug(
+                        f"[BotManager鉴权] 平台 '{pid}' 通过平台实例 config 匹配: "
+                        f"plugin_set={plugin_set} -> 判定结果: {'启用' if enabled else '禁用'}"
+                    )
+                    return enabled
+
+            platform_settings = getattr(platform, "settings", None)
+            if (
+                isinstance(platform_settings, dict)
+                and "plugin_set" in platform_settings
+            ):
+                plugin_set = platform_settings["plugin_set"]
+                if self._is_valid_plugin_set(plugin_set):
+                    enabled = self._check_plugin_set(plugin_set, plugin_name)
+                    logger.debug(
+                        f"[BotManager鉴权] 平台 '{pid}' 通过平台实例 settings 匹配: "
+                        f"plugin_set={plugin_set} -> 判定结果: {'启用' if enabled else '禁用'}"
+                    )
+                    return enabled
+
+        # 3. 检查全局配置回退
+        if self._context is not None:
+            global_config = getattr(self._context, "_config", None) or getattr(
+                self._context, "astrbot_config", None
+            )
+            if global_config is not None:
+                plugin_set = None
+                found_plugin_set = False
+                if isinstance(global_config, dict) and "plugin_set" in global_config:
+                    plugin_set = global_config["plugin_set"]
+                    found_plugin_set = True
+                elif hasattr(global_config, "get"):
+                    val = global_config.get("plugin_set", Ellipsis)
+                    if val is not Ellipsis:
+                        plugin_set = val
+                        found_plugin_set = True
+
+                if found_plugin_set and self._is_valid_plugin_set(plugin_set):
+                    enabled = self._check_plugin_set(plugin_set, plugin_name)
+                    logger.debug(
+                        f"[BotManager鉴权] 平台 '{pid}' 通过全局 AstrBot 配置兜底匹配: "
+                        f"plugin_set={plugin_set} -> 判定结果: {'启用' if enabled else '禁用'}"
+                    )
+                    return enabled
+
+        # 4. 默认启用
+        logger.debug(
+            f"[BotManager鉴权] 平台 '{pid}' / 群 '{gid}' 未命中任何限制性配置，默认启用"
+        )
+        return True

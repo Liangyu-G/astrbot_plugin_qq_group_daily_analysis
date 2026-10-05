@@ -1,0 +1,495 @@
+"""
+阶段 Checkpoint 缓存仓储 - 支持分析子阶段产物缓存与局部断点续跑 (Partial Resume)
+"""
+
+from __future__ import annotations
+
+import json
+import sqlite3
+import time
+from pathlib import Path
+from typing import TYPE_CHECKING
+
+from ...domain.repositories.persistence_repository import ICheckpointStore
+
+if TYPE_CHECKING:
+    from ...domain.value_objects.analysis_results import (
+        CheckpointDetailPayload,
+        CheckpointSummaryPayload,
+    )
+
+
+class CheckpointStore(ICheckpointStore):
+    """阶段 Checkpoint 存储器，用于在子阶段失败时实现秒级局部重试并节省 Token"""
+
+    def __init__(self, db_path: Path):
+        self.db_path = Path(db_path)
+        self.db_path.parent.mkdir(parents=True, exist_ok=True)
+        self._init_db()
+
+    def _get_connection(self) -> sqlite3.Connection:
+        conn = sqlite3.connect(str(self.db_path), timeout=10.0)
+        conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA journal_mode=WAL;")
+        return conn
+
+    def _init_db(self) -> None:
+        with self._get_connection() as conn:
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS stage_checkpoints (
+                    checkpoint_id TEXT PRIMARY KEY,
+                    group_id TEXT NOT NULL,
+                    date_str TEXT NOT NULL,
+                    stage_name TEXT NOT NULL,
+                    data_json TEXT NOT NULL,
+                    created_at REAL NOT NULL,
+                    expire_at REAL NOT NULL,
+                    trace_id TEXT DEFAULT ''
+                );
+                """
+            )
+            # 增量升级：如果历史旧表缺少 trace_id 字段则自动追加
+            cursor = conn.execute("PRAGMA table_info(stage_checkpoints);")
+            columns = [row["name"] for row in cursor.fetchall()]
+            if "trace_id" not in columns:
+                try:
+                    conn.execute(
+                        "ALTER TABLE stage_checkpoints ADD COLUMN trace_id TEXT DEFAULT '';"
+                    )
+                except Exception:
+                    pass
+
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_chk_group_date ON stage_checkpoints(group_id, date_str);"
+            )
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_chk_trace_stage ON stage_checkpoints(trace_id, stage_name);"
+            )
+
+    def save_checkpoint(
+        self,
+        group_id: str,
+        date_str: str,
+        stage_name: str,
+        data: object,
+        trace_id: str = "",
+        ttl_seconds: int = 86400 * 30,
+    ) -> None:
+        """保存阶段产物快照（默认保留 30 天）。
+
+        支持通过 trace_id 进行任务级精准隔离；若未传入 trace_id 则兼容按天回退。
+        """
+        # 若指定了 trace_id，则快照主键绑定任务实例（绝不与同天其他任务发生碰撞或覆盖）
+        if trace_id:
+            checkpoint_id = f"{group_id}_{date_str}_{stage_name}_{trace_id}"
+        else:
+            checkpoint_id = f"{group_id}_{date_str}_{stage_name}"
+
+        now = time.time()
+        expire_at = now + ttl_seconds
+
+        with self._get_connection() as conn:
+            conn.execute(
+                """
+                INSERT INTO stage_checkpoints (
+                    checkpoint_id, group_id, date_str, stage_name, data_json, created_at, expire_at, trace_id
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(checkpoint_id) DO UPDATE SET
+                    data_json=excluded.data_json,
+                    created_at=excluded.created_at,
+                    expire_at=excluded.expire_at,
+                    trace_id=excluded.trace_id;
+                """,
+                (
+                    checkpoint_id,
+                    str(group_id),
+                    str(date_str),
+                    stage_name,
+                    json.dumps(data, ensure_ascii=False),
+                    now,
+                    expire_at,
+                    str(trace_id or ""),
+                ),
+            )
+
+    def get_checkpoint(
+        self,
+        group_id: str,
+        date_str: str,
+        stage_name: str,
+        trace_id: str = "",
+    ) -> object | None:
+        """读取有效的阶段产物快照。
+
+        若指定 trace_id 则优先匹配该任务的专属快照，杜绝跨任务脏读；
+        若未指定或专属快照未命中，可回退匹配按天快照。
+        """
+        now = time.time()
+
+        with self._get_connection() as conn:
+            row = None
+            if trace_id:
+                # 1. 优先按专属 task checkpoint_id 查找
+                scoped_id = f"{group_id}_{date_str}_{stage_name}_{trace_id}"
+                row = conn.execute(
+                    "SELECT * FROM stage_checkpoints WHERE checkpoint_id = ? AND expire_at >= ?",
+                    (scoped_id, now),
+                ).fetchone()
+
+                # 2. 如果 scoped_id 没找到，尝试按 (trace_id, stage_name) 查找
+                if not row:
+                    row = conn.execute(
+                        "SELECT * FROM stage_checkpoints WHERE trace_id = ? AND stage_name = ? AND expire_at >= ? ORDER BY created_at DESC LIMIT 1",
+                        (str(trace_id), stage_name, now),
+                    ).fetchone()
+
+            # 3. 回退查找通用快照：
+            # 若调用方显式指定了 trace_id，仅允许回退到老格式（trace_id = ''）的快照，严禁跨任务脏读其他 trace_id；
+            # 若调用方未指定 trace_id，则允许获取该群该日期最新的该阶段快照。
+            if not row:
+                if trace_id:
+                    row = conn.execute(
+                        "SELECT * FROM stage_checkpoints WHERE group_id = ? AND date_str = ? AND stage_name = ? AND (trace_id = '' OR trace_id IS NULL) AND expire_at >= ? ORDER BY created_at DESC LIMIT 1",
+                        (str(group_id), str(date_str), stage_name, now),
+                    ).fetchone()
+                else:
+                    row = conn.execute(
+                        "SELECT * FROM stage_checkpoints WHERE group_id = ? AND date_str = ? AND stage_name = ? AND expire_at >= ? ORDER BY created_at DESC LIMIT 1",
+                        (str(group_id), str(date_str), stage_name, now),
+                    ).fetchone()
+
+            if not row:
+                return None
+
+            try:
+                return json.loads(row["data_json"])
+            except Exception:
+                return None
+
+    def clear_checkpoints(self, group_id: str, date_str: str) -> None:
+        """任务全部成功后清理该群当天的临时 Checkpoint。
+
+        Args:
+            group_id: 群号。
+            date_str: 日期字符串。
+        """
+        with self._get_connection() as conn:
+            conn.execute(
+                "DELETE FROM stage_checkpoints WHERE group_id = ? AND date_str = ?",
+                (str(group_id), str(date_str)),
+            )
+
+    def get_checkpoints_by_group_date(
+        self, group_id: str, date_str: str
+    ) -> list[CheckpointSummaryPayload]:
+        """获取指定群在指定日期的所有有效 Checkpoint 快照摘要列表。
+
+        Args:
+            group_id: 群号。
+            date_str: 日期字符串（YYYY-MM-DD）。
+
+        Returns:
+            list[CheckpointSummaryPayload]: Checkpoint 摘要元数据列表。
+        """
+        now = time.time()
+        with self._get_connection() as conn:
+            rows = conn.execute(
+                """
+                SELECT checkpoint_id, group_id, date_str, stage_name, created_at, expire_at, LENGTH(data_json) as data_size
+                FROM stage_checkpoints
+                WHERE group_id = ? AND date_str = ? AND expire_at >= ?
+                ORDER BY created_at ASC
+                """,
+                (str(group_id), str(date_str), now),
+            ).fetchall()
+            return [
+                {
+                    "checkpoint_id": row["checkpoint_id"],
+                    "group_id": row["group_id"],
+                    "date_str": row["date_str"],
+                    "stage_name": row["stage_name"],
+                    "created_at": row["created_at"],
+                    "expire_at": row["expire_at"],
+                    "data_size": row["data_size"],
+                }
+                for row in rows
+            ]
+
+    def get_checkpoints_by_date_range(
+        self,
+        group_id: str,
+        start_date: str,
+        end_date: str,
+        stage_name: str = "LLM_ANALYSIS",
+    ) -> list[dict[str, object]]:
+        """按日期范围查询指定群在各自然日最新有效的一份阶段 Checkpoint 详情列表。
+
+        采用 SQL 窗口去重，同一天存在多份时取 MAX(created_at)，按日期升序返回。
+
+        Args:
+            group_id: 群号。
+            start_date: 起始日期（YYYY-MM-DD）。
+            end_date: 截止日期（YYYY-MM-DD）。
+            stage_name: 阶段名称（默认为 LLM_ANALYSIS）。
+
+        Returns:
+            list[dict[str, object]]: 包含 checkpoint_id, date_str, created_at, data 的详情字典列表。
+        """
+        now = time.time()
+        with self._get_connection() as conn:
+            query = """
+                WITH ranked_checkpoints AS (
+                    SELECT checkpoint_id, group_id, date_str, stage_name, data_json, created_at, expire_at, trace_id,
+                           ROW_NUMBER() OVER (PARTITION BY date_str ORDER BY created_at DESC) AS rn
+                    FROM stage_checkpoints
+                    WHERE (group_id = ? OR group_id LIKE ?)
+                      AND date_str >= ? AND date_str <= ?
+                      AND stage_name = ?
+                      AND expire_at >= ?
+                )
+                SELECT checkpoint_id, group_id, date_str, stage_name, data_json, created_at, expire_at, trace_id
+                FROM ranked_checkpoints
+                WHERE rn = 1
+                ORDER BY date_str ASC;
+            """
+            rows = conn.execute(
+                query,
+                (
+                    str(group_id),
+                    f"%:{group_id}",
+                    str(start_date),
+                    str(end_date),
+                    stage_name,
+                    now,
+                ),
+            ).fetchall()
+
+            results: list[dict[str, object]] = []
+            for row in rows:
+                try:
+                    data = json.loads(row["data_json"])
+                except Exception:
+                    data = row["data_json"]
+                results.append(
+                    {
+                        "checkpoint_id": row["checkpoint_id"],
+                        "group_id": row["group_id"],
+                        "date_str": row["date_str"],
+                        "stage_name": row["stage_name"],
+                        "trace_id": row["trace_id"] or "",
+                        "created_at": row["created_at"],
+                        "created_at_formatted": time.strftime(
+                            "%Y-%m-%d %H:%M:%S", time.localtime(row["created_at"])
+                        ),
+                        "data": data,
+                    }
+                )
+            return results
+
+    def delete_checkpoint(
+        self,
+        group_id: str,
+        date_str: str,
+        stage_name: str,
+        trace_id: str = "",
+    ) -> bool:
+        """单点删除指定阶段 Checkpoint。
+
+        Args:
+            group_id: 群号。
+            date_str: 日期字符串（YYYY-MM-DD）。
+            stage_name: 阶段名称。
+            trace_id: 可选任务ID。
+
+        Returns:
+            bool: 是否成功删除。
+        """
+        with self._get_connection() as conn:
+            if trace_id:
+                scoped_id = f"{group_id}_{date_str}_{stage_name}_{trace_id}"
+                cursor = conn.execute(
+                    "DELETE FROM stage_checkpoints WHERE checkpoint_id = ? OR (group_id = ? AND date_str = ? AND stage_name = ? AND trace_id = ?)",
+                    (
+                        scoped_id,
+                        str(group_id),
+                        str(date_str),
+                        stage_name,
+                        str(trace_id),
+                    ),
+                )
+                if cursor.rowcount > 0:
+                    return True
+
+            legacy_id = f"{group_id}_{date_str}_{stage_name}"
+            cursor = conn.execute(
+                "DELETE FROM stage_checkpoints WHERE checkpoint_id = ?",
+                (legacy_id,),
+            )
+            return cursor.rowcount > 0
+
+    def list_all_checkpoints(
+        self,
+        limit: int = 50,
+        offset: int = 0,
+        group_id: str | None = None,
+        date_str: str | None = None,
+        stage_name: str | None = None,
+        trace_id: str | None = None,
+    ) -> tuple[list[CheckpointSummaryPayload], int]:
+        """多维条件分页查询有效 Checkpoint 列表。
+
+        Args:
+            limit: 分页数量限制。
+            offset: 偏移量。
+            group_id: 可选群号筛选。
+            date_str: 可选日期筛选。
+            stage_name: 可选阶段筛选。
+            trace_id: 可选 TraceID 筛选。
+
+        Returns:
+            tuple[list[CheckpointSummaryPayload], int]: Checkpoint 列表与总数。
+        """
+        now = time.time()
+        conditions = ["expire_at >= ?"]
+        params: list[object] = [now]
+
+        if group_id:
+            conditions.append("group_id = ?")
+            params.append(str(group_id))
+        if date_str:
+            conditions.append("date_str = ?")
+            params.append(str(date_str))
+        if stage_name:
+            conditions.append("stage_name = ?")
+            params.append(str(stage_name))
+        if trace_id:
+            conditions.append("trace_id = ?")
+            params.append(str(trace_id))
+
+        where_clause = " AND ".join(conditions)
+
+        with self._get_connection() as conn:
+            count_row = conn.execute(
+                f"SELECT COUNT(*) as total FROM stage_checkpoints WHERE {where_clause}",
+                params,
+            ).fetchone()
+            total = count_row["total"] if count_row else 0
+
+            query_sql = f"""
+                SELECT checkpoint_id, group_id, date_str, stage_name, created_at, expire_at, trace_id, LENGTH(data_json) as data_size
+                FROM stage_checkpoints
+                WHERE {where_clause}
+                ORDER BY created_at DESC
+                LIMIT ? OFFSET ?
+            """
+            rows = conn.execute(query_sql, [*params, limit, offset]).fetchall()
+            items: list[CheckpointSummaryPayload] = [
+                {
+                    "checkpoint_id": row["checkpoint_id"],
+                    "group_id": row["group_id"],
+                    "date_str": row["date_str"],
+                    "stage_name": row["stage_name"],
+                    "trace_id": row["trace_id"] or "",
+                    "created_at": row["created_at"],
+                    "created_at_formatted": time.strftime(
+                        "%Y-%m-%d %H:%M:%S", time.localtime(row["created_at"])
+                    ),
+                    "expire_at": row["expire_at"],
+                    "data_size": row["data_size"],
+                    "data_size_bytes": row["data_size"],
+                }
+                for row in rows
+            ]
+            return items, total
+
+    def get_checkpoint_detail(
+        self,
+        group_id: str,
+        date_str: str,
+        stage_name: str,
+        trace_id: str = "",
+    ) -> CheckpointDetailPayload | None:
+        """获取单个 Checkpoint 的元数据及反序列化后的产物 JSON。
+
+        Args:
+            group_id: 群号。
+            date_str: 日期字符串。
+            stage_name: 阶段名称。
+            trace_id: 可选任务 TraceID。
+
+        Returns:
+            CheckpointDetailPayload | None: 包含 metadata 和 data 的字典，不存在或过期返回 None。
+        """
+        now = time.time()
+        with self._get_connection() as conn:
+            row = None
+            if trace_id:
+                scoped_id = f"{group_id}_{date_str}_{stage_name}_{trace_id}"
+                row = conn.execute(
+                    "SELECT * FROM stage_checkpoints WHERE checkpoint_id = ? AND expire_at >= ?",
+                    (scoped_id, now),
+                ).fetchone()
+                if not row:
+                    row = conn.execute(
+                        "SELECT * FROM stage_checkpoints WHERE trace_id = ? AND stage_name = ? AND expire_at >= ? ORDER BY created_at DESC LIMIT 1",
+                        (str(trace_id), stage_name, now),
+                    ).fetchone()
+
+            if not row:
+                legacy_id = f"{group_id}_{date_str}_{stage_name}"
+                row = conn.execute(
+                    "SELECT * FROM stage_checkpoints WHERE checkpoint_id = ?",
+                    (legacy_id,),
+                ).fetchone()
+
+            if not row or row["expire_at"] < now:
+                return None
+            try:
+                data = json.loads(row["data_json"])
+            except Exception:
+                data = row["data_json"]
+
+            return {
+                "checkpoint_id": row["checkpoint_id"],
+                "group_id": row["group_id"],
+                "date_str": row["date_str"],
+                "stage_name": row["stage_name"],
+                "trace_id": row["trace_id"] or "",
+                "created_at": row["created_at"],
+                "created_at_formatted": time.strftime(
+                    "%Y-%m-%d %H:%M:%S", time.localtime(row["created_at"])
+                ),
+                "expire_at": row["expire_at"],
+                "checkpoint_data": data,
+                "data": data,
+                "data_size": len(row["data_json"]),
+                "data_size_bytes": len(row["data_json"]),
+            }
+
+    def get_distinct_checkpoint_groups(self) -> list[str]:
+        """获取所有拥有有效 Checkpoint 记录的群号列表。
+
+        Returns:
+            list[str]: 去重群号列表。
+        """
+        now = time.time()
+        with self._get_connection() as conn:
+            rows = conn.execute(
+                "SELECT DISTINCT group_id FROM stage_checkpoints WHERE expire_at >= ? ORDER BY group_id ASC",
+                (now,),
+            ).fetchall()
+            return [str(row["group_id"]) for row in rows if row["group_id"]]
+
+    def cleanup_expired(self) -> int:
+        """清理所有已过期的 Checkpoint。
+
+        Returns:
+            int: 清理的过期记录数。
+        """
+        now = time.time()
+        with self._get_connection() as conn:
+            cursor = conn.execute(
+                "DELETE FROM stage_checkpoints WHERE expire_at < ?", (now,)
+            )
+            return cursor.rowcount

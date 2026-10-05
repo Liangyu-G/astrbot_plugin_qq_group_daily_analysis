@@ -1,0 +1,154 @@
+export interface ReportTemplateItem {
+  id: string;
+  label: string;
+  is_custom?: boolean;
+  has_image?: boolean;
+  has_html?: boolean;
+  can_uninstall?: boolean;
+  display_name?: string;
+  desc?: string;
+  tag?: string;
+  tag_color?: string;
+}
+
+export interface SelectOptionItem {
+  label: string;
+  value: string;
+  is_custom?: boolean;
+}
+
+export interface TemplateVisualInfo {
+  key: string;
+  name: string;
+  desc: string;
+  tag: string;
+  tagColor: string;
+}
+
+export const KNOWN_TEMPLATES: TemplateVisualInfo[] = [
+  {
+    key: "HatsuneMiku",
+    name: "HatsuneMiku (初音未来 / 默认)",
+    desc: "初音未来葱绿配色与音乐律动设计，支持多语言动态自适应",
+    tag: "默认主题",
+    tagColor: "green",
+  },
+  {
+    key: "scrapbook",
+    name: "Scrapbook (手账风格)",
+    desc: "手账贴纸风格，丰富拼贴与涂鸦设计，温馨可爱",
+    tag: "手账贴纸",
+    tagColor: "orange",
+  },
+  {
+    key: "ATRI",
+    name: "ATRI (亚托莉)",
+    desc: "《ATRI -My Dear Moments-》水下与海洋蓝调风格",
+    tag: "水下海洋",
+    tagColor: "blue",
+  },
+  {
+    key: "BlueArchive",
+    name: "BlueArchive (蔚蓝档案)",
+    desc: "碧蓝档案 UI 风格，清爽明亮青蓝与现代科技感",
+    tag: "清爽科技",
+    tagColor: "cyan",
+  },
+  {
+    key: "HatsuneMiku",
+    name: "HatsuneMiku (初音未来)",
+    desc: "初音未来葱绿配色与音乐律动设计",
+    tag: "葱绿音乐",
+    tagColor: "green",
+  },
+  {
+    key: "retro_futurism",
+    name: "Retro Futurism (复古未来)",
+    desc: "复古未来主义与像素霓虹排版风格",
+    tag: "复古像素",
+    tagColor: "purple",
+  },
+  {
+    key: "hack",
+    name: "Hack (黑客终端)",
+    desc: "赛博朋克极客终端，深黑背景与荧光绿代码风",
+    tag: "黑客极客",
+    tagColor: "lime",
+  },
+  {
+    key: "spring_festival",
+    name: "Spring Festival (新春红)",
+    desc: "中国传统喜庆红金配色，新春佳节喜气洋洋",
+    tag: "新春年节",
+    tagColor: "red",
+  },
+  {
+    key: "simple",
+    name: "Simple (极简浅色)",
+    desc: "干净清爽极简留白风格，高信息密度与易读性",
+    tag: "极简素雅",
+    tagColor: "default",
+  },
+  {
+    key: "art_nouveau",
+    name: "Art Nouveau (新艺术运动)",
+    desc: "源自19世纪末穆夏海报与自然美学，以流动藤蔓、雅金边框与典雅衬线排版呈现自然与艺术的和谐",
+    tag: "新艺术风",
+    tagColor: "gold",
+  },
+  {
+    key: "deepseek_maid",
+    name: "DeepSeek 鲸鱼女仆娘",
+    desc: "大肥鱼打工实录：饭票账单、内心OS、摸鱼雷达与DeepSleep交班",
+    tag: "蓝白女仆",
+    tagColor: "blue",
+  },
+  {
+    key: "format",
+    name: "Format (标准卡片)",
+    desc: "标准规范报表卡片，商务整洁",
+    tag: "标准报表",
+    tagColor: "geekblue",
+  },
+];
+
+export const DEFAULT_CDN_HOST = "https://cdn.jsdmirror.com";
+export const GITHUB_REPO_OWNER = "SXP-Simon";
+export const GITHUB_REPO_NAME = "astrbot_plugin_qq_group_daily_analysis";
+export const GITHUB_REPO_BRANCH = "main";
+export const ASSETS_CDN_BASE = `${DEFAULT_CDN_HOST}/gh/${GITHUB_REPO_OWNER}/${GITHUB_REPO_NAME}@${GITHUB_REPO_BRANCH}/assets`;
+
+export function getTemplateCdnUrl(templateKey: string): string {
+  return `${ASSETS_CDN_BASE}/${templateKey}-demo.jpg`;
+}
+
+export const DEFAULT_REPORT_TEMPLATES: ReportTemplateItem[] = [
+  { id: "HatsuneMiku", label: "初音未来 (HatsuneMiku / 默认)", is_custom: false },
+  { id: "scrapbook", label: "手账风格 (Scrapbook)", is_custom: false },
+  { id: "ATRI", label: "亚托莉 (ATRI)", is_custom: false },
+  { id: "spring_festival", label: "新春佳节 (Spring Festival)", is_custom: false },
+  { id: "retro_futurism", label: "复古未来 (Retro Futurism)", is_custom: false },
+  { id: "hack", label: "黑客赛博 (Hack)", is_custom: false },
+  { id: "BlueArchive", label: "蔚蓝档案 (BlueArchive)", is_custom: false },
+  { id: "simple", label: "极简黑白 (Simple)", is_custom: false },
+  { id: "art_nouveau", label: "新艺术运动 (Art Nouveau)", is_custom: false },
+  { id: "deepseek_maid", label: "DeepSeek 鲸鱼女仆娘", is_custom: false },
+  { id: "format", label: "标准卡片 (Format)", is_custom: false },
+];
+
+export function formatTemplateOptions(
+  templates: ReportTemplateItem[],
+  includeAuto = false
+): SelectOptionItem[] {
+  const list = templates && templates.length > 0 ? templates : DEFAULT_REPORT_TEMPLATES;
+  const options: SelectOptionItem[] = list.map((t) => ({
+    label: t.label || `${t.id}${t.is_custom ? " (自定义)" : ""}`,
+    value: t.id,
+    is_custom: Boolean(t.is_custom),
+  }));
+
+  if (includeAuto) {
+    return [{ label: "跟随系统默认配置 (推荐)", value: "auto" }, ...options];
+  }
+  return options;
+}

@@ -3,17 +3,22 @@ LLM分析器模块
 负责协调各个分析器进行话题分析、用户称号分析和金句分析
 """
 
-import asyncio
+from __future__ import annotations
 
-from ...domain.models.data_models import (
+import asyncio
+from typing import TYPE_CHECKING
+
+from ...domain.repositories.analysis_repository import IAnalysisProvider
+from ...domain.value_objects import (
+    ComicStoryboard,
     GoldenQuote,
     QualityReview,
     SummaryTopic,
     TokenUsage,
     UserTitle,
 )
-from ...domain.repositories.analysis_repository import IAnalysisProvider
-from ...shared.constants import PLUGIN_NAME
+from ...shared.constants import AnalysisStage
+from ...shared.trace_context import TraceContext
 from ...utils.logger import logger
 from .analyzers.chat_quality_analyzer import ChatQualityAnalyzer
 from .analyzers.comic_analyzer import ComicStoryboardAnalyzer
@@ -23,6 +28,14 @@ from .analyzers.user_title_analyzer import UserTitleAnalyzer
 from .utils.json_utils import fix_json
 from .utils.llm_utils import call_provider_with_retry
 
+if TYPE_CHECKING:
+    from collections.abc import Sequence
+
+    from astrbot.api.provider import LLMResponse
+    from astrbot.api.star import Context
+
+    from ..config.config_manager import ConfigManager
+
 
 class LLMAnalyzer(IAnalysisProvider):
     """
@@ -31,12 +44,19 @@ class LLMAnalyzer(IAnalysisProvider):
     保持向后兼容性，提供原有的接口
     """
 
+    context: Context
+    config_manager: ConfigManager
     topic_analyzer: TopicAnalyzer
     user_title_analyzer: UserTitleAnalyzer
     golden_quote_analyzer: GoldenQuoteAnalyzer
+    chat_quality_analyzer: ChatQualityAnalyzer
     comic_storyboard_analyzer: ComicStoryboardAnalyzer
 
-    def __init__(self, context, config_manager):
+    def __init__(
+        self,
+        context: Context,
+        config_manager: ConfigManager,
+    ) -> None:
         """
         初始化LLM分析器
 
@@ -56,44 +76,23 @@ class LLMAnalyzer(IAnalysisProvider):
             context, config_manager
         )
 
-    @staticmethod
-    def _make_session_id(
-        session_id: str | None, umo: str | None = None, prefix: str = ""
-    ) -> str:
-        """Generate a session ID if not already provided."""
-        if session_id:
-            return session_id
-        from datetime import datetime
-
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        if umo:
-            safe_umo = umo.replace(":", "_")
-            return f"{prefix}{timestamp}_{safe_umo}"
-        return f"{prefix}{timestamp}"
-
     async def analyze_topics(
         self,
         messages: list[dict],
         umo: str | None = None,
-        session_id: str | None = None,
     ) -> tuple[list[SummaryTopic], TokenUsage]:
-        """
-        使用LLM分析话题
-        保持原有接口，委托给专门的TopicAnalyzer处理
+        """使用LLM分析话题
 
         Args:
             messages: 群聊消息列表
             umo: 模型唯一标识符
-            session_id: 会话ID (用于调试模式)
 
         Returns:
             (话题列表, Token使用统计)
         """
         try:
-            session_id = self._make_session_id(session_id, umo)
-
-            logger.info(f"开始话题分析, session_id: {session_id}")
-            return await self.topic_analyzer.analyze_topics(messages, umo, session_id)
+            logger.info("开始话题分析")
+            return await self.topic_analyzer.analyze_topics(messages, umo)
         except Exception as e:
             logger.error(f"话题分析失败: {e}")
             return [], TokenUsage()
@@ -104,28 +103,22 @@ class LLMAnalyzer(IAnalysisProvider):
         user_activity: dict,
         umo: str | None = None,
         top_users: list[dict] | None = None,
-        session_id: str | None = None,
     ) -> tuple[list[UserTitle], TokenUsage]:
-        """
-        使用LLM分析用户称号
-        保持原有接口，委托给专门的UserTitleAnalyzer处理
+        """使用LLM分析用户称号
 
         Args:
             messages: 群聊消息列表
             user_activity: 用户分析统计
             umo: 模型唯一标识符
             top_users: 活跃用户列表(可选)
-            session_id: 会话ID (用于调试模式)
 
         Returns:
             (用户称号列表, Token使用统计)
         """
         try:
-            session_id = self._make_session_id(session_id, umo)
-
-            logger.info(f"开始用户称号分析, session_id: {session_id}")
+            logger.info("开始用户称号分析")
             return await self.user_title_analyzer.analyze_user_titles(
-                messages, user_activity, umo, top_users, session_id
+                messages, user_activity, umo, top_users
             )
         except Exception as e:
             logger.error(f"用户称号分析失败: {e}")
@@ -135,45 +128,35 @@ class LLMAnalyzer(IAnalysisProvider):
         self,
         messages: list[dict],
         umo: str | None = None,
-        session_id: str | None = None,
     ) -> tuple[list[GoldenQuote], TokenUsage]:
-        """
-        使用LLM分析群聊金句
-        保持原有接口，委托给专门的GoldenQuoteAnalyzer处理
+        """使用LLM分析群聊金句
 
         Args:
             messages: 群聊消息列表
             umo: 模型唯一标识符
-            session_id: 会话ID (用于调试模式)
 
         Returns:
             (金句列表, Token使用统计)
         """
         try:
-            session_id = self._make_session_id(session_id, umo)
-
-            logger.info(f"开始金句分析, session_id: {session_id}")
-            return await self.golden_quote_analyzer.analyze_golden_quotes(
-                messages, umo, session_id
-            )
+            logger.info("开始金句分析")
+            return await self.golden_quote_analyzer.analyze_golden_quotes(messages, umo)
         except Exception as e:
             logger.error(f"金句分析失败: {e}")
             return [], TokenUsage()
 
     async def analyze_comic_storyboards(
         self,
-        topics: list[dict],
+        topics: Sequence[SummaryTopic] | Sequence[dict[str, object]],
         umo: str | None = None,
-        session_id: str | None = None,
         persona_id: str | None = None,
         prompt_template: str | None = None,
-    ) -> tuple[list[dict], TokenUsage]:
+    ) -> tuple[list[ComicStoryboard] | list[dict[str, str]], TokenUsage]:
         """使用 LLM 分析并生成漫画分镜和绘画提示词。
 
         Args:
             topics: 已提取的有效群聊话题。
             umo: 群聊统一消息来源标识。
-            session_id: 调试会话标识。
             persona_id: 漫画分镜专用人格 ID。
             prompt_template: 角色专属的漫画分镜提示词模板。
 
@@ -181,27 +164,36 @@ class LLMAnalyzer(IAnalysisProvider):
             分镜列表和 Token 使用统计。
         """
         try:
-            session_id = self._make_session_id(session_id, umo)
-
-            logger.info(f"开始漫画分镜分析, session_id: {session_id}")
-            return await self.comic_storyboard_analyzer.analyze_storyboards(
-                topics, umo, session_id, persona_id, prompt_template
+            logger.info("开始漫画分镜分析")
+            (
+                storyboards,
+                usage,
+            ) = await self.comic_storyboard_analyzer.analyze_storyboards(
+                topics,
+                umo=umo,
+                persona_id=persona_id,
+                prompt_template=prompt_template,
             )
+            trace = TraceContext.current()
+            if trace and usage and usage.total_tokens > 0:
+                trace.add_token_usage(
+                    usage.prompt_tokens,
+                    usage.completion_tokens,
+                    analyzer_name="comic_storyboard",
+                )
+            return storyboards, usage
         except Exception as e:
             logger.error(f"漫画分镜分析失败: {e}", exc_info=True)
             return [], TokenUsage()
 
     async def summarize_quality_reviews(
         self,
-        batch_reviews: list[dict],
+        batch_reviews: Sequence[QualityReview] | Sequence[dict[str, object]],
         umo: str | None = None,
-        session_id: str | None = None,
     ) -> tuple[QualityReview | None, TokenUsage]:
-        """
-        汇总多个质量分析报告（增量模式使用）
-        """
+        """汇总多个质量分析报告（增量模式使用）"""
         return await self.chat_quality_analyzer.summarize_batch_reviews(
-            batch_reviews, umo, session_id
+            batch_reviews, umo
         )
 
     async def analyze_all_concurrent(
@@ -237,48 +229,34 @@ class LLMAnalyzer(IAnalysisProvider):
             (话题列表, 用户称号列表, 金句列表, 总Token使用统计)
         """
         try:
-            session_id = self._make_session_id(None, umo)
-
             logger.info(
-                f"开始并发执行分析任务 (话题:{topic_enabled}, 称号:{user_title_enabled}, 金句:{golden_quote_enabled}, 质量:{chat_quality_enabled})，会话ID: {session_id}"
+                f"开始并发执行分析任务 (话题:{topic_enabled}, 称号:{user_title_enabled}, 金句:{golden_quote_enabled}, 质量:{chat_quality_enabled})"
             )
-
-            # 保存原始消息数据 (Debug Mode)
-            if self.config_manager.get_debug_mode():
-                self._save_debug_messages(messages, session_id)
 
             # 构建并发任务列表
             tasks = []
             task_names = []
 
             if topic_enabled:
-                tasks.append(
-                    self.topic_analyzer.analyze_topics(messages, umo, session_id)
-                )
+                tasks.append(self.topic_analyzer.analyze_topics(messages, umo))
                 task_names.append("topic")
 
             if user_title_enabled:
                 tasks.append(
                     self.user_title_analyzer.analyze_user_titles(
-                        messages, user_activity, umo, top_users, session_id
+                        messages, user_activity, umo, top_users
                     )
                 )
                 task_names.append("user_title")
 
             if golden_quote_enabled:
                 tasks.append(
-                    self.golden_quote_analyzer.analyze_golden_quotes(
-                        messages, umo, session_id
-                    )
+                    self.golden_quote_analyzer.analyze_golden_quotes(messages, umo)
                 )
                 task_names.append("golden_quote")
 
             if chat_quality_enabled:
-                tasks.append(
-                    self.chat_quality_analyzer.analyze_quality(
-                        messages, umo, session_id
-                    )
-                )
+                tasks.append(self.chat_quality_analyzer.analyze_quality(messages, umo))
                 task_names.append("chat_quality")
 
             if not tasks:
@@ -292,11 +270,13 @@ class LLMAnalyzer(IAnalysisProvider):
             golden_quotes, quote_usage = [], TokenUsage()
             chat_quality_review = None
             quality_usage = TokenUsage()  # Initialize here
+            subtask_errors: list[str] = []
 
             for i, result in enumerate(results):
                 name = task_names[i]
                 if isinstance(result, Exception):
                     logger.error(f"分析任务 {name} 失败: {result}")
+                    subtask_errors.append(f"{name}: {result!s}")
                     continue
 
                 if name == "topic" and isinstance(result, tuple):
@@ -326,6 +306,93 @@ class LLMAnalyzer(IAnalysisProvider):
                 + quality_usage.total_tokens,
             )
 
+            # 校验并补全未成功产出内容的子任务说明
+            if (
+                topic_enabled
+                and not topics
+                and not any(e.startswith("topic") for e in subtask_errors)
+            ):
+                subtask_errors.append(
+                    "topic: 未能提取出有效话题（有效文本过少或模型未返回话题）"
+                )
+            if (
+                user_title_enabled
+                and not user_titles
+                and not any(e.startswith("user_title") for e in subtask_errors)
+            ):
+                subtask_errors.append(
+                    "user_title: 未能生成用户称号（活跃用户不足或模型未返回称号）"
+                )
+            if (
+                golden_quote_enabled
+                and not golden_quotes
+                and not any(e.startswith("golden_quote") for e in subtask_errors)
+            ):
+                subtask_errors.append(
+                    "golden_quote: 未能提取出精彩金句（符合条件的消息过少或模型未返回）"
+                )
+            if (
+                chat_quality_enabled
+                and not chat_quality_review
+                and not any(e.startswith("chat_quality") for e in subtask_errors)
+            ):
+                subtask_errors.append(
+                    "chat_quality: 未能生成质量锐评（模型未按预期格式输出）"
+                )
+
+            # 记录 Token 消耗与丰富执行详情到 TraceContext
+            trace = TraceContext.current()
+            if trace:
+                if topic_usage.total_tokens > 0:
+                    trace.add_token_usage(
+                        topic_usage.prompt_tokens,
+                        topic_usage.completion_tokens,
+                        analyzer_name="topics",
+                    )
+                if title_usage.total_tokens > 0:
+                    trace.add_token_usage(
+                        title_usage.prompt_tokens,
+                        title_usage.completion_tokens,
+                        analyzer_name="user_titles",
+                    )
+                if quote_usage.total_tokens > 0:
+                    trace.add_token_usage(
+                        quote_usage.prompt_tokens,
+                        quote_usage.completion_tokens,
+                        analyzer_name="golden_quotes",
+                    )
+                if quality_usage.total_tokens > 0:
+                    trace.add_token_usage(
+                        quality_usage.prompt_tokens,
+                        quality_usage.completion_tokens,
+                        analyzer_name="chat_quality",
+                    )
+                # 丰富 LLM_ANALYSIS span payload 便于 WebUI 详情精准诊断
+                for s in reversed(trace._spans):
+                    if s.get("stage_name") == AnalysisStage.LLM_ANALYSIS.value:
+                        s.setdefault("payload", {}).update(
+                            {
+                                "topics_count": len(topics),
+                                "topics": [t.topic for t in topics] if topics else [],
+                                "user_titles_count": len(user_titles),
+                                "golden_quotes_count": len(golden_quotes),
+                                "chat_quality_review": bool(chat_quality_review),
+                                "prompt_tokens": total_usage.prompt_tokens,
+                                "completion_tokens": total_usage.completion_tokens,
+                                "total_tokens": total_usage.total_tokens,
+                                "enabled_features": {
+                                    "topics": topic_enabled,
+                                    "user_titles": user_title_enabled,
+                                    "golden_quotes": golden_quote_enabled,
+                                    "chat_quality": chat_quality_enabled,
+                                },
+                                "prompts": trace.metadata.get("llm_prompts", {}),
+                            }
+                        )
+                        if subtask_errors:
+                            s["payload"]["subtask_errors"] = subtask_errors
+                        break
+
             logger.info(
                 f"并发分析完成 - 话题: {len(topics)}, 称号: {len(user_titles)}, 金句: {len(golden_quotes)}, 质量锐评: {1 if chat_quality_review else 0}"
             )
@@ -339,6 +406,17 @@ class LLMAnalyzer(IAnalysisProvider):
 
         except Exception as e:
             logger.error(f"并发分析失败: {e}")
+            trace = TraceContext.current()
+            if trace:
+                for s in reversed(trace._spans):
+                    if s.get("stage_name") == AnalysisStage.LLM_ANALYSIS.value:
+                        s.setdefault("payload", {}).update(
+                            {
+                                "error": str(e),
+                                "subtask_errors": [f"全局并发分析异常: {e}"],
+                            }
+                        )
+                        break
             return [], [], [], TokenUsage(), None
 
     async def analyze_incremental_concurrent(
@@ -368,18 +446,12 @@ class LLMAnalyzer(IAnalysisProvider):
             (话题列表, 金句列表, 总Token使用统计)
         """
         try:
-            session_id = self._make_session_id(None, umo, "incr_")
-
             logger.info(
                 f"开始增量并发分析 (话题:{topic_enabled}/{topics_per_batch}, 金句:{golden_quote_enabled}/{quotes_per_batch}, 质量锐评:{chat_quality_enabled})，"
-                f"消息数量: {len(messages)}，会话ID: {session_id}"
+                f"消息数量: {len(messages)}"
             )
 
-            # 保存原始消息数据 (Debug Mode)
-            if self.config_manager.get_debug_mode():
-                self._save_debug_messages(messages, session_id)
-
-            # 设置增量模式的最大数量覆盖值
+            # 设置增量模式的模型最大数量覆盖值
             self.topic_analyzer._incremental_max_count = topics_per_batch
             self.golden_quote_analyzer._incremental_max_count = quotes_per_batch
 
@@ -389,24 +461,18 @@ class LLMAnalyzer(IAnalysisProvider):
                 task_names = []
 
                 if topic_enabled:
-                    tasks.append(
-                        self.topic_analyzer.analyze_topics(messages, umo, session_id)
-                    )
+                    tasks.append(self.topic_analyzer.analyze_topics(messages, umo))
                     task_names.append("topic")
 
                 if golden_quote_enabled:
                     tasks.append(
-                        self.golden_quote_analyzer.analyze_golden_quotes(
-                            messages, umo, session_id
-                        )
+                        self.golden_quote_analyzer.analyze_golden_quotes(messages, umo)
                     )
                     task_names.append("golden_quote")
 
                 if chat_quality_enabled:
                     tasks.append(
-                        self.chat_quality_analyzer.analyze_quality(
-                            messages, umo, session_id
-                        )
+                        self.chat_quality_analyzer.analyze_quality(messages, umo)
                     )
                     task_names.append("chat_quality")
 
@@ -420,11 +486,13 @@ class LLMAnalyzer(IAnalysisProvider):
                 golden_quotes, quote_usage = [], TokenUsage()
                 chat_quality_review = None
                 quality_usage = TokenUsage()
+                subtask_errors: list[str] = []
 
                 for i, result in enumerate(results):
                     name = task_names[i]
                     if isinstance(result, Exception):
                         logger.error(f"增量{name}分析失败: {result}")
+                        subtask_errors.append(f"{name}: {result!s}")
                         continue
 
                     if name == "topic" and isinstance(result, tuple):
@@ -435,6 +503,32 @@ class LLMAnalyzer(IAnalysisProvider):
                         chat_quality_review, quality_usage = result
                         if not isinstance(quality_usage, TokenUsage):
                             quality_usage = TokenUsage()
+
+                # 校验并补全增量子任务未产出说明
+                if (
+                    topic_enabled
+                    and not topics
+                    and not any(e.startswith("topic") for e in subtask_errors)
+                ):
+                    subtask_errors.append(
+                        "topic: 未能提取出增量话题（可能有效文本过少或模型未返回）"
+                    )
+                if (
+                    golden_quote_enabled
+                    and not golden_quotes
+                    and not any(e.startswith("golden_quote") for e in subtask_errors)
+                ):
+                    subtask_errors.append(
+                        "golden_quote: 未能提取出增量金句（可能符合条件的消息过少或模型未返回）"
+                    )
+                if (
+                    chat_quality_enabled
+                    and not chat_quality_review
+                    and not any(e.startswith("chat_quality") for e in subtask_errors)
+                ):
+                    subtask_errors.append(
+                        "chat_quality: 未能生成增量质量锐评（模型未按预期格式输出）"
+                    )
 
                 # 合并Token使用统计
                 total_usage = TokenUsage(
@@ -449,6 +543,53 @@ class LLMAnalyzer(IAnalysisProvider):
                     + quality_usage.total_tokens,
                 )
 
+                # 记录 Token 消耗到 TraceContext
+                trace = TraceContext.current()
+                if trace:
+                    if topic_usage.total_tokens > 0:
+                        trace.add_token_usage(
+                            topic_usage.prompt_tokens,
+                            topic_usage.completion_tokens,
+                            analyzer_name="topics",
+                        )
+                    if quote_usage.total_tokens > 0:
+                        trace.add_token_usage(
+                            quote_usage.prompt_tokens,
+                            quote_usage.completion_tokens,
+                            analyzer_name="golden_quotes",
+                        )
+                    if quality_usage.total_tokens > 0:
+                        trace.add_token_usage(
+                            quality_usage.prompt_tokens,
+                            quality_usage.completion_tokens,
+                            analyzer_name="chat_quality",
+                        )
+                    for s in reversed(trace._spans):
+                        if s.get("stage_name") == AnalysisStage.LLM_ANALYSIS.value:
+                            s.setdefault("payload", {}).update(
+                                {
+                                    "incremental": True,
+                                    "topics_count": len(topics),
+                                    "topics": [t.topic for t in topics]
+                                    if topics
+                                    else [],
+                                    "golden_quotes_count": len(golden_quotes),
+                                    "chat_quality_review": bool(chat_quality_review),
+                                    "prompt_tokens": total_usage.prompt_tokens,
+                                    "completion_tokens": total_usage.completion_tokens,
+                                    "total_tokens": total_usage.total_tokens,
+                                    "enabled_features": {
+                                        "topics": topic_enabled,
+                                        "user_titles": False,
+                                        "golden_quotes": golden_quote_enabled,
+                                        "chat_quality": chat_quality_enabled,
+                                    },
+                                }
+                            )
+                            if subtask_errors:
+                                s["payload"]["subtask_errors"] = subtask_errors
+                            break
+
                 logger.info(
                     f"增量并发分析完成 - 话题: {len(topics)}, 金句: {len(golden_quotes)}, 质量锐评: {1 if chat_quality_review else 0}, "
                     f"Token消耗: {total_usage.total_tokens}"
@@ -462,41 +603,27 @@ class LLMAnalyzer(IAnalysisProvider):
 
         except Exception as e:
             logger.error(f"增量并发分析失败: {e}", exc_info=True)
+            trace = TraceContext.current()
+            if trace:
+                for s in reversed(trace._spans):
+                    if s.get("stage_name") == AnalysisStage.LLM_ANALYSIS.value:
+                        s.setdefault("payload", {}).update(
+                            {
+                                "error": str(e),
+                                "subtask_errors": [f"全局增量并发分析异常: {e}"],
+                            }
+                        )
+                        break
             return [], [], TokenUsage(), None
 
-    def _save_debug_messages(self, messages: list[dict], session_id: str):
-        """
-        保存调试消息数据到文件（Debug Mode 专用）
-
-        Args:
-            messages: 群聊消息列表
-            session_id: 会话ID
-        """
-        try:
-            import json
-
-            from astrbot.api.star import StarTools
-
-            debug_dir = StarTools.get_data_dir(PLUGIN_NAME) / "debug_data"
-            debug_dir.mkdir(parents=True, exist_ok=True)
-
-            msg_file_path = debug_dir / f"{session_id}_messages.json"
-            with open(msg_file_path, "w", encoding="utf-8") as f:
-                json.dump(messages, f, ensure_ascii=False, indent=2)
-        except Exception:
-            pass
-
-    # 向后兼容的方法，保持原有调用方式
     async def _call_provider_with_retry(
         self,
-        provider,
+        provider: object | None,
         prompt: str,
         umo: str | None = None,
         provider_id_key: str | None = None,
-    ):
-        """
-        向后兼容的LLM调用方法
-        现在委托给llm_utils模块处理
+    ) -> LLMResponse | None:
+        """向后兼容的LLM调用方法，现在委托给llm_utils模块处理。
 
         Args:
             provider: LLM服务商实例或None（已弃用，现在使用 provider_id_key）

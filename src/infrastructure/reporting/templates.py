@@ -3,19 +3,52 @@ HTML模板模块
 使用Jinja2加载外部HTML模板文件
 """
 
+from __future__ import annotations
+
 import asyncio
+import json
 import os
 import threading
+from pathlib import Path
+from typing import TYPE_CHECKING, ClassVar
 
-from jinja2 import ChoiceLoader, Environment, FileSystemLoader, select_autoescape
+from jinja2 import ChoiceLoader, FileSystemLoader, select_autoescape
+from jinja2.sandbox import SandboxedEnvironment
 
 from ...utils.logger import logger
+from .template_installer import (
+    INSTALL_MARKER_FILENAME,
+    template_dir_has_symlink_entries,
+    validate_template_name,
+)
+
+if TYPE_CHECKING:
+    from ..config.config_manager import ConfigManager
 
 
 class HTMLTemplates:
     """HTML模板管理类"""
 
-    def __init__(self, config_manager):
+    KNOWN_TEMPLATE_NAMES: ClassVar[dict[str, str]] = {
+        "HatsuneMiku": "初音未来 (HatsuneMiku / 默认)",
+        "scrapbook": "手账风格 (Scrapbook)",
+        "ATRI": "亚托莉 (ATRI)",
+        "spring_festival": "新春佳节 (Spring Festival)",
+        "retro_futurism": "复古未来 (Retro Futurism)",
+        "hack": "黑客赛博 (Hack)",
+        "BlueArchive": "蔚蓝档案 (BlueArchive)",
+        "simple": "极简黑白 (Simple)",
+        "art_nouveau": "新艺术运动 (Art Nouveau)",
+        "deepseek_maid": "DeepSeek 鲸鱼女仆娘",
+    }
+
+    config_manager: ConfigManager
+    base_dir: str
+    platform_base_dir: str
+    _envs: dict[str, SandboxedEnvironment]
+    _env_lock: threading.Lock
+
+    def __init__(self, config_manager: ConfigManager) -> None:
         """初始化Jinja2环境"""
         self.config_manager = config_manager
         # 设置模板根目录
@@ -27,9 +60,9 @@ class HTMLTemplates:
         self._envs = {}
         self._env_lock = threading.Lock()
 
-    def _get_env_sync(self) -> Environment:
-        """获取当前配置的模板环境（同步版本，供 asyncio.to_thread 调用）"""
-        template_name = self.config_manager.get_report_template()
+    def _get_env_sync(self, template_theme: str | None = None) -> SandboxedEnvironment:
+        """获取当前配置或指定主题的模板环境（同步版本，供 asyncio.to_thread 调用）"""
+        template_name = template_theme or self.config_manager.get_report_template()
 
         # 如果环境已缓存且配置未变（使用锁保证多线程安全）
         with self._env_lock:
@@ -37,30 +70,48 @@ class HTMLTemplates:
             if env is not None:
                 return env
 
-        template_dir = os.path.join(self.base_dir, template_name)
-        if not os.path.exists(template_dir):
-            logger.warning(f"模板目录不存在: {template_dir}，回退到 scrapbook")
-            template_name = "scrapbook"
-            template_dir = os.path.join(self.base_dir, template_name)
+        # 模板名安全校验：拒绝路径分隔符/穿越（渲染入口的最终防线）
+        clean_name = validate_template_name(template_name)
 
-        get_custom_template_dir = getattr(
-            self.config_manager, "get_custom_report_template_dir", None
+        template_dir = os.path.join(self.base_dir, clean_name)
+        custom_template_res = self.config_manager.get_custom_report_template_dir(
+            clean_name
         )
         custom_template_dir = (
-            get_custom_template_dir(template_name)
-            if callable(get_custom_template_dir)
-            else None
+            Path(str(custom_template_res)) if custom_template_res else None
         )
-        loaders = [FileSystemLoader(template_dir)]
-        if custom_template_dir:
-            # 用户副本排在前面，缺少的子模板仍从当前版本内置模板读取。
-            loaders.insert(0, FileSystemLoader(str(custom_template_dir)))
 
-        env = Environment(
+        loaders = []
+        # 1. 官方内置模板：优先加载官方内置模板目录，绝不加载任何自定义覆盖，保持官方模板的纯净与最新
+        if os.path.exists(template_dir):
+            loaders.append(FileSystemLoader(template_dir))
+        # 2. 用户自定义模板：如果不是官方内置模板，从用户自定义模板目录加载
+        elif (
+            custom_template_dir
+            and custom_template_dir.exists()
+            and not custom_template_dir.is_symlink()
+            and not template_dir_has_symlink_entries(custom_template_dir)
+        ):
+            loaders.append(FileSystemLoader(str(custom_template_dir)))
+
+        # 若目标模板既不在内置目录也不在自定义目录，明确抛出未找到异常
+        if not loaders:
+            raise FileNotFoundError(f"未找到指定的报告主题模板「{clean_name}」")
+
+        # 将默认的 scrapbook 目录追加为最底层 Fallback，避免自定义模板缺少局部组件时渲染失败
+        default_dir = os.path.join(self.base_dir, "scrapbook")
+        if default_dir != template_dir and not any(
+            isinstance(ld, FileSystemLoader) and ld.searchpath == [default_dir]
+            for ld in loaders
+        ):
+            loaders.append(FileSystemLoader(default_dir))
+
+        env = SandboxedEnvironment(
             loader=ChoiceLoader(loaders),
             autoescape=select_autoescape(["html", "xml"]),
             trim_blocks=True,
             lstrip_blocks=True,
+            # 沙箱模式：禁止模板访问 dunder 属性/敏感对象（防第三方模板 SSTI→RCE）
         )
 
         # 使用双重检查锁定，避免在高并发下重复创建相同 template_name 的 env
@@ -72,13 +123,123 @@ class HTMLTemplates:
 
         return env
 
-    async def _get_env_async(self) -> Environment:
-        """获取当前配置的模板环境（异步版本）"""
-        return await asyncio.to_thread(self._get_env_sync)
+    def get_available_templates(self) -> list[dict[str, object]]:
+        """动态扫描内置与自定义数据目录，返回所有可用的视觉主题模板列表"""
+        found_themes: dict[str, dict[str, object]] = {}
 
-    def _get_env(self) -> Environment:
-        """获取当前配置的模板环境（同步版本，向后兼容）"""
-        return self._get_env_sync()
+        # 1. 扫描内置模板目录（官方模板始终由源码管理）
+        if os.path.isdir(self.base_dir):
+            for entry in sorted(os.listdir(self.base_dir)):
+                if entry.startswith(".") or entry == "format":
+                    continue
+                p = os.path.join(self.base_dir, entry)
+                if os.path.isdir(p):
+                    has_image = os.path.exists(os.path.join(p, "image_template.html"))
+                    has_html = os.path.exists(os.path.join(p, "html_template.html"))
+                    if has_image or has_html:
+                        label = self.KNOWN_TEMPLATE_NAMES.get(
+                            entry, f"{entry} (内置模板)"
+                        )
+                        meta = self._read_template_meta(p)
+                        found_themes[entry] = {
+                            "id": entry,
+                            "label": label,
+                            "is_custom": False,
+                            "has_image": has_image,
+                            "has_html": has_html,
+                            "display_name": meta.get("name") or entry,
+                            "desc": meta.get("desc", ""),
+                            "tag": meta.get("tag", ""),
+                            "tag_color": meta.get("tag_color", ""),
+                            "can_uninstall": False,
+                        }
+
+        # 2. 扫描用户自定义模板目录（仅登记非官方内置的独立自定义主题）
+        sample_res = self.config_manager.get_custom_report_template_dir("")
+        custom_base: Path | None = None
+        if sample_res:
+            p_sample = Path(str(sample_res))
+            custom_base = p_sample if p_sample.is_dir() else p_sample.parent
+
+        if custom_base and custom_base.is_dir():
+            for p in sorted(custom_base.iterdir()):
+                # 拒绝符号链接目录及其内的主模板文件：避免外部目录/文件被当作自定义模板展示
+                if (
+                    p.is_dir()
+                    and not p.is_symlink()
+                    and not p.name.startswith(".")
+                    and not template_dir_has_symlink_entries(p)
+                ):
+                    entry = p.name
+                    # 若与官方内置模板同名，则忽略自定义目录下的同名残留，严格使用官方版本
+                    if entry in found_themes:
+                        continue
+
+                    has_image = (p / "image_template.html").exists()
+                    has_html = (p / "html_template.html").exists()
+                    if has_image or has_html:
+                        meta = self._read_template_meta(p)
+                        meta_name = meta.get("name", "")
+                        custom_label = (
+                            f"{meta_name} ({entry})"
+                            if meta_name
+                            else f"{entry} (自定义主题)"
+                        )
+
+                        found_themes[entry] = {
+                            "id": entry,
+                            "label": custom_label,
+                            "is_custom": True,
+                            "has_image": has_image,
+                            "has_html": has_html,
+                            "display_name": meta_name or entry,
+                            "desc": meta.get("desc", ""),
+                            "tag": meta.get("tag", ""),
+                            "tag_color": meta.get("tag_color", ""),
+                            "can_uninstall": (p / INSTALL_MARKER_FILENAME).is_file(),
+                        }
+
+        # 确保默认的 HatsuneMiku 始终位于第一个
+        result = []
+        if "HatsuneMiku" in found_themes:
+            result.append(found_themes.pop("HatsuneMiku"))
+        result.extend(found_themes.values())
+        return result
+
+    @staticmethod
+    def _read_template_meta(template_dir: str | Path) -> dict[str, str]:
+        """读取模板目录中可选 template.json 的展示元信息（name/desc/tag/tag_color）。"""
+        meta_path = os.path.join(template_dir, "template.json")
+        if not os.path.isfile(meta_path):
+            return {}
+        try:
+            with open(meta_path, encoding="utf-8") as f:
+                raw = json.load(f)
+        except Exception:
+            return {}
+        meta: dict[str, str] = {}
+        if not isinstance(raw, dict):
+            return meta
+        for key in ("name", "desc", "tag", "tag_color"):
+            value = raw.get(key)
+            if isinstance(value, str) and value.strip():
+                meta[key] = value.strip()[:100]
+        return meta
+
+    def invalidate_env(self, template_name: str) -> None:
+        """使指定主题的 Jinja2 环境缓存失效（模板卸载后调用）。"""
+        with self._env_lock:
+            self._envs.pop(template_name, None)
+
+    async def _get_env_async(
+        self, template_theme: str | None = None
+    ) -> SandboxedEnvironment:
+        """获取当前配置或指定主题的模板环境（异步版本）"""
+        return await asyncio.to_thread(self._get_env_sync, template_theme)
+
+    def _get_env(self, template_theme: str | None = None) -> SandboxedEnvironment:
+        """获取当前配置或指定主题的模板环境（同步版本，向后兼容）"""
+        return self._get_env_sync(template_theme=template_theme)
 
     def _read_template_file_sync(self, filename: str) -> str:
         """同步读取模板文件内容"""
@@ -114,31 +275,36 @@ class HTMLTemplates:
             logger.error(f"加载图片模板失败: {e}")
             return ""
 
-    def render_template(self, template_name: str, **kwargs) -> str:
+    def render_template(
+        self, template_name: str, template_theme: str | None = None, **kwargs: object
+    ) -> str:
         """渲染指定的模板文件
 
         Args:
             template_name: 模板文件名
+            template_theme: 可选指定的主题模板名称
             **kwargs: 传递给模板的变量
 
         Returns:
             渲染后的HTML字符串
         """
         try:
-            env = self._get_env()
+            env = self._get_env(template_theme=template_theme)
             template = env.get_template(template_name)
             return template.render(**kwargs)
         except Exception as e:
-            logger.error(f"渲染模板 {template_name} 失败: {e}")
+            logger.error(
+                f"渲染模板 {template_name} (theme: {template_theme}) 失败: {e}"
+            )
             return ""
 
     def render_platform_template(
-        self, platform_name: str, template_name: str, **kwargs
+        self, platform_name: str, template_name: str, **kwargs: object
     ) -> str:
         """渲染与报告主题解耦的平台专用模板。"""
         try:
             template_dir = os.path.join(self.platform_base_dir, platform_name)
-            env = Environment(
+            env = SandboxedEnvironment(
                 loader=FileSystemLoader(template_dir),
                 autoescape=select_autoescape(["html", "xml"]),
                 trim_blocks=True,

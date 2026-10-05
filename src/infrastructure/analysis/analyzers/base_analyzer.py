@@ -3,12 +3,13 @@
 定义通用分析流程和接口
 """
 
+from __future__ import annotations
+
 from abc import ABC, abstractmethod
 from collections.abc import Sized
-from typing import Generic, TypeVar
+from typing import TYPE_CHECKING, Generic, TypeVar
 
-from ....domain.models.data_models import TokenUsage
-from ....shared.constants import PLUGIN_NAME
+from ....domain.value_objects import TokenUsage
 from ....utils.logger import logger
 from ..utils.json_utils import parse_json_response
 from ..utils.llm_utils import (
@@ -18,6 +19,11 @@ from ..utils.llm_utils import (
     get_provider_id_with_fallback,
 )
 from ..utils.structured_output_schema import JSONObject, build_response_format
+
+if TYPE_CHECKING:
+    from astrbot.api.star import Context
+
+    from ...config.config_manager import ConfigManager
 
 TDataObject = TypeVar("TDataObject")
 TInputData = TypeVar("TInputData")
@@ -29,7 +35,14 @@ class BaseAnalyzer(ABC, Generic[TDataObject, TInputData]):
     定义所有分析器的通用接口 and 流程
     """
 
-    def __init__(self, context, config_manager):
+    context: Context
+    config_manager: ConfigManager
+
+    def __init__(
+        self,
+        context: Context,
+        config_manager: ConfigManager,
+    ) -> None:
         """
         初始化基础分析器
 
@@ -60,7 +73,6 @@ class BaseAnalyzer(ABC, Generic[TDataObject, TInputData]):
         Returns:
             数据类型字符串
         """
-        pass
 
     @abstractmethod
     def get_max_count(self) -> int:
@@ -70,7 +82,6 @@ class BaseAnalyzer(ABC, Generic[TDataObject, TInputData]):
         Returns:
             最大数量
         """
-        pass
 
     @abstractmethod
     def build_prompt(self, data: TInputData) -> str:
@@ -83,7 +94,6 @@ class BaseAnalyzer(ABC, Generic[TDataObject, TInputData]):
         Returns:
             提示词字符串
         """
-        pass
 
     def build_prompt_with_override(
         self, data: TInputData, prompt_override: str | None
@@ -112,7 +122,6 @@ class BaseAnalyzer(ABC, Generic[TDataObject, TInputData]):
         Returns:
             提取到的数据列表
         """
-        pass
 
     @abstractmethod
     def create_data_objects(self, data_list: list[dict]) -> list[TDataObject]:
@@ -125,7 +134,6 @@ class BaseAnalyzer(ABC, Generic[TDataObject, TInputData]):
         Returns:
             数据对象列表
         """
-        pass
 
     def get_response_schema_name(self) -> str:
         return f"{self.get_data_type()}_output"
@@ -290,38 +298,11 @@ class BaseAnalyzer(ABC, Generic[TDataObject, TInputData]):
         """
         return True, data_list, None
 
-    def _save_debug_data(self, prompt: str, session_id: str):
-        """
-        保存调试数据到文件
-
-        Args:
-            prompt: 提示词内容
-            session_id: 会话ID
-        """
-        try:
-            from astrbot.api.star import StarTools
-
-            data_path = StarTools.get_data_dir(PLUGIN_NAME) / "debug_data"
-
-            data_path.mkdir(parents=True, exist_ok=True)
-
-            file_name = f"{session_id}_{self.get_data_type()}.txt"
-            file_path = data_path / file_name
-
-            logger.info(f"正在保存调试数据到: {file_path}")
-            with open(file_path, "w", encoding="utf-8") as f:
-                f.write(prompt)
-
-            logger.info(f"已保存 {self.get_data_type()} 分析 Prompt 到 {file_path}")
-
-        except Exception as e:
-            logger.error(f"保存调试数据失败: {e}", exc_info=True)
-
     def _apply_persona_reinforcement(
         self, prompt: str, system_prompt: str | None
     ) -> str:
-        """
-        核心的人格强化注入逻辑。采用首尾深度注入与指令交织策略。
+        """核心的人格强化注入逻辑。采用首尾深度注入与指令交织策略。
+
         不仅强化输出口吻，更强调使用人格的逻辑视角进行分析过程。
         """
         if not system_prompt or not system_prompt.strip():
@@ -352,17 +333,14 @@ class BaseAnalyzer(ABC, Generic[TDataObject, TInputData]):
         self,
         data: TInputData,
         umo: str | None = None,
-        session_id: str | None = None,
         persona_id: str | None = None,
         prompt_override: str | None = None,
     ) -> tuple[list[TDataObject], TokenUsage]:
-        """
-        统一的分析流程
+        """统一的分析流程
 
         Args:
             data: 输入数据
             umo: 模型唯一标识符
-            session_id: 会话ID (用于调试模式)
             persona_id: 显式指定的人格 ID，传入时优先于常规人格选择逻辑
             prompt_override: 调用方指定的提示词模板，供支持专属模板的分析器使用
 
@@ -385,13 +363,6 @@ class BaseAnalyzer(ABC, Generic[TDataObject, TInputData]):
             logger.debug(
                 f"{self.get_data_type()}分析prompt前100字符: {prompt[:100] if prompt else 'None'}..."
             )
-
-            # 保存调试数据
-            debug_mode = self.config_manager.get_debug_mode()
-            if debug_mode and session_id and prompt:
-                self._save_debug_data(prompt, session_id)
-            elif debug_mode and not session_id:
-                logger.warning("[Debug] Debug mode enabled but no session_id provided")
 
             # 检查 prompt 是否为空
             if not prompt or not prompt.strip():
@@ -422,11 +393,17 @@ class BaseAnalyzer(ABC, Generic[TDataObject, TInputData]):
 
             logger.info(f"[{self.get_data_type()}分析] 开始发起 LLM 请求, umo: {umo}")
 
-            # [Debug] 记录调试信息
-            if debug_mode:
-                logger.debug(
-                    f"[Debug] debug_mode={debug_mode}, umo={umo}, session_id={session_id}, prompt_len={len(prompt) if prompt else 0}"
-                )
+            from ....shared.trace_context import TraceContext
+
+            trace = TraceContext.current()
+            if trace:
+                prompts_map = trace.metadata.setdefault("llm_prompts", {})
+                if isinstance(prompts_map, dict):
+                    prompts_map[self.get_data_type()] = {
+                        "prompt": prompt,
+                        "system_prompt": system_prompt,
+                        "provider_id": resolved_provider_id or "default",
+                    }
 
             response = await call_provider_with_retry(
                 self.context,
@@ -441,10 +418,9 @@ class BaseAnalyzer(ABC, Generic[TDataObject, TInputData]):
             )
 
             if response is None:
-                logger.error(
-                    f"{self.get_data_type()}分析调用LLM失败: provider返回None（重试失败）"
-                )
-                return [], TokenUsage()
+                err_text = f"{self.get_data_type()}分析调用LLM失败: Provider 返回空响应或重试耗尽"
+                logger.error(err_text)
+                raise RuntimeError(err_text)
 
             # 3. 提取token使用统计
             token_usage_dict = extract_token_usage(response)
@@ -457,6 +433,23 @@ class BaseAnalyzer(ABC, Generic[TDataObject, TInputData]):
             # 4. 提取响应文本
             result_text = extract_response_text(response)
             logger.debug(f"{self.get_data_type()}分析原始响应: {result_text[:500]}...")
+
+            slot: dict | None = None
+            if trace:
+                prompts_map = trace.metadata.setdefault("llm_prompts", {})
+                if isinstance(prompts_map, dict):
+                    slot = prompts_map.setdefault(self.get_data_type(), {})
+                    if isinstance(slot, dict):
+                        slot["prompt"] = prompt
+                        slot["initial_prompt"] = prompt
+                        slot["system_prompt"] = system_prompt
+                        slot["tokens"] = token_usage_dict["total_tokens"]
+                        slot["prompt_tokens"] = token_usage_dict["prompt_tokens"]
+                        slot["completion_tokens"] = token_usage_dict[
+                            "completion_tokens"
+                        ]
+                        slot["completion"] = result_text
+                        slot["initial_completion"] = result_text
 
             # 5. 尝试结构化解析 + 正则降级解析
             success, parsed_data, error_msg = self._try_parse_with_fallback(result_text)
@@ -501,6 +494,19 @@ class BaseAnalyzer(ABC, Generic[TDataObject, TInputData]):
                         success = True
                         parsed_data = retry_parsed_data
                         error_msg = None
+                        if trace and isinstance(slot, dict):
+                            slot["completion"] = retry_result_text
+                            slot["corrected_completion"] = retry_result_text
+                            slot["prompt"] = retry_prompt
+                            slot["corrected_prompt"] = retry_prompt
+                            slot["retry_count"] = idx
+                            retry_token_dict = extract_token_usage(retry_response)
+                            slot["tokens"] = (
+                                slot.get("tokens", 0) or 0
+                            ) + retry_token_dict["total_tokens"]
+                            slot["completion_tokens"] = retry_token_dict[
+                                "completion_tokens"
+                            ]
                         break
                     error_msg = retry_error_msg
 
@@ -513,14 +519,13 @@ class BaseAnalyzer(ABC, Generic[TDataObject, TInputData]):
                 return data_objects, token_usage
 
             # 6. 全部尝试失败
-            logger.error(
-                f"{self.get_data_type()}分析失败: JSON解析与正则降级均未成功: {error_msg}"
-            )
-            return [], token_usage
+            err_text = f"{self.get_data_type()}分析失败: JSON解析与正则降级均未成功 ({error_msg or '未产出有效内容'})"
+            logger.error(err_text)
+            raise RuntimeError(err_text)
 
         except Exception as e:
             logger.error(f"{self.get_data_type()}分析失败: {e}", exc_info=True)
-            return [], TokenUsage()
+            raise
 
     async def _build_system_prompt(
         self, umo: str | None, persona_id: str | None = None

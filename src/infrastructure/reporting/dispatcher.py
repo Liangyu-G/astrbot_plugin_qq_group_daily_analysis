@@ -1,14 +1,31 @@
+from __future__ import annotations
+
 import base64
 import os
 import tempfile
-from collections.abc import Callable
+import time
+from contextlib import nullcontext
 from datetime import datetime
-from typing import Any
+from pathlib import Path
+from typing import TYPE_CHECKING
 from urllib.parse import quote
 
-from ...shared.constants import PLUGIN_NAME
+from ...shared.constants import AnalysisStage
 from ...shared.trace_context import TraceContext
 from ...utils.logger import logger
+
+if TYPE_CHECKING:
+    from collections.abc import Awaitable, Callable
+
+    from ...domain.repositories.platform_adapter_repository import (
+        GroupAlbumSupportProtocol,
+        GroupFileSupportProtocol,
+    )
+    from ...domain.value_objects import AnalysisResultPayload
+    from ..config.config_manager import ConfigManager
+    from ..messaging.message_sender import MessageSender
+    from ..platform.adapters.onebot_adapter import OneBotAdapter
+    from .generators import ReportGenerator
 
 
 class ReportDispatcher:
@@ -17,18 +34,26 @@ class ReportDispatcher:
     负责协调报告生成、格式选择、消息发送和失败重试
     """
 
+    config_manager: ConfigManager
+    report_generator: ReportGenerator | None
+    message_sender: MessageSender
+
     def __init__(
         self,
-        config_manager,
-        report_generator,
-        message_sender,
-    ):
+        config_manager: ConfigManager,
+        report_generator: ReportGenerator | None,
+        message_sender: MessageSender,
+    ) -> None:
         self.config_manager = config_manager
         self.report_generator = report_generator
         self.message_sender = message_sender
-        self._html_render_func: Callable | None = None
+        self._html_render_func: Callable[..., Awaitable[str | bytes | None]] | None = (
+            None
+        )
 
-    def set_html_render(self, render_func: Callable):
+    def set_html_render(
+        self, render_func: Callable[..., Awaitable[str | bytes | None]]
+    ):
         """设置 HTML 渲染函数 (运行时注入)"""
         self._html_render_func = render_func
 
@@ -36,10 +61,21 @@ class ReportDispatcher:
         adapter = self.message_sender.bot_manager.get_adapter(platform_id)
         return bool(adapter and adapter.get_platform_name() == "qq_official")
 
+    # 复用多平台通用 Markdown 结构化排版的平台（如 Telegram、Discord、Satori）：
+    # 身份自动降级为昵称文本，排版与结构化报告一致。
+    _SHARED_MARKDOWN_PLATFORMS = frozenset({"telegram", "discord", "satori"})
+
+    def _uses_shared_markdown_report(self, platform_id: str | None) -> bool:
+        """平台是否复用 QQ 官方的 Markdown 文本排版。"""
+        adapter = self.message_sender.bot_manager.get_adapter(platform_id)
+        return bool(
+            adapter and adapter.get_platform_name() in self._SHARED_MARKDOWN_PLATFORMS
+        )
+
     async def dispatch(
         self,
         group_id: str,
-        analysis_result: dict[str, Any],
+        analysis_result: AnalysisResultPayload,
         platform_id: str | None = None,
     ) -> bool:
         """分发分析报告，并返回至少一种格式是否实际发送成功。"""
@@ -58,21 +94,23 @@ class ReportDispatcher:
             "text": self._dispatch_text,
         }
         sent_any = False
+        format_results: dict[str, bool] = {}
+
         for fmt in output_formats:
             handler = dispatch_map.get(fmt)
             if not handler:
                 logger.warning(f"[{trace_id}] 不支持的报告格式: {fmt}")
                 continue
             try:
-                sent_any = (
-                    bool(await handler(group_id, analysis_result, platform_id))
-                    or sent_any
-                )
+                ok = bool(await handler(group_id, analysis_result, platform_id))
+                format_results[fmt] = ok
+                sent_any = ok or sent_any
             except Exception as e:
                 logger.error(
                     f"[{trace_id}] 群 {group_id} 的 {fmt} 报告发送异常: {e}",
                     exc_info=True,
                 )
+                format_results[fmt] = False
 
         if sent_any:
             logger.info(
@@ -83,9 +121,17 @@ class ReportDispatcher:
         return sent_any
 
     async def _dispatch_image(
-        self, group_id: str, analysis_result: dict[str, Any], platform_id: str | None
+        self,
+        group_id: str,
+        analysis_result: AnalysisResultPayload,
+        platform_id: str | None,
     ) -> bool:
         trace_id = TraceContext.get()
+        trace_ctx = TraceContext.current()
+        if not self.report_generator:
+            logger.error(f"[{trace_id}] 报告生成器未初始化，无法生成图片报告。")
+            return False
+
         # 1. 检查渲染函数
         if not self._html_render_func:
             logger.warning(f"[{trace_id}] 未设置 HTML 渲染函数，回退到文本模式。")
@@ -93,50 +139,199 @@ class ReportDispatcher:
 
         # 2. 生成图片
         image_url = None
-        html_content = None
         try:
             # 定义头像获取回调，请求小尺寸头像以优化性能
-            async def avatar_url_getter(user_id: str):
+            async def avatar_url_getter(
+                user_id: str, size: int | None = None
+            ) -> str | None:
                 if not platform_id:
                     return None
                 adapter = self.message_sender.bot_manager.get_adapter(platform_id)
-                if adapter and hasattr(adapter, "get_user_avatar_url"):
-                    return await adapter.get_user_avatar_url(user_id, size=40)
+                if adapter:
+                    return await adapter.get_user_avatar_url(user_id, size=size or 40)
                 return None
 
-            image_url, html_content = await self.report_generator.generate_image_report(
-                analysis_result,
-                group_id,
-                self._html_render_func,
-                avatar_url_getter=avatar_url_getter,
-                avatar_cache_namespace=platform_id,
-                allow_alphanumeric_user_ids=self._is_qq_official(platform_id),
+            trace = TraceContext.current()
+            override_theme = (
+                str(trace.metadata.get("override_template_name") or "").strip()
+                if trace
+                else ""
             )
+            template_theme: str = (
+                override_theme
+                or self.config_manager.get_report_template()
+                or "scrapbook"
+            )
+
+            if trace:
+                with trace.span(
+                    AnalysisStage.RENDER_REPORT,
+                    {"format": "image", "template": template_theme},
+                ):
+                    (
+                        image_url,
+                        _html_content,
+                    ) = await self.report_generator.generate_image_report(
+                        analysis_result,
+                        group_id,
+                        self._html_render_func,
+                        avatar_url_getter=avatar_url_getter,
+                        avatar_cache_namespace=platform_id,
+                        allow_alphanumeric_user_ids=self._is_qq_official(platform_id),
+                        template_theme=template_theme,
+                    )
+            else:
+                (
+                    image_url,
+                    _html_content,
+                ) = await self.report_generator.generate_image_report(
+                    analysis_result,
+                    group_id,
+                    self._html_render_func,
+                    avatar_url_getter=avatar_url_getter,
+                    avatar_cache_namespace=platform_id,
+                    allow_alphanumeric_user_ids=self._is_qq_official(platform_id),
+                    template_theme=template_theme,
+                )
         except Exception as e:
             logger.error(f"[{trace_id}] Failed to generate image report: {e}")
             # image_url and html_content remain None
 
         # 4. 发送图片
         sent = False
+        dest_filename: str | None = None
         if image_url:
-            caption = (
-                TraceContext.make_report_caption()
-                if self.config_manager.get_show_report_caption()
-                else ""
-            )
-            try:
-                sent = await self.message_sender.send_image_smart(
-                    group_id, image_url, caption, platform_id
+            with (
+                trace_ctx.span(
+                    AnalysisStage.DISPATCH_REPORT,
+                    {
+                        "platform": platform_id or "auto",
+                        "group_id": group_id,
+                        "formats": ["image"],
+                        "format": "image",
+                    },
                 )
-            except Exception as e:
-                logger.error(f"[{trace_id}] 图片报告发送异常: {e}", exc_info=True)
+                if trace_ctx
+                else nullcontext()
+            ) as dispatch_span:
+                try:
+                    reports_dir = self.report_generator.data_dir / "reports"
+                    reports_dir.mkdir(parents=True, exist_ok=True)
+                    eff_trace_id = (
+                        trace_id
+                        or (trace_ctx.trace_id if trace_ctx else "")
+                        or TraceContext.get()
+                        or ""
+                    )
+                    ts_str = datetime.now().strftime("%Y%m%d_%H%M%S")
+                    filename = (
+                        f"report_{group_id}_{ts_str}_{eff_trace_id}.jpg"
+                        if eff_trace_id
+                        else f"report_{group_id}_{ts_str}.jpg"
+                    )
+                    dest = reports_dir / filename
+                    dest_filename = dest.name
+                    if os.path.exists(image_url):
+                        import shutil
 
-            # 5. 尝试上传到群文件/群相册（静默处理）
-            # 无论消息发送是否成功（如超时回退），只要图片生成了，就尝试备份到群文件
-            try:
-                await self._try_upload_image(group_id, image_url, platform_id)
-            except Exception as e:
-                logger.warning(f"[{trace_id}] 图片报告备份失败，不影响发送状态: {e}")
+                        shutil.copy2(image_url, dest)
+                    elif image_url.startswith("base64://"):
+                        data = base64.b64decode(image_url[9:])
+                        dest.write_bytes(data)
+
+                    # 关联到 TraceContext 并在数据库中更新元数据
+                    if trace_ctx:
+                        rfiles = trace_ctx.metadata.setdefault("report_files", [])
+                        if isinstance(rfiles, list) and not any(
+                            isinstance(rf, dict) and rf.get("filename") == dest.name
+                            for rf in rfiles
+                        ):
+                            rfiles.append(
+                                {
+                                    "filename": dest.name,
+                                    "path": str(dest.resolve()),
+                                    "format": "image",
+                                    "size_bytes": dest.stat().st_size
+                                    if dest.exists()
+                                    else 0,
+                                    "created_at": time.time(),
+                                }
+                            )
+                        from ...shared.trace_context import _global_trace_store
+
+                        if _global_trace_store is not None:
+                            try:
+                                _global_trace_store.save_trace(trace_ctx.to_dict())
+                            except Exception:
+                                pass
+                except Exception as e:
+                    logger.warning(f"[{trace_id}] 保存历史报告副本失败: {e}")
+
+                caption = (
+                    TraceContext.make_report_caption()
+                    if self.config_manager.get_show_report_caption()
+                    else ""
+                )
+                is_b64 = image_url.startswith("base64://")
+                raw_image_kb = 0.0
+                base64_payload_kb = 0.0
+                bloat_ratio = None
+                if is_b64:
+                    b64_str = image_url[9:]
+                    b64_len = len(b64_str)
+                    base64_payload_kb = round(b64_len / 1024, 2)
+                    padding = b64_str.count("=", max(0, b64_len - 2))
+                    raw_bytes_len = max(0, (b64_len * 3 // 4) - padding)
+                    raw_image_kb = round(raw_bytes_len / 1024, 2)
+                    bloat_pct = round(
+                        ((b64_len - raw_bytes_len) / max(raw_bytes_len, 1)) * 100, 1
+                    )
+                    bloat_ratio = f"+{bloat_pct}%"
+                elif os.path.exists(image_url):
+                    raw_image_kb = round(os.path.getsize(image_url) / 1024, 2)
+
+                dispatch_start_ts = time.perf_counter()
+                try:
+                    sent = await self.message_sender.send_image_smart(
+                        group_id, image_url, caption, platform_id
+                    )
+                except Exception as e:
+                    logger.error(f"[{trace_id}] 图片报告发送异常: {e}", exc_info=True)
+                dispatch_api_ms = round(
+                    (time.perf_counter() - dispatch_start_ts) * 1000, 2
+                )
+
+                # 5. 尝试上传到群文件/群相册（静默处理）
+                try:
+                    await self._try_upload_image(group_id, image_url, platform_id)
+                except Exception as e:
+                    logger.warning(
+                        f"[{trace_id}] 图片报告备份失败，不影响发送状态: {e}"
+                    )
+
+                if dispatch_span:
+                    dispatch_span.setdefault("payload", {}).update(
+                        {
+                            "platform": platform_id or "auto",
+                            "formats": ["image"],
+                            "format": "image",
+                            "transmission_mode": "base64" if is_b64 else "file_path",
+                            "raw_image_kb": raw_image_kb,
+                            "base64_payload_kb": base64_payload_kb,
+                            "bloat_ratio": bloat_ratio,
+                            "dispatch_api_ms": dispatch_api_ms,
+                            "success": bool(sent),
+                            "image_sent": bool(sent),
+                            "report_file": dest_filename,
+                        }
+                    )
+                    if not sent:
+                        dispatch_span["status"] = "warning"
+                        dispatch_span["payload"]["warning"] = (
+                            "图片报告发送失败，已自动降级回退至文本报告"
+                        )
+                        if trace_ctx:
+                            trace_ctx.metadata["has_warnings"] = True
 
         if sent:
             return True
@@ -148,82 +343,187 @@ class ReportDispatcher:
         return await self._dispatch_text(group_id, analysis_result, platform_id)
 
     async def _dispatch_html(
-        self, group_id: str, analysis_result: dict[str, Any], platform_id: str | None
+        self,
+        group_id: str,
+        analysis_result: AnalysisResultPayload,
+        platform_id: str | None,
     ) -> bool:
         trace_id = TraceContext.get()
+        trace_ctx = TraceContext.current()
+        if not self.report_generator:
+            logger.error(f"[{trace_id}] 报告生成器未初始化，无法生成 HTML 报告。")
+            return False
 
         html_path = None
         try:
 
-            async def avatar_url_getter(user_id: str):
+            async def avatar_url_getter(
+                user_id: str, size: int | None = None
+            ) -> str | None:
                 if not platform_id:
                     return None
                 adapter = self.message_sender.bot_manager.get_adapter(platform_id)
-                if adapter and hasattr(adapter, "get_user_avatar_url"):
-                    return await adapter.get_user_avatar_url(user_id, size=40)
+                if adapter:
+                    return await adapter.get_user_avatar_url(user_id, size=size or 40)
                 return None
 
-            html_path, json_path = await self.report_generator.generate_html_report(
-                analysis_result,
-                group_id,
-                avatar_url_getter=avatar_url_getter,
-                avatar_cache_namespace=platform_id,
-                allow_alphanumeric_user_ids=self._is_qq_official(platform_id),
+            trace = TraceContext.current()
+            override_theme = (
+                str(trace.metadata.get("override_template_name") or "").strip()
+                if trace
+                else ""
             )
+            template_theme: str = (
+                override_theme
+                or self.config_manager.get_report_template()
+                or "scrapbook"
+            )
+
+            if trace:
+                with trace.span(
+                    AnalysisStage.RENDER_REPORT,
+                    {"format": "html", "template": template_theme},
+                ):
+                    (
+                        html_path,
+                        _json_path,
+                    ) = await self.report_generator.generate_html_report(
+                        analysis_result,
+                        group_id,
+                        avatar_url_getter=avatar_url_getter,
+                        avatar_cache_namespace=platform_id,
+                        allow_alphanumeric_user_ids=self._is_qq_official(platform_id),
+                        template_theme=template_theme,
+                        trace_id=trace_id,
+                    )
+            else:
+                (
+                    html_path,
+                    _json_path,
+                ) = await self.report_generator.generate_html_report(
+                    analysis_result,
+                    group_id,
+                    avatar_url_getter=avatar_url_getter,
+                    avatar_cache_namespace=platform_id,
+                    allow_alphanumeric_user_ids=self._is_qq_official(platform_id),
+                    template_theme=template_theme,
+                    trace_id=trace_id,
+                )
         except Exception as e:
             logger.error(f"[{trace_id}] Failed to generate HTML report: {e}")
 
+        html_filename: str | None = None
+        sent = False
         if html_path:
-            is_only_url = self.config_manager.get_html_only_url()
-            base_url = self.config_manager.get_html_base_url()
+            with (
+                trace_ctx.span(
+                    AnalysisStage.DISPATCH_REPORT,
+                    {
+                        "platform": platform_id or "auto",
+                        "group_id": group_id,
+                        "formats": ["html"],
+                        "format": "html",
+                    },
+                )
+                if trace_ctx
+                else nullcontext()
+            ) as dispatch_span:
+                try:
+                    html_file = Path(html_path)
+                    html_filename = html_file.name
+                    if trace_ctx:
+                        rfiles = trace_ctx.metadata.setdefault("report_files", [])
+                        if isinstance(rfiles, list) and not any(
+                            isinstance(rf, dict)
+                            and rf.get("filename") == html_file.name
+                            for rf in rfiles
+                        ):
+                            rfiles.append(
+                                {
+                                    "filename": html_file.name,
+                                    "path": str(html_file.resolve()),
+                                    "format": "html",
+                                    "size_bytes": html_file.stat().st_size
+                                    if html_file.exists()
+                                    else 0,
+                                    "created_at": time.time(),
+                                }
+                            )
+                        from ...shared.trace_context import _global_trace_store
 
-            if is_only_url:
-                if base_url and base_url.strip():
-                    # 获取配置的目录
-                    html_output_dir = self.config_manager.get_html_output_dir()
+                        if _global_trace_store is not None:
+                            try:
+                                _global_trace_store.save_trace(trace_ctx.to_dict())
+                            except Exception:
+                                pass
+                except Exception as e:
+                    logger.warning(f"[{trace_id}] 关联 HTML 报告元数据失败: {e}")
 
-                    # 若用户配置为空，使用默认目录
-                    if not html_output_dir:
-                        from astrbot.api.star import StarTools
+                is_only_url = self.config_manager.get_html_only_url()
+                base_url = self.config_manager.get_html_base_url()
 
-                        html_output_dir = os.path.join(
-                            StarTools.get_data_dir(PLUGIN_NAME),
-                            "self_hosted_html_reports",
+                if is_only_url:
+                    if base_url and base_url.strip():
+                        # 获取配置的目录
+                        html_output_dir = self.config_manager.get_html_output_dir()
+
+                        # 若用户配置为空，使用默认目录
+                        if not html_output_dir:
+                            html_output_dir = str(
+                                self.report_generator.data_dir
+                                / "self_hosted_html_reports"
+                            )
+
+                        # 计算相对路径并转换为URL
+                        rel_path = os.path.relpath(html_path, html_output_dir)
+                        url_path = rel_path.replace(os.sep, "/")
+                        encoded_url_path = quote(url_path.lstrip("/"), safe="/")
+                        report_url = f"{base_url.rstrip('/')}/{encoded_url_path}"
+
+                        sent = await self.message_sender.send_text(
+                            group_id,
+                            f"📊 今日群聊分析报告已生成：\n{report_url}",
+                            platform_id,
+                        )
+                    else:
+                        logger.warning(
+                            f"[{trace_id}] 群 {group_id} 开启了仅发送外链，但未配置 html_base_url，已进行降级，回退至发送 HTML 文件。"
                         )
 
-                    # 计算相对路径并转换为URL
-                    rel_path = os.path.relpath(html_path, html_output_dir)
-                    url_path = rel_path.replace(os.sep, "/")
-                    encoded_url_path = quote(url_path.lstrip("/"), safe="/")
-                    report_url = f"{base_url.rstrip('/')}/{encoded_url_path}"
-
-                    sent = await self.message_sender.send_text(
+                if not sent:
+                    caption = (
+                        self.report_generator.build_html_caption(html_path)
+                        if self.config_manager.get_show_report_caption()
+                        else ""
+                    )
+                    sent = await self.message_sender.send_file(
                         group_id,
-                        f"📊 今日群聊分析报告已生成：\n{report_url}",
-                        platform_id,
+                        html_path,
+                        caption=caption,
+                        platform_id=platform_id,
                     )
 
-                    if sent:
-                        return True
-                else:
-                    logger.warning(
-                        f"[{trace_id}] 群 {group_id} 开启了仅发送外链，但未配置 html_base_url，已进行降级，回退至发送 HTML 文件。"
+                if dispatch_span:
+                    dispatch_span.setdefault("payload", {}).update(
+                        {
+                            "platform": platform_id or "auto",
+                            "formats": ["html"],
+                            "format": "html",
+                            "success": bool(sent),
+                            "html_sent": bool(sent),
+                            "html_file": html_filename,
+                        }
                     )
+                    if not sent:
+                        dispatch_span["status"] = "warning"
+                        dispatch_span["payload"]["warning"] = (
+                            "HTML 报告发送失败，已自动降级回退至文本报告"
+                        )
+                        if trace_ctx:
+                            trace_ctx.metadata["has_warnings"] = True
 
-            caption = (
-                self.report_generator.build_html_caption(html_path)
-                if self.config_manager.get_show_report_caption()
-                else ""
-            )
-
-            sent = await self.message_sender.send_file(
-                group_id,
-                html_path,
-                caption=caption,
-                platform_id=platform_id,
-            )
-            if sent:
-                return True
+                if sent:
+                    return True
 
         logger.warning(
             f"[{trace_id}] HTML dispatch failed, falling back to text report."
@@ -231,41 +531,93 @@ class ReportDispatcher:
         return await self._dispatch_text(group_id, analysis_result, platform_id)
 
     async def _dispatch_text(
-        self, group_id: str, analysis_result: dict[str, Any], platform_id: str | None
+        self,
+        group_id: str,
+        analysis_result: AnalysisResultPayload,
+        platform_id: str | None,
     ) -> bool:
         """分发文本报告"""
         logger.info(f"[分发器] 正在向群组 {group_id} 分发文本报告")
+        trace_ctx = TraceContext.current()
+        if not self.report_generator:
+            logger.error("[分发器] 报告生成器未初始化，无法生成文本报告。")
+            return False
         is_qq_official = self._is_qq_official(platform_id)
         fallback_report = None
         if is_qq_official:
             (
                 text_report,
                 fallback_report,
-            ) = await self.report_generator.generate_qq_official_markdown_report(
-                analysis_result, self._html_render_func
+            ) = await self.report_generator.generate_markdown_report(
+                analysis_result, self._html_render_func, mention_style="qq"
+            )
+        elif self._uses_shared_markdown_report(platform_id):
+            # 支持富文本 Markdown 但无 QQ @ 提及能力的平台（如 Telegram / Discord）走通用 Markdown 排版（身份降级为昵称）
+            (
+                text_report,
+                _,
+            ) = await self.report_generator.generate_markdown_report(
+                analysis_result, mention_style="name"
             )
         else:
             text_report = self.report_generator.generate_text_report(analysis_result)
         adapter = self.message_sender.bot_manager.get_adapter(platform_id)
         # 尝试通过适配器发送文本报告
         logger.info(f"[分发器] 正在尝试通过适配器发送文本报告。群: {group_id}")
-        try:
-            if adapter:
-                if is_qq_official:
-                    if await adapter.send_text_report(
-                        group_id,
-                        text_report,
-                        fallback_content=fallback_report,
-                    ):
-                        return True
-                elif await adapter.send_text_report(group_id, text_report):
-                    return True
-            return await self.message_sender.send_text(
-                group_id, f"📊 每日群聊分析报告：\n\n{text_report}", platform_id
+
+        with (
+            trace_ctx.span(
+                AnalysisStage.DISPATCH_REPORT,
+                {
+                    "platform": platform_id or "auto",
+                    "group_id": group_id,
+                    "formats": ["text"],
+                    "format": "text",
+                },
             )
-        except Exception as e:
-            logger.error(f"[分发器] 发送文本报告最终失败。群: {group_id}, 错误: {e}")
-            return False
+            if trace_ctx
+            else nullcontext()
+        ) as dispatch_span:
+            sent = False
+            try:
+                if adapter:
+                    if is_qq_official:
+                        sent = bool(
+                            await adapter.send_text_report(
+                                group_id,
+                                text_report,
+                                fallback_content=fallback_report,
+                            )
+                        )
+                    else:
+                        sent = bool(
+                            await adapter.send_text_report(group_id, text_report)
+                        )
+                if not sent:
+                    sent = bool(
+                        await self.message_sender.send_text(
+                            group_id,
+                            f"📊 每日群聊分析报告：\n\n{text_report}",
+                            platform_id,
+                        )
+                    )
+            except Exception as e:
+                logger.error(
+                    f"[分发器] 发送文本报告最终失败。群: {group_id}, 错误: {e}"
+                )
+                sent = False
+
+            if dispatch_span:
+                dispatch_span.setdefault("payload", {}).update(
+                    {
+                        "platform": platform_id or "auto",
+                        "formats": ["text"],
+                        "format": "text",
+                        "success": bool(sent),
+                        "text_sent": bool(sent),
+                    }
+                )
+            return sent
 
     # ================================================================
     # 图片报告上传到群文件 / 群相册（仅 QQ 平台 image 格式）
@@ -311,7 +663,12 @@ class ReportDispatcher:
             except OSError:
                 pass
 
-    async def _do_upload_group_file(self, adapter, group_id: str, file_path: str):
+    async def _do_upload_group_file(
+        self,
+        adapter: GroupFileSupportProtocol | OneBotAdapter,
+        group_id: str,
+        file_path: str,
+    ) -> None:
         """上传文件到群文件目录，失败静默"""
         try:
             folder_name = self.config_manager.get_group_file_folder()
@@ -326,26 +683,30 @@ class ReportDispatcher:
         except Exception as e:
             logger.warning(f"群文件上传失败 (群 {group_id}): {e}")
 
-    async def _do_upload_group_album(self, adapter, group_id: str, file_path: str):
+    async def _do_upload_group_album(
+        self,
+        adapter: GroupAlbumSupportProtocol | OneBotAdapter,
+        group_id: str,
+        file_path: str,
+    ) -> None:
         """上传图片到群相册，失败静默"""
         try:
             album_name = self.config_manager.get_group_album_name()
             strict_mode = self.config_manager.get_group_album_strict_mode()
             album_id = None
 
-            if hasattr(adapter, "find_album_id"):
-                if album_name:
-                    album_id = await adapter.find_album_id(group_id, album_name)
-                    if not album_id and strict_mode:
-                        logger.info(
-                            f"群相册严格模式开启：在群 {group_id} 中未找到名为 '{album_name}' 的相册，停止上传。"
-                        )
-                        return
-                elif strict_mode:
+            if album_name:
+                album_id = await adapter.find_album_id(group_id, album_name)
+                if not album_id and strict_mode:
                     logger.info(
-                        f"群相册严格模式开启：未设置目标相册名称，停止上传以防止操作群 {group_id} 的默认相册。"
+                        f"群相册严格模式开启：在群 {group_id} 中未找到名为 '{album_name}' 的相册，停止上传。"
                     )
                     return
+            elif strict_mode:
+                logger.info(
+                    f"群相册严格模式开启：未设置目标相册名称，停止上传以防止操作群 {group_id} 的默认相册。"
+                )
+                return
 
             await adapter.upload_group_album(
                 group_id,
@@ -379,7 +740,7 @@ class ReportDispatcher:
 
             date_str = datetime.now().strftime("%Y%m%d_%H%M%S")
             path = os.path.join(
-                tempfile.gettempdir(), f"群聊分析报告_{group_id}_{date_str}.png"
+                tempfile.gettempdir(), f"report_{group_id}_{date_str}.png"
             )
             with open(path, "wb") as f:
                 f.write(image_data)
@@ -388,11 +749,13 @@ class ReportDispatcher:
             logger.debug(f"保存图片到临时文件失败: {e}")
             return None
 
-    def _get_onebot_adapter(self, platform_id: str | None):
+    def _get_onebot_adapter(self, platform_id: str | None) -> OneBotAdapter | None:
         """获取 OneBot 适配器，非 OneBot 平台返回 None。"""
         if not platform_id:
             return None
+        from ..platform.adapters.onebot_adapter import OneBotAdapter
+
         adapter = self.message_sender.bot_manager.get_adapter(platform_id)
-        if adapter and hasattr(adapter, "upload_group_file_to_folder"):
+        if isinstance(adapter, OneBotAdapter):
             return adapter
         return None

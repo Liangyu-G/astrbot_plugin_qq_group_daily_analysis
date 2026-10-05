@@ -1,29 +1,166 @@
 """
-追踪上下文 - 请求追踪和关联
-
-提供用于在插件中跟踪请求的上下文。
+追踪上下文 - 全链路请求追踪、Span 耗时打点与 dsh-context 风格指标审计
 """
+
+from __future__ import annotations
 
 import functools
 import logging
 import re
+import time
 import uuid
+from contextlib import contextmanager
 from contextvars import ContextVar, Token
 from dataclasses import dataclass, field
 from datetime import datetime
-from typing import Any, Optional
+from typing import TYPE_CHECKING, ClassVar, ParamSpec, TypedDict, TypeVar
+
+from .constants import AnalysisStage
+
+if TYPE_CHECKING:
+    from collections.abc import Callable, Coroutine, Generator, Mapping
+
+    from ..infrastructure.persistence.trace_sqlite_store import TraceSQLiteStore
+    from ..infrastructure.webui.active_task_manager import ActiveTaskManager
+
+
+class SpanPayload(TypedDict, total=False):
+    """Span 上下文自定义载荷契约"""
+
+    success: bool
+    warning: str | bool
+    subtask_errors: list[str] | bool
+    error: str
+    start_memory_mb: float
+    end_memory_mb: float
+    delta_memory_mb: float
+    raw_message_count: int
+    cleaned_message_count: int
+    prompt_tokens: int
+    completion_tokens: int
+    total_tokens: int
+
+
+class SpanRecord(TypedDict):
+    """单次步骤耗时与内存 Span 记录契约"""
+
+    span_id: str
+    trace_id: str
+    stage_name: str
+    status: str
+    started_at: float
+    duration_ms: float | None
+    start_memory_mb: float
+    end_memory_mb: float | None
+    delta_memory_mb: float | None
+    payload: dict[str, object]
+
+
+class AnalyzerTokenUsage(TypedDict):
+    """单个分析器 Token 消耗契约"""
+
+    prompt_tokens: int
+    completion_tokens: int
+    total_tokens: int
+
+
+class TraceTokenUsage(TypedDict):
+    """全链路 Token 消耗与成本审计契约"""
+
+    prompt_tokens: int
+    completion_tokens: int
+    total_tokens: int
+    estimated_cost: float
+    per_analyzer: dict[str, AnalyzerTokenUsage]
+
+
+class TraceContextMetrics(TypedDict):
+    """上下文演进与清洗漏斗指标契约"""
+
+    raw_message_count: int
+    cleaned_message_count: int
+    compression_ratio: float
+    incremental_batches: int
+    window_size: int
+
+
+class TracePerformanceMetrics(TypedDict):
+    """运行时内存与性能遥测契约"""
+
+    init_memory_mb: float
+    peak_memory_mb: float
+    final_memory_mb: float
+    delta_memory_mb: float
+
+
+class TraceContextSnapshot(TypedDict, total=False):
+    """全链路追踪数据落盘与传输快照契约"""
+
+    trace_id: str
+    group_id: str
+    group_name: str
+    platform: str
+    operation: str
+    trigger_type: str
+    status: str
+    current_stage: str
+    started_at: float
+    completed_at: float | None
+    duration_ms: float | None
+    error_stage: str | None
+    error_message: str | None
+    stack_trace: str | None
+    extra: dict[str, object]
+    spans: list[SpanRecord]
+    context_metrics: TraceContextMetrics | None
+    performance_metrics: TracePerformanceMetrics
+    token_usage: TraceTokenUsage
+    checkpoints: dict[str, str]
+
+
+class ActiveTaskSnapshot(TypedDict):
+    """活跃任务状态快照契约（供 WebUI 与 SSE 广播）"""
+
+    task_id: str
+    group_id: str
+    group_name: str
+    platform: str
+    trigger_type: str
+    current_stage: str
+    started_at: float
+    duration_s: float
+    last_heartbeat: float
+
 
 # Trace ID 中群名的最大长度（平衡可读性和日志宽度）
 _MAX_GROUP_NAME_LEN = 10
 
 # 用于匹配报告 Caption 中去重 Token 的正则模式
-# 格式: "| MM-DD HH:MM:SS"
 REPORT_CAPTION_PATTERN = re.compile(r"\| (\d{2}-\d{2} \d{2}:\d{2}:\d{2})")
 
+
+def _get_process_rss_mb() -> float:
+    """获取当前 Python 进程常驻内存集 (RSS, MB)。"""
+    try:
+        import psutil
+
+        return round(psutil.Process().memory_info().rss / (1024 * 1024), 2)
+    except Exception:
+        return 0.0
+
+
 # 当前追踪的上下文变量
-_current_trace: ContextVar[Optional["TraceContext"]] = ContextVar(
+_current_trace: ContextVar[TraceContext | None] = ContextVar(
     "current_trace", default=None
 )
+
+# 全局持有的 Trace 仓储引用（用于链路自动持久化）
+_global_trace_store: TraceSQLiteStore | None = None
+_global_active_task_manager: ActiveTaskManager | None = None
+_active_traces: dict[str, TraceContext] = {}
+
+P = ParamSpec("P")
+R = TypeVar("R")
 
 
 @dataclass
@@ -31,215 +168,482 @@ class TraceContext:
     """
     核心组件：全链路追踪上下文 (Tracing Context)
 
-    该组件用于在复杂的异步分析流程中关联日志、耗时统计及元数据。
-    它不仅提供了 TraceId 的生成与传递，还集成了毫秒级的性能打点（Checkpoint）功能。
-
-    Attributes:
-        trace_id (str): 链路唯一标识码，默认为 UUID 前 8 位
-        group_id (str): 当前关联的群组 ID
-        platform (str): 当前消息所属平台
-        operation (str): 当前执行的操作名称 (如 'DAILY_ANALYSIS')
-        start_time (datetime): 追踪开始的具体时刻
-        metadata (dict[str, Any]): 随链路传递的额外上下文数据
+    集成 TraceId 传递、Span 级细粒度耗时与内存增量打点、dsh-context 风格的上下文演进与 Token 审计。
     """
 
     trace_id: str = field(default_factory=lambda: str(uuid.uuid4())[:8])
     group_id: str = ""
+    group_name: str = ""
     platform: str = ""
     operation: str = ""
-    start_time: datetime = field(default_factory=datetime.now)
-    metadata: dict[str, Any] = field(default_factory=dict)
+    trigger_type: str = "manual"
+    status: str = "running"
+    current_stage: str = ""
+    started_at: float = field(default_factory=time.time)
+    completed_at: float | None = None
+    duration_ms: float | None = None
 
-    # 内部计时器，用于多阶段耗时分析
+    # 错误归因
+    error_stage: str | None = None
+    error_message: str | None = None
+    stack_trace: str | None = None
+
+    # 扩展元数据
+    metadata: dict[str, object] = field(default_factory=dict)
+
+    # 细粒度 Span 列表
+    _spans: list[SpanRecord] = field(default_factory=list, init=False)
+
+    # dsh-context 上下文演进指标
+    _context_metrics: TraceContextMetrics | None = field(default=None, init=False)
+
+    # 遥测开关 (类级别默认 True)
+    _enable_metrics: ClassVar[bool] = True
+
+    # 运行期内存性能监控 (RSS MB)
+    _init_memory_mb: float = field(default=0.0, init=False)
+    _peak_memory_mb: float = field(default=0.0, init=False)
+    _final_memory_mb: float = field(default=0.0, init=False)
+
+    def __post_init__(self) -> None:
+        init_rss = _get_process_rss_mb() if self._enable_metrics else 0.0
+        self._init_memory_mb = init_rss
+        self._peak_memory_mb = init_rss
+
+    # Token 消耗与成本审计
+    _token_usage: TraceTokenUsage = field(
+        default_factory=lambda: {
+            "prompt_tokens": 0,
+            "completion_tokens": 0,
+            "total_tokens": 0,
+            "estimated_cost": 0.0,
+            "per_analyzer": {},
+        },
+        init=False,
+    )
+
+    # 传统锚点兼容
     _checkpoints: dict[str, datetime] = field(default_factory=dict, init=False)
+    _token: Token | None = field(default=None, init=False, repr=False)
+
+    @classmethod
+    def set_metrics_enabled(cls, enabled: bool) -> None:
+        """设置全链路运行时指标遥测开关"""
+        cls._enable_metrics = enabled
+
+    @classmethod
+    def is_metrics_enabled(cls) -> bool:
+        """检查全链路运行时指标遥测是否启用"""
+        return cls._enable_metrics
+
+    @classmethod
+    def set_global_store(cls, store: TraceSQLiteStore | None) -> None:
+        """设置全局持久化仓储实例"""
+        global _global_trace_store
+        _global_trace_store = store
+
+    @classmethod
+    def set_active_task_manager(cls, manager: ActiveTaskManager | None) -> None:
+        """设置全局活跃任务管理器引用"""
+        global _global_active_task_manager
+        _global_active_task_manager = manager
+
+    @classmethod
+    def get_active_trace(cls, trace_id: str) -> TraceContext | None:
+        """根据 trace_id 获取内存中活跃运行的 TraceContext 实例"""
+        return _active_traces.get(trace_id)
+
+    @property
+    def start_time(self) -> datetime:
+        """兼容旧版 start_time 属性"""
+        return datetime.fromtimestamp(self.started_at)
 
     def checkpoint(self, name: str) -> None:
-        """
-        在当前时间轴上设置一个命名锚点（打点）。
-
-        Args:
-            name (str): 锚点标识符，如 'LLM_REPLY_RECEIVED'
-        """
+        """在当前时间轴上设置命名锚点（兼容旧接口）"""
         self._checkpoints[name] = datetime.now()
 
     def elapsed_ms(self, from_checkpoint: str | None = None) -> float:
-        """
-        计算从开始或指定锚点到当前时刻经过的毫秒数。
+        """计算从开始或指定锚点到当前时刻经过的毫秒数"""
+        if from_checkpoint and from_checkpoint in self._checkpoints:
+            delta = datetime.now() - self._checkpoints[from_checkpoint]
+            return delta.total_seconds() * 1000
+        return (time.time() - self.started_at) * 1000
+
+    @contextmanager
+    def span(
+        self,
+        stage_name: AnalysisStage | str,
+        payload: Mapping[str, object] | None = None,
+    ) -> Generator[SpanRecord]:
+        """创建一个细粒度 Span 上下文，自动记录该步骤耗时、内存增量与执行状态。
 
         Args:
-            from_checkpoint (str, optional): 起始锚点名称。若为 None 则从链路启动时算起。
-
-        Returns:
-            float: 经过的毫秒数
+            stage_name: 阶段名称，如 AnalysisStage.FETCH_MESSAGES 或字符串
+            payload: 随 Span 记录的参数或快照字典
         """
-        start = self.start_time
-        if from_checkpoint and from_checkpoint in self._checkpoints:
-            start = self._checkpoints[from_checkpoint]
+        stage_str = (
+            stage_name.value
+            if isinstance(stage_name, AnalysisStage)
+            else str(stage_name)
+        )
+        self.current_stage = stage_str
+        _active_traces[self.trace_id] = self
+        if _global_active_task_manager is not None:
+            try:
+                _global_active_task_manager.update_stage_sync(self.trace_id, stage_str)
+            except Exception:
+                pass
 
-        delta = datetime.now() - start
-        return delta.total_seconds() * 1000
+        start_ts = time.time()
+        start_mem = _get_process_rss_mb() if self._enable_metrics else 0.0
+        if start_mem > self._peak_memory_mb:
+            self._peak_memory_mb = start_mem
 
-    def to_dict(self) -> dict[str, Any]:
+        span_id = f"{self.trace_id}_{stage_str}_{len(self._spans) + 1}"
+        span_record: SpanRecord = {
+            "span_id": span_id,
+            "trace_id": self.trace_id,
+            "stage_name": stage_str,
+            "status": "running",
+            "started_at": start_ts,
+            "duration_ms": None,
+            "start_memory_mb": start_mem,
+            "end_memory_mb": None,
+            "delta_memory_mb": None,
+            "payload": dict(payload or {}),
+        }
+        self._spans.append(span_record)
+
+        try:
+            yield span_record
+            if span_record.get("status") in ("running", None):
+                span_record["status"] = "success"
+        except Exception as exc:
+            span_record["status"] = "failed"
+            span_record["payload"]["error"] = str(exc)
+            raise
+        finally:
+            end_ts = time.time()
+            end_mem = _get_process_rss_mb() if self._enable_metrics else 0.0
+            if end_mem > self._peak_memory_mb:
+                self._peak_memory_mb = end_mem
+
+            span_record["duration_ms"] = round((end_ts - start_ts) * 1000, 2)
+            span_record["end_memory_mb"] = end_mem
+            span_record["delta_memory_mb"] = round(end_mem - start_mem, 2)
+
+            # 同步填充到 payload 字典供前端组件灵活读取
+            p = span_record["payload"]
+            if "start_memory_mb" not in p:
+                p["start_memory_mb"] = start_mem
+            if "end_memory_mb" not in p:
+                p["end_memory_mb"] = end_mem
+            if "delta_memory_mb" not in p:
+                p["delta_memory_mb"] = span_record["delta_memory_mb"]
+
+            if self.status != "running" and _global_trace_store is not None:
+                try:
+                    _global_trace_store.save_trace(self.to_dict())
+                except Exception:
+                    pass
+
+    def touch_heartbeat(self) -> None:
+        """刷新当前 Trace 关联的活跃任务心跳时间戳（供长耗时阶段保活）。"""
+        if _global_active_task_manager is not None and self.trace_id:
+            try:
+                if hasattr(_global_active_task_manager, "touch_heartbeat"):
+                    _global_active_task_manager.touch_heartbeat(self.trace_id)
+                elif hasattr(_global_active_task_manager, "update_stage_sync"):
+                    _global_active_task_manager.update_stage_sync(
+                        self.trace_id, self.current_stage
+                    )
+            except Exception:
+                pass
+
+    def set_context_metrics(
+        self,
+        raw_message_count: int,
+        cleaned_message_count: int,
+        incremental_batches: int = 0,
+        window_size: int = 0,
+    ) -> None:
         """
-        将链路快照序列化为字典格式，便于持久化或 JSON 日志输出。
+        记录上下文演进与清洗漏斗指标（dsh-context 核心）。
 
-        Returns:
-            dict[str, Any]: 序列化后的追踪状态
+        Args:
+            raw_message_count: 原始拉取消息数
+            cleaned_message_count: 规则清洗后保留的消息数
+            incremental_batches: 增量处理分批数
+            window_size: 采样窗口大小
         """
+        compression_ratio = (
+            round(cleaned_message_count / max(1, raw_message_count), 4)
+            if raw_message_count > 0
+            else 1.0
+        )
+        self._context_metrics = {
+            "raw_message_count": raw_message_count,
+            "cleaned_message_count": cleaned_message_count,
+            "compression_ratio": compression_ratio,
+            "incremental_batches": incremental_batches,
+            "window_size": window_size,
+        }
+
+    def add_token_usage(
+        self,
+        prompt_tokens: int,
+        completion_tokens: int,
+        analyzer_name: str = "",
+        cost_est: float = 0.0,
+    ) -> None:
+        """
+        累加 Token 消耗与成本。
+
+        Args:
+            prompt_tokens: 输入 Token
+            completion_tokens: 输出 Token
+            analyzer_name: 具体的 Analyzer 名称 (如 'topics', 'user_titles', 'comics')
+            cost_est: 估算费用
+        """
+        total = prompt_tokens + completion_tokens
+        self._token_usage["prompt_tokens"] = (
+            self._token_usage.get("prompt_tokens", 0) + prompt_tokens
+        )
+        self._token_usage["completion_tokens"] = (
+            self._token_usage.get("completion_tokens", 0) + completion_tokens
+        )
+        self._token_usage["total_tokens"] = (
+            self._token_usage.get("total_tokens", 0) + total
+        )
+        self._token_usage["estimated_cost"] = (
+            self._token_usage.get("estimated_cost", 0.0) + cost_est
+        )
+
+        if analyzer_name:
+            per_analyzer = self._token_usage.setdefault("per_analyzer", {})
+            cur = per_analyzer.get(
+                analyzer_name,
+                {
+                    "prompt_tokens": 0,
+                    "completion_tokens": 0,
+                    "total_tokens": 0,
+                },
+            )
+            cur["prompt_tokens"] = cur.get("prompt_tokens", 0) + prompt_tokens
+            cur["completion_tokens"] = (
+                cur.get("completion_tokens", 0) + completion_tokens
+            )
+            cur["total_tokens"] = cur.get("total_tokens", 0) + total
+            per_analyzer[analyzer_name] = cur
+
+    def finish(
+        self,
+        status: str = "succeeded",
+        error_stage: str | None = None,
+        error_message: str | None = None,
+        stack_trace: str | None = None,
+    ) -> None:
+        """
+        标记任务完成，计算总耗时并自动持久化到 SQLite
+        """
+        if status == "succeeded":
+            if any(s.get("status") == "failed" for s in self._spans):
+                status = "failed"
+            elif any(
+                s.get("status") == "warning"
+                or s["payload"].get("success") is False
+                or bool(s["payload"].get("warning"))
+                or bool(s["payload"].get("subtask_errors"))
+                for s in self._spans
+            ) or self.metadata.get("has_warnings"):
+                status = "warning"
+
+        self.status = status
+        self.completed_at = time.time()
+        self.duration_ms = round((self.completed_at - self.started_at) * 1000, 2)
+        self._final_memory_mb = _get_process_rss_mb() if self._enable_metrics else 0.0
+        if self._final_memory_mb > self._peak_memory_mb:
+            self._peak_memory_mb = self._final_memory_mb
+
+        if error_stage:
+            self.error_stage = error_stage
+        if error_message:
+            self.error_message = error_message
+        if stack_trace:
+            self.stack_trace = stack_trace
+
+        # 确保所有未完成的 Span 在 Trace 结束时被正确收尾，避免前端面板出现永久运行状态
+        for s in self._spans:
+            if s.get("status") == "running":
+                s["status"] = "success"
+                started_at = s.get("started_at", self.started_at)
+                if s.get("duration_ms") is None:
+                    s["duration_ms"] = round((self.completed_at - started_at) * 1000, 2)
+
+        _active_traces.pop(self.trace_id, None)
+
+        # 自动落盘
+        if _global_trace_store is not None:
+            try:
+                _global_trace_store.save_trace(self.to_dict())
+            except Exception as e:
+                from ..utils.logger import logger
+
+                logger.warning(f"Trace 持久化保存失败: {e}")
+
+    def to_dict(self) -> TraceContextSnapshot:
+        """将完整链路快照序列化为字典"""
+        curr_mem = self._final_memory_mb or (
+            _get_process_rss_mb() if self._enable_metrics else 0.0
+        )
         return {
             "trace_id": self.trace_id,
             "group_id": self.group_id,
+            "group_name": self.group_name,
             "platform": self.platform,
             "operation": self.operation,
-            "start_time": self.start_time.isoformat(),
-            "elapsed_ms": self.elapsed_ms(),
-            "metadata": self.metadata,
+            "trigger_type": self.trigger_type,
+            "status": self.status,
+            "started_at": self.started_at,
+            "completed_at": self.completed_at,
+            "duration_ms": (
+                self.duration_ms
+                if self.duration_ms is not None
+                else (time.time() - self.started_at) * 1000
+            ),
+            "error_stage": self.error_stage,
+            "error_message": self.error_message,
+            "stack_trace": self.stack_trace,
+            "extra": self.metadata,
+            "spans": list(self._spans),
+            "context_metrics": self._context_metrics,
+            "performance_metrics": {
+                "init_memory_mb": self._init_memory_mb,
+                "peak_memory_mb": self._peak_memory_mb,
+                "final_memory_mb": curr_mem,
+                "delta_memory_mb": round(curr_mem - self._init_memory_mb, 2),
+            },
+            "token_usage": self._token_usage,
             "checkpoints": {k: v.isoformat() for k, v in self._checkpoints.items()},
         }
 
-    _token: Token | None = field(default=None, init=False, repr=False)
-
-    def __enter__(self) -> "TraceContext":
-        """进入上下文管理器，将当前实例绑定到当前协程上下文。"""
+    def __enter__(self) -> TraceContext:
         self._token = _current_trace.set(self)
+        _active_traces[self.trace_id] = self
         return self
 
-    def __exit__(self, exc_type, exc_val, exc_tb) -> None:
-        """退出上下文管理器，清理绑定状态。"""
+    def __exit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc_val: BaseException | None,
+        exc_tb: object,
+    ) -> None:
+        if exc_type is not None and self.status == "running":
+            self.finish(
+                status="failed",
+                error_stage=self._spans[-1]["stage_name"]
+                if self._spans
+                else "PIPELINE",
+                error_message=str(exc_val),
+            )
+        elif self.status == "running":
+            self.finish(status="succeeded")
+
         if self._token:
             _current_trace.reset(self._token)
             self._token = None
 
     @classmethod
-    def current(cls) -> Optional["TraceContext"]:
-        """
-        静态获取当前协程活跃的追踪上下文。
-
-        Returns:
-            Optional[TraceContext]: 若当前处于追踪链路中则返回实例，否则返回 None
-        """
+    def current(cls) -> TraceContext | None:
         return _current_trace.get()
 
     @classmethod
     def get_or_create(
         cls,
+        trace_id: str = "",
         group_id: str = "",
+        group_name: str = "",
         platform: str = "",
         operation: str = "",
+        trigger_type: str = "manual",
         auto_bind: bool = False,
-    ) -> "TraceContext":
-        """
-        尝试获取现有链路，若不存在则按需创建一个。
-
-        Args:
-            group_id (str): 群组 ID
-            platform (str): 平台名称
-            operation (str): 操作描述
-            auto_bind (bool): 若新建，是否自动绑定到当前上下文（仅在 non-with 场景有用，谨慎使用）
-
-        Returns:
-            TraceContext: 活跃或新生成的实例
-        """
+    ) -> TraceContext:
         current = cls.current()
         if current:
             return current
 
         new_ctx = cls(
+            trace_id=trace_id or str(uuid.uuid4())[:8],
             group_id=group_id,
+            group_name=group_name,
             platform=platform,
             operation=operation,
+            trigger_type=trigger_type,
         )
         if auto_bind:
             new_ctx._token = _current_trace.set(new_ctx)
+            _active_traces[new_ctx.trace_id] = new_ctx
         return new_ctx
 
     @staticmethod
     def generate(prefix: str = "", group_name: str = "") -> str:
+        """生成全局唯一且具备高可读性的 TraceID。
+
+        格式: {prefix}_{group_name}_{YYYYMMDD_HHMMSS}_{entropy}
+        包含精确时间与足够强度的随机熵，彻底杜绝同秒或高并发场景下的 ID 碰撞。
         """
-        生成语义化、易读的追踪 ID。
-
-        格式: {来源}_{群名}_{时间点}
-        示例: manual_系统交流群_1733
-
-        由于插件存在任务锁 (DuplicateGroupTaskError)，确保了一个群同一时间只有一个分析任务，
-        因此 时间点 (HHmm) 已足够提供唯一性，无需 UUID 缀。
-
-        Args:
-            prefix (str): 来源标识，如 'manual', 'group', 'incr', 'report'
-            group_name (str): 可选群名，用于日志中快速识别
-
-        Returns:
-            str: 语义化 TraceID 字符串
-        """
-        timestamp = datetime.now().strftime("%H%M")
-
+        now = datetime.now()
+        timestamp = now.strftime("%Y%m%d_%H%M%S")
+        entropy = uuid.uuid4().hex[:12]
         parts: list[str] = []
         if prefix:
             parts.append(prefix)
         if group_name:
-            # 清理：移除空白符和文件系统不安全字符
-            safe_name = re.sub(r'[\s\n\r\t/\\:*?"<>|\[\]{}]', "", group_name)
+            safe_name = re.sub(r'[\s\n\r\t/\\:*?"<>|\[\]{}]', "", str(group_name))
             safe_name = safe_name[:_MAX_GROUP_NAME_LEN]
             if safe_name:
                 parts.append(safe_name)
         parts.append(timestamp)
-
+        parts.append(entropy)
         return "_".join(parts)
 
     @staticmethod
     def make_report_caption() -> str:
-        """
-        生成整洁的、面向用户的报告 Caption，包含用于去重的隐式时间戳。
-
-        该时间戳用作图片去重检查的 Token。
-        格式: "📊 每日群聊分析报告已生成 | MM-DD HH:MM:SS"
-
-        Returns:
-            str: 报告 Caption 字符串
-        """
         ts = datetime.now().strftime("%m-%d %H:%M:%S")
         return f"📊 每日群聊分析报告已生成 | {ts}"
 
     @classmethod
-    def set(cls, trace_id: str) -> None:
-        """
-        [兼容性接口] 直接设置当前上下文的 TraceID。
-        这会创建一个新的 TraceContext 实例并将其推入 ContextVar。
-
-        Args:
-            trace_id (str): 要设置的追踪 ID 字符串
-        """
-        ctx = cls(trace_id=trace_id)
-        # 注意：此处不手动存储 Token，依靠异步任务结束时 ContextVar 的自动清理。
-        _current_trace.set(ctx)
+    def set(
+        cls,
+        trace_id: str,
+        group_id: str = "",
+        group_name: str = "",
+        platform: str = "",
+        trigger_type: str = "manual",
+    ) -> TraceContext:
+        ctx = cls(
+            trace_id=trace_id,
+            group_id=str(group_id),
+            group_name=group_name,
+            platform=platform,
+            trigger_type=trigger_type,
+        )
+        ctx._token = _current_trace.set(ctx)
+        _active_traces[ctx.trace_id] = ctx
+        return ctx
 
     @classmethod
     def get(cls) -> str:
-        """
-        [兼容性接口] 获取当前活跃的追踪 ID 字符串。
-        """
         return get_trace_id()
 
 
 class TraceLogFilter(logging.Filter):
-    """
-    日志过滤器：自动将当前的 TraceID 注入每一条日志记录中。
-
-    配合日志格式化字符串 `[%(trace_id)s]` 使用。
-    """
-
     def filter(self, record: logging.LogRecord) -> bool:
         record.trace_id = get_trace_id()
         return True
 
 
 def get_trace_id() -> str:
-    """
-    便捷接口：快速获取当前活跃的 TraceID 或零时生成一个临时 ID。
-
-    Returns:
-        str: 8 位十六进制追踪 ID
-    """
     trace = TraceContext.current()
     if trace:
         return trace.trace_id
@@ -250,23 +654,15 @@ def with_trace(
     group_id: str = "",
     platform: str = "",
     operation: str = "",
-):
-    """
-    装饰器：自动为异步函数包裹追踪上下文。
-
-    Args:
-        group_id (str): 设置追踪的群组
-        platform (str): 设置追踪的平台
-        operation (str): 操作名称，默认为函数名
-
-    Returns:
-        Callable: 装饰后的函数
-    """
-
-    def decorator(func):
+) -> Callable[
+    [Callable[P, Coroutine[object, object, R]]],
+    Callable[P, Coroutine[object, object, R]],
+]:
+    def decorator(
+        func: Callable[P, Coroutine[object, object, R]],
+    ) -> Callable[P, Coroutine[object, object, R]]:
         @functools.wraps(func)
-        async def wrapper(*args, **kwargs):
-            # 优先使用装饰器声明的 operation，否则取函数原始名称
+        async def wrapper(*args: P.args, **kwargs: P.kwargs) -> R:
             op_name = operation or func.__name__
             with TraceContext(
                 group_id=group_id,

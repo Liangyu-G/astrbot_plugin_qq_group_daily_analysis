@@ -1,0 +1,252 @@
+"""模板管理相关应用服务。"""
+
+from __future__ import annotations
+
+import asyncio
+import os
+from pathlib import Path
+
+from astrbot.api.message_components import (
+    BaseMessageComponent,
+    Image,
+    Node,
+    Nodes,
+    Plain,
+)
+
+from ...shared.constants import DEFAULT_ASSETS_CDN_URL
+
+
+class TemplateCommandService:
+    """封装模板命令的文件系统与消息构建逻辑。"""
+
+    @staticmethod
+    def _format_index_label(index: int) -> str:
+        """生成序号标签。
+
+        1-20 使用 Unicode 带圈数字（①~⑳），
+        21-35 使用 ㉑~㉟，
+        36-50 使用 ㊱~㊿，
+        超过 50 时自动回退为 [N] 格式，支持任意数量的模板扩展。
+        """
+        num = index + 1
+        if 1 <= num <= 20:
+            return chr(0x2460 + num - 1)
+        if 21 <= num <= 35:
+            return chr(0x3251 + num - 21)
+        if 36 <= num <= 50:
+            return chr(0x32B1 + num - 36)
+        return f"[{num}]"
+
+    plugin_root: str
+
+    def __init__(self, plugin_root: str) -> None:
+        self.plugin_root = plugin_root
+
+    def resolve_template_base_dir(self) -> str:
+        """解析报告模板目录（兼容新旧目录结构）。"""
+        candidate_dirs = [
+            os.path.join(
+                self.plugin_root, "src", "infrastructure", "reporting", "templates"
+            ),
+            os.path.join(self.plugin_root, "src", "reports", "templates"),
+        ]
+        for candidate in candidate_dirs:
+            if os.path.isdir(candidate):
+                return candidate
+        return candidate_dirs[0]
+
+    def resolve_template_preview_path(self, template_name: str) -> str | None:
+        """解析模板预览图路径。
+
+        优先级：
+        1. 自定义模板目录内随模板打包的预览图
+           （custom_t2i_templates/reporting_templates/<模板名>/ 下的
+           preview.jpg/png 或 demo.jpg/png）；
+        2. 插件仓库 assets/<模板名>-demo.jpg（本地）；
+        3. 无本地文件时返回 None，由调用方回退仓库图库链接。
+        """
+        from ...infrastructure.reporting.template_installer import (
+            default_template_store_dir,
+            is_path_within,
+            preview_candidate_files,
+            validate_template_name,
+        )
+
+        try:
+            template_name = validate_template_name(template_name)
+        except Exception:
+            return None
+
+        store = default_template_store_dir()
+        custom_dir = store / template_name
+        # 目录级校验：模板目录必须位于存储根内（拒绝对根目录外路径的读取），
+        # 候选文件同样拒绝符号链接且 resolve 后仍需位于模板目录内
+        if is_path_within(custom_dir, store):
+            for candidate in preview_candidate_files(custom_dir):
+                return str(candidate)
+
+        candidate_paths = [
+            os.path.join(self.plugin_root, "assets", f"{template_name}-demo.jpg"),
+        ]
+        for candidate in candidate_paths:
+            if os.path.exists(candidate):
+                return candidate
+        return None
+
+    def list_available_templates(self) -> list[str]:
+        """获取本地所有可用模板名称列表（内置 + 用户自定义）。"""
+        from ...infrastructure.reporting.template_installer import (
+            default_template_store_dir,
+            template_dir_has_symlink_entries,
+        )
+
+        templates: set[str] = set()
+
+        base_dir = self.resolve_template_base_dir()
+        if os.path.isdir(base_dir):
+            for item in os.listdir(base_dir):
+                item_path = os.path.join(base_dir, item)
+                if not os.path.isdir(item_path):
+                    continue
+                if item.startswith(("__", ".")) or item == "format":
+                    continue
+                if (
+                    os.path.isfile(os.path.join(item_path, "html_template.html"))
+                    or os.path.isfile(os.path.join(item_path, "image_template.html"))
+                    or os.path.isfile(os.path.join(item_path, "template.html"))
+                ):
+                    templates.add(item)
+
+        custom_dir = default_template_store_dir()
+        if custom_dir.is_dir():
+            for item in os.listdir(custom_dir):
+                item_path = custom_dir / item
+                # 拒绝符号链接目录及其内主模板文件（与卸载/预览侧防护一致）
+                if (
+                    not item_path.is_dir()
+                    or item_path.is_symlink()
+                    or item.startswith(".")
+                    or template_dir_has_symlink_entries(item_path)
+                ):
+                    continue
+                if (item_path / "html_template.html").is_file() or (
+                    item_path / "image_template.html"
+                ).is_file():
+                    templates.add(item)
+
+        return sorted(templates)
+
+    async def template_exists(self, template_name: str) -> bool:
+        """检查模板目录是否存在且包含有效模板文件（含模板名安全校验）。"""
+        try:
+            from ...infrastructure.reporting.template_installer import (
+                template_dir_has_symlink_entries,
+                validate_template_name,
+            )
+
+            template_name = validate_template_name(template_name)
+        except Exception:
+            return False
+        template_dir = os.path.join(self.resolve_template_base_dir(), template_name)
+        custom_dir = None
+        try:
+            from ...infrastructure.reporting.template_installer import (
+                default_template_store_dir,
+            )
+
+            custom_dir = os.path.join(str(default_template_store_dir()), template_name)
+        except Exception:
+            custom_dir = None
+
+        for candidate_dir in (template_dir, custom_dir):
+            if not candidate_dir or not await asyncio.to_thread(
+                os.path.isdir, candidate_dir
+            ):
+                continue
+            # 拒绝符号链接目录：os.path.isdir 会跟随链接，可能把外部目录误判为有效模板
+            if os.path.islink(candidate_dir):
+                continue
+            # 拒绝目录内的符号链接主模板文件（文件级 symlink 会跟随读外部内容）
+            if template_dir_has_symlink_entries(Path(candidate_dir)):
+                continue
+            valid = await asyncio.to_thread(
+                lambda base=candidate_dir: (
+                    os.path.isfile(os.path.join(base, "html_template.html"))
+                    or os.path.isfile(os.path.join(base, "image_template.html"))
+                    or os.path.isfile(os.path.join(base, "template.html"))
+                )
+            )
+            if valid:
+                return True
+        return False
+
+    def parse_template_input(
+        self, template_input: str, available_templates: list[str]
+    ) -> tuple[str | None, str | None]:
+        """解析模板输入（支持模板名或序号）。"""
+        if not template_input:
+            return None, "❌ 模板参数不能为空"
+
+        if template_input.isdigit():
+            index = int(template_input)
+            if 1 <= index <= len(available_templates):
+                return available_templates[index - 1], None
+            return (
+                None,
+                f"❌ 无效的序号 '{template_input}'，有效范围: 1-{len(available_templates)}",
+            )
+
+        return template_input, None
+
+    def build_template_preview_nodes(
+        self,
+        available_templates: list[str],
+        current_template: str,
+        bot_id: str,
+    ) -> Nodes:
+        """构建模板预览的合并消息节点。"""
+        node_list: list[Node] = []
+
+        header_content: list[BaseMessageComponent] = [
+            Plain(
+                f"🎨 可用报告模板列表\n📌 当前使用: {current_template}\n💡 使用 /设置模板 [序号] 切换"
+            )
+        ]
+        node_list.append(Node(uin=bot_id, name="模板预览", content=header_content))
+
+        for index, template_name in enumerate(available_templates):
+            current_mark = " ✅" if template_name == current_template else ""
+            num_label = self._format_index_label(index)
+
+            preview_image_path = self.resolve_template_preview_path(template_name)
+            if preview_image_path:
+                node_content: list[BaseMessageComponent] = [
+                    Plain(f"{num_label} {template_name}{current_mark}"),
+                    Image.fromFileSystem(preview_image_path),
+                ]
+            else:
+                from ...infrastructure.reporting.template_installer import (
+                    builtin_template_names,
+                )
+
+                # 仅内置模板在本地 assets 缺失时尝试从官方 GitHub CDN 加载；
+                # 自定义模板若未提供本地预览图，避免拼接 404 的 CDN 链接
+                if template_name in builtin_template_names():
+                    cdn_url = f"{DEFAULT_ASSETS_CDN_URL}/{template_name}-demo.jpg"
+                    node_content = [
+                        Plain(f"{num_label} {template_name}{current_mark}"),
+                        Image.fromURL(cdn_url),
+                    ]
+                else:
+                    node_content = [
+                        Plain(
+                            f"{num_label} {template_name}{current_mark}\n(未提供预览图)"
+                        )
+                    ]
+
+            node_list.append(Node(uin=bot_id, name=template_name, content=node_content))
+
+        return Nodes(node_list)
+
+    build_preview_nodes = build_template_preview_nodes

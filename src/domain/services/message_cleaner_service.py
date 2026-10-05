@@ -3,6 +3,8 @@
 负责过滤掉机器人消息、指令、技术性内容（如原始表情代码）及敏感内容。
 """
 
+from __future__ import annotations
+
 import re
 from dataclasses import replace
 
@@ -24,7 +26,7 @@ class MessageCleanerService:
     def clean_messages(
         self,
         messages: list[UnifiedMessage],
-        bot_self_ids: list[str] = None,
+        bot_self_ids: list[str] | None = None,
         filter_commands: bool = True,
     ) -> list[UnifiedMessage]:
         """

@@ -2,13 +2,32 @@
 共享模块 - 通用工具和常量
 """
 
-from .constants import ContentType, Platform, ReportFormat, TaskStatus
-from .trace_context import TraceContext
+from .constants import AnalysisStage, ContentType, Platform, ReportFormat, TaskStatus
+from .trace_context import (
+    ActiveTaskSnapshot,
+    AnalyzerTokenUsage,
+    SpanPayload,
+    SpanRecord,
+    TraceContext,
+    TraceContextMetrics,
+    TraceContextSnapshot,
+    TracePerformanceMetrics,
+    TraceTokenUsage,
+)
 
 __all__ = [
-    "TraceContext",
-    "Platform",
-    "TaskStatus",
+    "ActiveTaskSnapshot",
+    "AnalysisStage",
+    "AnalyzerTokenUsage",
     "ContentType",
+    "Platform",
     "ReportFormat",
+    "SpanPayload",
+    "SpanRecord",
+    "TaskStatus",
+    "TraceContext",
+    "TraceContextMetrics",
+    "TraceContextSnapshot",
+    "TracePerformanceMetrics",
+    "TraceTokenUsage",
 ]

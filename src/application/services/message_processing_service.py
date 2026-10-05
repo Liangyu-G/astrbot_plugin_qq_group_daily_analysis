@@ -1,11 +1,23 @@
+from __future__ import annotations
+
+import asyncio
 import re
 from collections import Counter, OrderedDict
+from typing import TYPE_CHECKING
 
-from astrbot.api.event import AstrMessageEvent
-from astrbot.api.star import Context
-
-from ...infrastructure.persistence.platform_group_registry import PlatformGroupRegistry
 from ...utils.logger import logger
+
+if TYPE_CHECKING:
+    from astrbot.api.event import AstrMessageEvent
+    from astrbot.api.star import Context
+
+    from ...infrastructure.config.config_manager import ConfigManager
+    from ...infrastructure.persistence.event_deduplication_store import (
+        EventDeduplicationStore,
+    )
+    from ...infrastructure.persistence.platform_group_registry import (
+        PlatformGroupRegistry,
+    )
 
 _QQ_OFFICIAL_PLATFORM_NAMES = frozenset({"qq_official", "qq_official_webhook"})
 _QQ_OFFICIAL_MENTION_PATTERN = re.compile(r"<@!?([A-Za-z0-9_-]+)>")
@@ -13,42 +25,72 @@ _LOCAL_HISTORY_MAX_MESSAGES = 10000
 
 
 class MessageProcessingService:
-    """
-    消息处理服务
+    """消息处理服务。
 
     解析收到的群消息事件，提取内容与发送者信息，持久化历史记录，
-    并维护事件驱动平台（Telegram、QQ 官方等）的群组注册表。
-    QQ 官方平台特有的重复消息去重逻辑也在本服务中处理。
+    维护事件驱动平台（Telegram、Satori、QQ 官方等）的群组注册表，
+    并提供跨平台两阶段预占锁与持久化缓存的事件幂等去重防线。
 
     职责：
     1. 解析消息内容（文本、图片、@提及等）
     2. 解析发送者展示名（跨平台兼容）
-    3. 存储消息历史
+    3. 存储消息历史（统一携带原生 message_id）
     4. 维护群组注册表，供调度器做群组发现（Telegram、QQ 官方等事件驱动平台）
-    5. QQ 官方事件消息去重（按 message_id 预占 + 确认机制）
+    5. 多平台事件消息两阶段去重（按 platform_id:group_id:message_id 预占 + 确认机制 + 本地持久化预热）
     """
 
-    def __init__(self, context: Context, group_registry: PlatformGroupRegistry):
+    context: Context
+    group_registry: PlatformGroupRegistry
+    dedup_store: EventDeduplicationStore | None
+    config_manager: ConfigManager | None
+    _seen_event_ids: OrderedDict[str, None]
+    _inflight_event_ids: set[str]
+    _seen_event_ids_limit: int
+    _supports_history_max_messages: bool | None
+
+    def __init__(
+        self,
+        context: Context,
+        group_registry: PlatformGroupRegistry,
+        dedup_store: EventDeduplicationStore | None = None,
+        config_manager: ConfigManager | None = None,
+    ) -> None:
+        """初始化消息处理服务。
+
+        Args:
+            context: AstrBot 核心上下文对象。
+            group_registry: 事件驱动平台群组注册表。
+            dedup_store: 可选的本地持久化事件去重仓储（用于重启记忆恢复）。
+            config_manager: 可选的配置管理器（用于动态获取保留消息上限）。
+        """
         self.context = context
         self.group_registry = group_registry
-        self._seen_event_ids: OrderedDict[str, None] = OrderedDict()
-        self._inflight_event_ids: set[str] = set()
+        self.dedup_store = dedup_store
+        self.config_manager = config_manager
+        self._seen_event_ids = OrderedDict()
+        self._inflight_event_ids = set()
         self._seen_event_ids_limit = 4096
         # AstrBot 4.26.x 的消息历史接口尚未提供 max_messages 参数。
         # 首次探测到旧签名后缓存结果，避免每条消息都触发一次失败调用。
-        self._supports_history_max_messages: bool | None = None
+        self._supports_history_max_messages = None
+        if self.dedup_store is not None:
+            for key in self.dedup_store.load_recent_keys(self._seen_event_ids_limit):
+                self._seen_event_ids[key] = None
 
     async def process_message(self, event: AstrMessageEvent) -> bool:
-        """
-        处理并在历史记录中存储消息。
-         被 main.py 的 Telegram 和 QQ 官方消息拦截器共同调用。
+        """处理并在历史记录中存储消息。
 
-         Args:
-             event: AstrBot 消息事件
+        被 main.py 的 Satori、Telegram 与 QQ 官方消息拦截器共同调用。
 
-         Raises:
-             ValueError: 当必要数据无法获取时
-             RuntimeError: 当消息内容为空时
+        Args:
+            event: AstrBot 消息事件
+
+        Returns:
+            bool: 若成功存储返回 True；若为重复消息跳过存储则返回 False。
+
+        Raises:
+            ValueError: 当群组 ID、发送者 ID 或平台 ID 无法获取时。
+            RuntimeError: 当解析出的消息内容为空时。
         """
         # 1. 获取群组 ID（必需）
         group_id = self._get_group_id_from_event(event)
@@ -69,6 +111,24 @@ class MessageProcessingService:
         if not platform_id:
             raise ValueError(f"群 {group_id}: 无法获取平台 ID，拒绝存储消息")
 
+        # 检查是否开启“仅对已启用分析的群进行持久化”过滤
+        if (
+            self.config_manager is not None
+            and self.config_manager.get_persist_only_allowed_groups()
+        ):
+            umo = (
+                event.unified_msg_origin
+                if hasattr(event, "unified_msg_origin") and event.unified_msg_origin
+                else f"{platform_id}:GroupMessage:{group_id}"
+            )
+            if not self.config_manager.is_group_allowed(umo):
+                logger.debug(
+                    "[%s] 群 %s 未通过群权限白名单校验且开启了严格持久化过滤，跳过消息存储",
+                    platform_id,
+                    group_id,
+                )
+                return False
+
         # 5. 提取消息内容
         message_parts = self._extract_message_parts(event)
         if not message_parts:
@@ -80,20 +140,32 @@ class MessageProcessingService:
 
         # 6. 提取事件消息 ID 和事件时间
         msg_obj = getattr(event, "message_obj", None)
-        event_message_id = str(getattr(msg_obj, "message_id", "") or "")
+        event_message_id = str(getattr(msg_obj, "message_id", "") or "").strip()
 
         platform_name = str(event.get_platform_name() or "").strip().lower()
         reserved_event_id = False
-        if platform_name in {"qq_official", "qq_official_webhook"} and event_message_id:
-            reserved_event_id = self._reserve_event_id(event_message_id)
+        dedup_key = ""
+        if event_message_id:
+            dedup_key = (
+                f"{len(platform_id)}:{platform_id}|"
+                f"{len(group_id)}:{group_id}|"
+                f"{len(event_message_id)}:{event_message_id}"
+            )
+            reserved_event_id = await self._reserve_event_id(dedup_key)
             if not reserved_event_id:
-                logger.debug("[QQOfficial] 跳过重复消息事件: %s", event_message_id)
+                logger.debug(
+                    "[%s] 跳过重复消息事件: group=%s, id=%s",
+                    platform_name or platform_id,
+                    group_id,
+                    event_message_id,
+                )
                 return False
-        history_content = {
+        history_content: dict[str, object] = {
             "type": "user",
             "message": message_parts,
+            "message_id": event_message_id,
         }
-        if platform_name in {"qq_official", "qq_official_webhook"}:
+        if platform_name in _QQ_OFFICIAL_PLATFORM_NAMES:
             event_timestamp = self._extract_event_timestamp(msg_obj)
             history_content["_qq_official"] = {
                 "message_id": event_message_id,
@@ -110,15 +182,14 @@ class MessageProcessingService:
                 sender_name=sender_name,
             )
         except BaseException:
-            if reserved_event_id:
-                self._release_event_id(event_message_id)
+            if reserved_event_id and dedup_key:
+                await self._release_event_id(dedup_key)
             raise
         else:
-            if reserved_event_id:
-                self._commit_event_id(event_message_id)
+            if reserved_event_id and dedup_key:
+                await self._commit_event_id(dedup_key)
 
-        # Register the group so the scheduler can discover platforms that
-        # do not provide a group-list API (Telegram, QQ Official, etc.).
+        # 注册群组，以便调度器能自动发现未提供群列表 API 的平台（如 Telegram、QQ 官方等）。
         try:
             await self.group_registry.upsert(
                 platform_id=platform_id,
@@ -129,7 +200,7 @@ class MessageProcessingService:
             )
         except Exception as e:
             logger.warning(
-                "[GroupRegistry] Upsert failed: "
+                "[GroupRegistry] 更新群注册表失败: "
                 f"platform_id={platform_id} group_id={group_id} error={e}"
             )
 
@@ -170,8 +241,14 @@ class MessageProcessingService:
             await insert(**insert_kwargs)
             return
 
+        max_messages = (
+            self.config_manager.get_local_history_max_messages()
+            if self.config_manager is not None
+            else _LOCAL_HISTORY_MAX_MESSAGES
+        )
+
         try:
-            await insert(**insert_kwargs, max_messages=_LOCAL_HISTORY_MAX_MESSAGES)
+            await insert(**insert_kwargs, max_messages=max_messages)
         except TypeError as exc:
             if "unexpected keyword argument 'max_messages'" not in str(exc):
                 raise
@@ -259,8 +336,9 @@ class MessageProcessingService:
                     continue
 
                 target = getattr(seg, "target", None) or getattr(seg, "qq", None)
-                if target is None and hasattr(seg, "data"):
-                    target = seg.data.get("qq") or seg.data.get("target")
+                seg_data = getattr(seg, "data", None)
+                if target is None and isinstance(seg_data, dict):
+                    target = seg_data.get("qq") or seg_data.get("target")
 
                 target_str = str(target or "").strip()
                 if target_str:
@@ -276,10 +354,11 @@ class MessageProcessingService:
                     continue
 
                 seg_type = seg.type
+                seg_data = getattr(seg, "data", None)
                 if seg_type in ("Plain", "text"):
                     text = getattr(seg, "text", None)
-                    if text is None and hasattr(seg, "data"):
-                        text = seg.data.get("text")
+                    if text is None and isinstance(seg_data, dict):
+                        text = seg_data.get("text")
                     if text:
                         text = self._strip_known_mentions(text, pending_mentions)
                         if qq_mention_replacements is not None:
@@ -290,15 +369,15 @@ class MessageProcessingService:
 
                 elif seg_type in ("Image", "image"):
                     url = getattr(seg, "url", None) or (
-                        seg.data.get("url") if hasattr(seg, "data") else None
+                        seg_data.get("url") if isinstance(seg_data, dict) else None
                     )
                     if url:
                         message_parts.append({"type": "image", "url": url})
 
                 elif seg_type in ("At", "at"):
                     target = getattr(seg, "target", None) or getattr(seg, "qq", None)
-                    if target is None and hasattr(seg, "data"):
-                        target = seg.data.get("qq") or seg.data.get("target")
+                    if target is None and isinstance(seg_data, dict):
+                        target = seg_data.get("qq") or seg_data.get("target")
                     if target:
                         message_parts.append(
                             {
@@ -334,16 +413,14 @@ class MessageProcessingService:
                 )
             message_parts.append({"type": "plain", "text": fallback_text})
 
-        # 清理空文本段
-        message_parts = [
+        # 清理空文本段并返回
+        return [
             part
             for part in message_parts
             if not (
                 part.get("type") == "plain" and not str(part.get("text", "")).strip()
             )
         ]
-
-        return message_parts
 
     @classmethod
     def _extract_qq_official_mention_replacements(
@@ -488,28 +565,55 @@ class MessageProcessingService:
                 pass
         return 0
 
-    def _reserve_event_id(self, event_message_id: str) -> bool:
-        """预占事件消息 ID：在历史记录持久化期间防止重复入库。"""
-        if (
-            event_message_id in self._inflight_event_ids
-            or event_message_id in self._seen_event_ids
-        ):
-            if event_message_id in self._seen_event_ids:
-                self._seen_event_ids.move_to_end(event_message_id)
+    async def _reserve_event_id(self, dedup_key: str) -> bool:
+        """预占事件消息 ID：在历史记录持久化期间防止重复入库。
+
+        Args:
+            dedup_key: 平台群组事件消息的唯一幂等标识键。
+
+        Returns:
+            bool: 若预占成功返回 True；若已存在处理中或已处理记录则返回 False。
+        """
+        if dedup_key in self._inflight_event_ids or dedup_key in self._seen_event_ids:
+            if dedup_key in self._seen_event_ids:
+                self._seen_event_ids.move_to_end(dedup_key)
             return False
-        self._inflight_event_ids.add(event_message_id)
+
+        # 在任何异步等待让渡控制权前，同步原子预占 in-flight 状态，杜绝并发穿透
+        self._inflight_event_ids.add(dedup_key)
+
+        if self.dedup_store is not None:
+            # 在 SQLite 中原子执行 claim 预占（基于唯一主键冲突拦截，杜绝竞态）
+            is_claimed = await asyncio.to_thread(self.dedup_store.try_claim, dedup_key)
+            if not is_claimed:
+                self._inflight_event_ids.discard(dedup_key)
+                self._seen_event_ids[dedup_key] = None
+                if len(self._seen_event_ids) > self._seen_event_ids_limit:
+                    self._seen_event_ids.popitem(last=False)
+                return False
+
         return True
 
-    def _commit_event_id(self, event_message_id: str) -> None:
-        """确认事件消息 ID：标记为已持久化，纳入后续去重。"""
-        self._inflight_event_ids.discard(event_message_id)
-        if event_message_id in self._seen_event_ids:
-            self._seen_event_ids.move_to_end(event_message_id)
+    async def _commit_event_id(self, dedup_key: str) -> None:
+        """确认事件消息 ID：标记为已持久化，纳入后续去重。
+
+        Args:
+            dedup_key: 平台群组事件消息的唯一幂等标识键。
+        """
+        self._inflight_event_ids.discard(dedup_key)
+        if dedup_key in self._seen_event_ids:
+            self._seen_event_ids.move_to_end(dedup_key)
         else:
-            self._seen_event_ids[event_message_id] = None
+            self._seen_event_ids[dedup_key] = None
         if len(self._seen_event_ids) > self._seen_event_ids_limit:
             self._seen_event_ids.popitem(last=False)
 
-    def _release_event_id(self, event_message_id: str) -> None:
-        """释放事件消息 ID：持久化失败或取消时清理预占状态。"""
-        self._inflight_event_ids.discard(event_message_id)
+    async def _release_event_id(self, dedup_key: str) -> None:
+        """释放事件消息 ID：持久化失败或取消时清理预占状态。
+
+        Args:
+            dedup_key: 平台群组事件消息的唯一幂等标识键。
+        """
+        self._inflight_event_ids.discard(dedup_key)
+        if self.dedup_store is not None:
+            await asyncio.to_thread(self.dedup_store.release, dedup_key)

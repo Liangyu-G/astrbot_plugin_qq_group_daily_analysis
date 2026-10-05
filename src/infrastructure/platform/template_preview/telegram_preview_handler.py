@@ -6,38 +6,54 @@ import re
 import time
 import uuid
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING
 
+from ....domain.repositories.bot_client_protocol import (
+    TelegramApplicationProtocol,
+    TelegramClientProtocol,
+)
 from ....utils.logger import logger
 
 if TYPE_CHECKING:
-    from astrbot.api.event import AstrMessageEvent
-
-    from ....application.commands.template_command_service import TemplateCommandService
-    from ...config.config_manager import ConfigManager
-
-try:
+    from astrbot.api.event import AstrMessageEvent, MessageEventResult
     from telegram import (
+        CallbackQuery,
         InlineKeyboardButton,
         InlineKeyboardMarkup,
         InputMediaDocument,
         InputMediaPhoto,
-        Update,
     )
     from telegram.error import BadRequest
-    from telegram.ext import CallbackQueryHandler, ContextTypes
+    from telegram.ext import CallbackQueryHandler
 
+    from ....application.services.template_command_service import (
+        TemplateCommandService,
+    )
+    from ...config.config_manager import ConfigManager
+
+if not TYPE_CHECKING:
+    try:
+        from telegram import (
+            InlineKeyboardButton,
+            InlineKeyboardMarkup,
+            InputMediaDocument,
+            InputMediaPhoto,
+        )
+        from telegram.error import BadRequest
+        from telegram.ext import CallbackQueryHandler, ContextTypes
+
+        TELEGRAM_RUNTIME_AVAILABLE = True
+    except Exception:
+        TELEGRAM_RUNTIME_AVAILABLE = False
+        InlineKeyboardButton = None
+        InlineKeyboardMarkup = None
+        InputMediaPhoto = None
+        InputMediaDocument = None
+        BadRequest = Exception
+        CallbackQueryHandler = None
+        ContextTypes = None
+else:
     TELEGRAM_RUNTIME_AVAILABLE = True
-except Exception:
-    TELEGRAM_RUNTIME_AVAILABLE = False
-    InlineKeyboardButton = None
-    InlineKeyboardMarkup = None
-    InputMediaPhoto = None
-    InputMediaDocument = None
-    Update = None
-    BadRequest = Exception
-    CallbackQueryHandler = None
-    ContextTypes = None
 
 
 @dataclass
@@ -76,8 +92,8 @@ class TelegramTemplatePreviewHandler:
         self.template_service = template_service
         self._sessions: dict[str, _PreviewSession] = {}
         self._registered_platform_ids: set[str] = set()
-        self._handlers: dict[str, tuple[Any, Any]] = {}
-        self._platform_clients: dict[str, Any] = {}
+        self._handlers: dict[str, tuple[TelegramApplicationProtocol, object]] = {}
+        self._platform_clients: dict[str, TelegramClientProtocol] = {}
         self._callback_prefix = f"qda_tpl_{uuid.uuid4().hex[:8]}"
 
     @staticmethod
@@ -91,14 +107,15 @@ class TelegramTemplatePreviewHandler:
     # 向后兼容旧调用名
     is_telegram_event = supports
 
-    async def ensure_callback_handlers_registered(self, context: Any) -> None:
+    async def ensure_callback_handlers_registered(self, context: object) -> None:
         """为所有 Telegram 平台注册按钮回调处理器。"""
         if not TELEGRAM_RUNTIME_AVAILABLE:
             return
-        if not context or not hasattr(context, "platform_manager"):
+        platform_manager = getattr(context, "platform_manager", None)
+        if platform_manager is None:
             return
 
-        platforms = context.platform_manager.get_insts()
+        platforms = platform_manager.get_insts()
         seen_platform_ids: set[str] = set()
         for platform in platforms:
             platform_id, platform_name = self._extract_platform_meta(platform)
@@ -113,7 +130,7 @@ class TelegramTemplatePreviewHandler:
                 self._platform_clients[platform_id] = client
 
             application = getattr(platform, "application", None)
-            if not application:
+            if not isinstance(application, TelegramApplicationProtocol):
                 continue
 
             existing = self._handlers.get(platform_id)
@@ -135,6 +152,9 @@ class TelegramTemplatePreviewHandler:
                     )
                 self._handlers.pop(platform_id, None)
                 self._registered_platform_ids.discard(platform_id)
+
+            if not TELEGRAM_RUNTIME_AVAILABLE:
+                return
 
             try:
                 handler = CallbackQueryHandler(
@@ -247,33 +267,37 @@ class TelegramTemplatePreviewHandler:
         if not image_path:
             return False
 
-        payload: dict[str, Any] = {"chat_id": chat_id, "reply_markup": keyboard}
+        payload: dict[str, object] = {"chat_id": chat_id, "reply_markup": keyboard}
         if message_thread_id is not None:
             payload["message_thread_id"] = message_thread_id
 
         try:
             with open(image_path, "rb") as image_file:
                 sent_msg = await client.send_photo(
+                    chat_id=chat_id,
                     photo=image_file,
                     caption=caption,
+                    reply_markup=keyboard,
+                    message_thread_id=message_thread_id,
                     connect_timeout=self._CONNECT_TIMEOUT,
                     read_timeout=self._READ_TIMEOUT,
                     write_timeout=self._WRITE_TIMEOUT,
                     pool_timeout=self._POOL_TIMEOUT,
-                    **payload,
                 )
         except BadRequest as e:
             if not self._is_photo_dimension_error(e):
                 raise
             with open(image_path, "rb") as image_file:
                 sent_msg = await client.send_document(
+                    chat_id=chat_id,
                     document=image_file,
                     caption=caption,
+                    reply_markup=keyboard,
+                    message_thread_id=message_thread_id,
                     connect_timeout=self._CONNECT_TIMEOUT,
                     read_timeout=self._READ_TIMEOUT,
                     write_timeout=self._WRITE_TIMEOUT,
                     pool_timeout=self._POOL_TIMEOUT,
-                    **payload,
                 )
 
         self._sessions[token] = _PreviewSession(
@@ -318,25 +342,32 @@ class TelegramTemplatePreviewHandler:
             return False
         chat_id, message_thread_id = target
 
-        payload: dict[str, Any] = {
-            "chat_id": chat_id,
-            "caption": f"🖼 当前模板预览: {template_name}",
-            "connect_timeout": self._CONNECT_TIMEOUT,
-            "read_timeout": self._READ_TIMEOUT,
-            "write_timeout": self._WRITE_TIMEOUT,
-            "pool_timeout": self._POOL_TIMEOUT,
-        }
-        if message_thread_id is not None:
-            payload["message_thread_id"] = message_thread_id
-
         try:
             with open(image_path, "rb") as image_file:
-                await client.send_photo(photo=image_file, **payload)
+                await client.send_photo(
+                    chat_id=chat_id,
+                    photo=image_file,
+                    caption=f"🖼 当前模板预览: {template_name}",
+                    message_thread_id=message_thread_id,
+                    connect_timeout=self._CONNECT_TIMEOUT,
+                    read_timeout=self._READ_TIMEOUT,
+                    write_timeout=self._WRITE_TIMEOUT,
+                    pool_timeout=self._POOL_TIMEOUT,
+                )
         except BadRequest as e:
             if not self._is_photo_dimension_error(e):
                 raise
             with open(image_path, "rb") as image_file:
-                await client.send_document(document=image_file, **payload)
+                await client.send_document(
+                    chat_id=chat_id,
+                    document=image_file,
+                    caption=f"🖼 当前模板预览: {template_name}",
+                    message_thread_id=message_thread_id,
+                    connect_timeout=self._CONNECT_TIMEOUT,
+                    read_timeout=self._READ_TIMEOUT,
+                    write_timeout=self._WRITE_TIMEOUT,
+                    pool_timeout=self._POOL_TIMEOUT,
+                )
         return True
 
     async def handle_view_templates(
@@ -344,12 +375,12 @@ class TelegramTemplatePreviewHandler:
         event: AstrMessageEvent,
         platform_id: str,
         available_templates: list[str],
-    ) -> tuple[bool, list[Any]]:
+    ) -> tuple[bool, list[MessageEventResult]]:
         """统一处理 Telegram 的 /查看模板 流程。"""
         if not self.supports(event):
             return False, []
 
-        results: list[Any] = []
+        results: list[MessageEventResult] = []
 
         async def _append_fallback_results() -> None:
             current_template = self.config_manager.get_report_template()
@@ -396,17 +427,16 @@ class TelegramTemplatePreviewHandler:
             await _append_fallback_results()
             return True, results
 
-    async def _on_callback_query(
-        self, update: Update, context: ContextTypes.DEFAULT_TYPE
-    ) -> None:
+    async def _on_callback_query(self, update: object, context: object) -> None:
         if not TELEGRAM_RUNTIME_AVAILABLE:
             return
-        if not update.callback_query or not update.callback_query.data:
+        callback_query = getattr(update, "callback_query", None)
+        if not callback_query or not getattr(callback_query, "data", None):
             return
 
         self._cleanup_expired_sessions()
 
-        query = update.callback_query
+        query = callback_query
         data = query.data
         parts = data.split(":")
         if len(parts) != 3:
@@ -466,7 +496,7 @@ class TelegramTemplatePreviewHandler:
         await query.answer("未知操作", show_alert=False)
 
     async def _edit_preview_message(
-        self, query: Any, session: _PreviewSession, applied: bool = False
+        self, query: CallbackQuery, session: _PreviewSession, applied: bool = False
     ) -> None:
         template_name = session.current_template
         caption = self._build_caption(
@@ -485,6 +515,9 @@ class TelegramTemplatePreviewHandler:
             return
 
         try:
+            if not TELEGRAM_RUNTIME_AVAILABLE:
+                return
+
             with open(image_path, "rb") as image_file:
                 media = InputMediaPhoto(media=image_file, caption=caption)
                 await query.edit_message_media(
@@ -517,7 +550,9 @@ class TelegramTemplatePreviewHandler:
                 return
             raise
 
-    def _build_keyboard(self, token: str) -> Any:
+    def _build_keyboard(self, token: str) -> InlineKeyboardMarkup | None:
+        if not TELEGRAM_RUNTIME_AVAILABLE:
+            return None
         return InlineKeyboardMarkup(
             [
                 [
@@ -556,13 +591,15 @@ class TelegramTemplatePreviewHandler:
         )
 
     @staticmethod
-    def _extract_platform_meta(platform: Any) -> tuple[str | None, str | None]:
+    def _extract_platform_meta(platform: object) -> tuple[str | None, str | None]:
         metadata = getattr(platform, "metadata", None)
-        if not metadata and hasattr(platform, "meta"):
-            try:
-                metadata = platform.meta()
-            except Exception:
-                metadata = None
+        if not metadata:
+            meta_fn = getattr(platform, "meta", None)
+            if callable(meta_fn):
+                try:
+                    metadata = meta_fn()
+                except Exception:
+                    metadata = None
 
         platform_id = None
         platform_name = None
@@ -582,11 +619,12 @@ class TelegramTemplatePreviewHandler:
         return platform_id, platform_name
 
     @staticmethod
-    def _extract_platform_client(platform: Any) -> Any | None:
-        client = None
-        if hasattr(platform, "get_client"):
+    def _extract_platform_client(platform: object) -> TelegramClientProtocol | None:
+        client: object | None = None
+        get_client_fn = getattr(platform, "get_client", None)
+        if callable(get_client_fn):
             try:
-                client = platform.get_client()
+                client = get_client_fn()
             except Exception:
                 client = None
         if client is None:
@@ -595,14 +633,12 @@ class TelegramTemplatePreviewHandler:
             application = getattr(platform, "application", None)
             if application is not None:
                 client = getattr(application, "bot", None)
-        if client is None:
-            return None
-        if not hasattr(client, "send_photo"):
-            return None
-        return client
+        if isinstance(client, TelegramClientProtocol):
+            return client
+        return None
 
     @staticmethod
-    def _get_raw_event_client(event: AstrMessageEvent) -> Any | None:
+    def _get_raw_event_client(event: AstrMessageEvent) -> object:
         client = getattr(event, "client", None)
         if client:
             return client
@@ -610,9 +646,9 @@ class TelegramTemplatePreviewHandler:
 
     def _get_event_client(
         self, event: AstrMessageEvent, platform_id: str | None = None
-    ) -> Any | None:
+    ) -> TelegramClientProtocol | None:
         client = self._get_raw_event_client(event)
-        if client is not None and hasattr(client, "send_photo"):
+        if isinstance(client, TelegramClientProtocol):
             return client
         if platform_id:
             cached = self._platform_clients.get(platform_id)

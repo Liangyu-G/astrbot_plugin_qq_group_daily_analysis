@@ -8,7 +8,7 @@ from types import SimpleNamespace
 import aiohttp
 from PIL import Image
 
-from src.domain.models.data_models import (
+from src.domain.value_objects import (
     ActivityVisualization,
     GoldenQuote,
     GroupStatistics,
@@ -16,8 +16,8 @@ from src.domain.models.data_models import (
     QualityReview,
 )
 from src.infrastructure.reporting.generators import ReportGenerator
-from src.infrastructure.reporting.qq_official_markdown import (
-    QQOfficialMarkdownReportGenerator,
+from src.infrastructure.reporting.markdown_report_generator import (
+    MarkdownReportGenerator,
 )
 from src.infrastructure.reporting.templates import HTMLTemplates
 
@@ -35,6 +35,9 @@ class FakeConfig:
     def get_qq_official_t2i_summary_dashboard_enabled(self):
         return True
 
+    def get_report_template(self):
+        return "scrapbook"
+
 
 def build_generator_without_io():
     generator = object.__new__(ReportGenerator)
@@ -44,7 +47,7 @@ def build_generator_without_io():
 
 def generate_qq_markdown(generator, analysis_result):
     markdown_report, _ = asyncio.run(
-        generator.generate_qq_official_markdown_report(analysis_result)
+        generator.generate_markdown_report(analysis_result, mention_style="qq")
     )
     return markdown_report
 
@@ -348,8 +351,8 @@ def test_qq_official_t2i_summary_dashboard_replaces_text_summary():
         return "https://t2i.example/chart.png"
 
     markdown_report, fallback_report = asyncio.run(
-        generator.generate_qq_official_markdown_report(
-            analysis_result, fake_html_render
+        generator.generate_markdown_report(
+            analysis_result, fake_html_render, mention_style="qq"
         )
     )
 
@@ -431,8 +434,8 @@ def test_qq_official_t2i_summary_dashboard_switch_disables_rendering():
         raise AssertionError("T2I should not run when disabled")
 
     markdown_report, fallback_report = asyncio.run(
-        generator.generate_qq_official_markdown_report(
-            analysis_result, unexpected_render
+        generator.generate_markdown_report(
+            analysis_result, unexpected_render, mention_style="qq"
         )
     )
 
@@ -441,10 +444,10 @@ def test_qq_official_t2i_summary_dashboard_switch_disables_rendering():
 
 
 def test_qq_official_summary_dashboard_compacts_large_metrics():
-    assert QQOfficialMarkdownReportGenerator.format_metric(10_000) == "10K"
-    assert QQOfficialMarkdownReportGenerator.format_metric(12_500) == "12.5K"
-    assert QQOfficialMarkdownReportGenerator.format_metric(1_000_000) == "1M"
-    assert QQOfficialMarkdownReportGenerator.format_metric(1_250_000) == "1.2M"
+    assert MarkdownReportGenerator.format_metric(10_000) == "10K"
+    assert MarkdownReportGenerator.format_metric(12_500) == "12.5K"
+    assert MarkdownReportGenerator.format_metric(1_000_000) == "1M"
+    assert MarkdownReportGenerator.format_metric(1_250_000) == "1.2M"
 
 
 def test_non_qq_avatar_mentions_ignore_alphanumeric_bracket_text():
@@ -626,7 +629,7 @@ def test_qq_official_html_sidecar_uses_identity_sanitizer(tmp_path):
         "summary": f"{openid} 最活跃",
     }
 
-    _, json_path = asyncio.run(
+    html_path, _ = asyncio.run(
         generator.generate_html_report(
             analysis_result,
             "GROUP_OPENID",
@@ -634,9 +637,9 @@ def test_qq_official_html_sidecar_uses_identity_sanitizer(tmp_path):
         )
     )
 
-    assert json_path is not None
-    exported = Path(json_path).read_text(encoding="utf-8")
-    assert openid not in exported
+    assert html_path is not None
+    assert Path(html_path).exists()
+    assert not Path(html_path).with_suffix(".json").exists()
 
 
 def test_avatar_failure_is_cached_briefly_to_avoid_repeated_downloads():
@@ -683,13 +686,13 @@ def test_avatar_download_retries_after_transient_network_error(monkeypatch):
         def __init__(self):
             self.requests = 0
 
-        def get(self, _url):
+        def get(self, url: str):
             self.requests += 1
             if self.requests == 1:
                 return FailedRequest()
             return SuccessfulRequest()
 
-    async def no_wait(_seconds):
+    async def no_wait(seconds: float):
         return None
 
     generator = object.__new__(ReportGenerator)
@@ -698,7 +701,7 @@ def test_avatar_download_retries_after_transient_network_error(monkeypatch):
     generator._avatar_session_concurrent_semaphore = asyncio.Semaphore(1)
     monkeypatch.setattr(asyncio, "sleep", no_wait)
 
-    async def avatar_url_getter(_user_id):
+    async def avatar_url_getter(user_id: str):
         return "https://q1.qlogo.cn/g?b=qq&nk=123456&s=100"
 
     avatar = asyncio.run(generator._get_user_avatar_bytes("123456", avatar_url_getter))
@@ -717,3 +720,29 @@ def test_avatar_resize_preserves_transparency():
     with Image.open(BytesIO(resized)) as image:
         assert image.mode == "RGBA"
         assert max(image.size) <= 96
+
+
+def test_markdown_report_generator_plain_markdown_nickname_fallback():
+    generator = build_generator_without_io()
+    analysis_result = {
+        "statistics": SimpleNamespace(
+            message_count=100,
+            participant_count=10,
+            total_characters=5000,
+            emoji_count=50,
+            most_active_period="14:00-15:00",
+            activity_visualization=None,
+            golden_quotes=[],
+        ),
+        "topics": [],
+        "user_titles": [],
+        "user_analysis": {
+            "12345678": {"nickname": "Alice", "name": "Alice"},
+        },
+    }
+    plain_report, _ = asyncio.run(
+        generator.generate_markdown_report(analysis_result, mention_style="name")
+    )
+    assert "# 🎯 群聊日常分析报告" in plain_report
+    assert "## 📊 基础统计" in plain_report
+    assert "<@" not in plain_report  # 确保无 QQ 官方真提及标签，采用昵称/纯文本模式

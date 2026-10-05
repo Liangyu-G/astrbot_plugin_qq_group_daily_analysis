@@ -3,42 +3,90 @@
 负责定时任务和自动分析功能，支持传统单次分析与增量多次分析两种调度模式。
 """
 
+from __future__ import annotations
+
 import asyncio
 import time as time_mod
-from typing import Any
+from typing import TYPE_CHECKING, cast
 
 from apscheduler.triggers.cron import CronTrigger
 
 from ...application.services.analysis_application_service import DuplicateGroupTaskError
+from ...domain.repositories.platform_adapter_repository import PlatformAdapterProtocol
+from ...shared.constants import PLUGIN_NAME
 from ...shared.trace_context import TraceContext
 from ...utils.logger import logger
 from ..messaging.message_sender import MessageSender
-from ..platform.factory import PlatformAdapterFactory
 from ..reporting.dispatcher import ReportDispatcher
 from .incremental_trigger import IncrementalTriggerCoordinator
+from .target_resolver import ScheduledTargetResolver
+
+if TYPE_CHECKING:
+    from collections.abc import Awaitable, Callable
+
+    from apscheduler.schedulers.asyncio import AsyncIOScheduler
+    from astrbot.api.event import AstrMessageEvent
+    from astrbot.api.star import Context
+
+    from ...application.services.analysis_application_service import (
+        AnalysisApplicationService,
+    )
+    from ...domain.repositories.plugin_host_repository import PluginHostProtocol
+    from ...domain.value_objects import (
+        AnalysisResultPayload,
+        DailyAnalysisExecutionResult,
+    )
+    from ..config.config_manager import ConfigManager
+    from ..platform.bot_manager import BotManager
+    from ..reporting.generators import ReportGenerator
 
 _SCHEDULED_DISPATCH_INFO_SECONDS = 1.0
 _SCHEDULED_DISPATCH_WARN_SECONDS = 15.0
+
+AUTO_ANALYSIS_SKIP_REASONS: dict[str, str] = {
+    "below_threshold": "群聊有效发言数未达到设定的自动分析阈值，已安全跳过本次分析",
+    "no_messages": "指定时间窗口内未获取到有效聊天记录，跳过本次分析",
+    "no_incremental_data": "未检测到新的增量批次数据，无需生成分析报告",
+    "target_removed": "群聊已移出定时分析名单，自动跳过",
+    "bot_not_ready": "机器人实例未就绪或未完成连接初始化，跳过本次执行",
+    "muted": "检测到群聊处于禁言状态，自动跳过",
+    "already_running": "群聊分析任务已在执行中（并发锁拦截），本次调度跳过",
+    "terminating": "系统正在停止中，跳过调度任务",
+}
 
 
 class AutoScheduler:
     """自动调度器，支持传统模式和增量模式"""
 
+    config_manager: ConfigManager
+    analysis_service: AnalysisApplicationService
+    bot_manager: BotManager
+    report_generator: ReportGenerator | None
+    html_render_func: Callable[..., Awaitable[str | bytes | None]] | None
+    plugin_instance: PluginHostProtocol | None
+    target_resolver: ScheduledTargetResolver
+    message_sender: MessageSender
+    report_dispatcher: ReportDispatcher
+    incremental_trigger: IncrementalTriggerCoordinator | None = None
+
     def __init__(
         self,
-        config_manager,
-        analysis_service,
-        bot_manager,
-        report_generator=None,
-        html_render_func=None,
-        plugin_instance: Any | None = None,
-    ):
+        config_manager: ConfigManager,
+        analysis_service: AnalysisApplicationService,
+        bot_manager: BotManager,
+        report_generator: ReportGenerator | None = None,
+        html_render_func: Callable[..., Awaitable[str | bytes | None]] | None = None,
+        plugin_instance: PluginHostProtocol | None = None,
+    ) -> None:
         self.config_manager = config_manager
         self.analysis_service = analysis_service
         self.bot_manager = bot_manager
         self.report_generator = report_generator
         self.html_render_func = html_render_func
         self.plugin_instance = plugin_instance
+
+        # 初始化目标解析器
+        self.target_resolver = ScheduledTargetResolver(config_manager, bot_manager)
 
         # 初始化核心组件
         self.message_sender = MessageSender(bot_manager, config_manager)
@@ -51,8 +99,6 @@ class AutoScheduler:
         self.scheduler_job_ids = []  # 存储已注册的定时任务 ID
         self.last_executed_target = None  # 记录上次执行的具体时间点，防止重复执行
 
-        # Cache: group_id -> group_name (populated lazily)
-        self._group_name_cache: dict[str, str] = {}
         self._terminating = False  # 终止标志位
         self._immediate_report_tasks: dict[str, asyncio.Task] = {}
         self._immediate_report_versions: dict[str, int] = {}
@@ -67,98 +113,38 @@ class AutoScheduler:
             else None
         )
 
-    def set_bot_instance(self, bot_instance):
+    def set_bot_instance(self, bot_instance: object) -> None:
         """设置bot实例（保持向后兼容）"""
         self.bot_manager.set_bot_instance(bot_instance)
 
-    def set_bot_self_ids(self, bot_self_ids):
+    def set_bot_self_ids(
+        self, bot_self_ids: list[str | int] | str | int | None
+    ) -> None:
         """设置bot ID（支持单个ID或ID列表）"""
-        # 确保传入的是列表，保持统一处理
         if isinstance(bot_self_ids, list):
             self.bot_manager.set_bot_self_ids(bot_self_ids)
         elif bot_self_ids:
             self.bot_manager.set_bot_self_ids([bot_self_ids])
 
-    def set_bot_qq_ids(self, bot_qq_ids):
+    def set_bot_qq_ids(self, bot_qq_ids: list[str | int] | str | int | None) -> None:
         """设置bot QQ号（已弃用，使用 set_bot_self_ids）"""
         self.set_bot_self_ids(bot_qq_ids)
 
-    async def get_platform_id_for_group(self, group_id):
-        """根据群ID获取对应的平台ID"""
-        try:
-            # 首先检查已注册的bot实例
-            if (
-                hasattr(self.bot_manager, "_bot_instances")
-                and self.bot_manager._bot_instances
-            ):
-                # 如果只有一个实例，直接返回
-                if self.bot_manager.get_platform_count() == 1:
-                    platform_id = self.bot_manager.get_platform_ids()[0]
-                    logger.debug(f"只有一个适配器，使用平台: {platform_id}")
-                    return platform_id
-
-                # 如果有多个实例，尝试通过适配器检查群属于哪个平台
-                logger.info(f"检测到多个适配器，正在验证群 {group_id} 属于哪个平台...")
-                for platform_id in self.bot_manager.get_platform_ids():
-                    try:
-                        adapter = self.bot_manager.get_adapter(platform_id)
-                        if adapter:
-                            # 通过统一接口尝试获取群信息，如果能获取到则说明属于该平台
-                            info = await adapter.get_group_info(str(group_id))
-                            if info:
-                                logger.info(f"✅ 群 {group_id} 属于平台 {platform_id}")
-                                return platform_id
-                            else:
-                                logger.debug(
-                                    f"平台 {platform_id} 无法获取群 {group_id} 信息"
-                                )
-                    except Exception as e:
-                        logger.debug(f"平台 {platform_id} 验证群 {group_id} 失败: {e}")
-                        continue
-
-                # 如果所有适配器都尝试失败，记录错误并返回 None
-                logger.error(
-                    f"❌ 无法确定群 {group_id} 属于哪个平台 (已尝试: {list(self.bot_manager._bot_instances.keys())})"
-                )
-                return None
-
-            # 没有任何bot实例，返回None
-            logger.error("❌ 没有注册的bot实例")
-            return None
-        except Exception as e:
-            logger.error(f"❌ 获取平台ID失败: {e}")
-            return None
+    async def get_platform_id_for_group(self, group_id: str | int) -> str | None:
+        """根据群ID获取对应的平台ID（委托 ScheduledTargetResolver）。"""
+        return await self.target_resolver.get_platform_id_for_group(group_id)
 
     async def _get_group_name_safe(
         self, group_id: str, platform_id: str | None = None
     ) -> str:
-        """
-        为 TraceID 生成解析可读的群名。
-        使用内存缓存以避免重复的 API 调用。
-        若名称不可用，则回退到 group_id。
-        """
-        if group_id in self._group_name_cache:
-            return self._group_name_cache[group_id]
-
-        try:
-            pid = platform_id or await self.get_platform_id_for_group(group_id)
-            if pid:
-                adapter = self.bot_manager.get_adapter(pid)
-                if adapter:
-                    info = await adapter.get_group_info(group_id)
-                    if info and info.group_name:
-                        self._group_name_cache[group_id] = info.group_name
-                        return info.group_name
-        except Exception:
-            pass
-
-        return group_id
+        """为 TraceID 生成解析可读的群名（委托 ScheduledTargetResolver）。"""
+        return await self.target_resolver.get_group_name_safe(group_id, platform_id)
 
     # ================================================================
     # 任务注册与取消
     # ================================================================
 
-    def schedule_jobs(self, context):
+    def schedule_jobs(self, context: Context) -> None:
         """根据分层名单配置注册定时任务。"""
         # 首先清理之前的任务
         self.unschedule_jobs(context)
@@ -184,7 +170,7 @@ class AutoScheduler:
         else:
             logger.info("增量分析总开关未启用，仅执行传统定时全量分析。")
 
-    def _schedule_report_time_jobs(self, scheduler):
+    def _schedule_report_time_jobs(self, scheduler: AsyncIOScheduler) -> None:
         """在配置的时间点注册报告生成任务。
 
         这些任务根据运行时解析出的生效模式，决定执行传统的全量分析还是增量汇报。
@@ -214,7 +200,7 @@ class AutoScheduler:
             except Exception as e:
                 logger.error(f"注册定时任务失败 ({t_str}): {e}")
 
-    def unschedule_jobs(self, context):
+    def unschedule_jobs(self, context: Context) -> None:
         """取消定时任务"""
         self._terminating = True
         if (
@@ -237,7 +223,7 @@ class AutoScheduler:
                 logger.warning(f"移除定时任务失败 ({job_id}): {e}")
         self.scheduler_job_ids.clear()
 
-    async def shutdown(self, context) -> None:
+    async def shutdown(self, context: Context) -> None:
         """停止调度器并持久化增量消息计数。
 
         Args:
@@ -270,50 +256,8 @@ class AutoScheduler:
     async def _get_scheduled_targets(
         self, mode_filter: str | None = None
     ) -> list[tuple[str, str, str]]:
-        """
-        根据分层过滤逻辑判定所有应参与计划分析的目标群组及其分析策略。
-
-        判定过程：
-        1. 准入层：群组必须在基础设置的允许名单内。
-        2. 定时层：群组需通过定时分析名单的过滤。
-        3. 模式层：如果群组在增量名单内，则使用增量模式，否则使用默认策略。
-
-        参数：
-            mode_filter: 如果提供，则只返回匹配指定模式的目标 (traditional 或 incremental)。
-        """
-        # 获取基础信息
-        all_groups = await self._get_all_groups()
-
-        result = []
-
-        # 遍历所有平台上的群组
-        for platform_id, group_id_orig in all_groups:
-            group_id = str(group_id_orig)
-            umo = f"{platform_id}:GroupMessage:{group_id}"
-
-            # 配置管理器统一处理基础名单与定时 inherit/白黑名单。
-            if not self.config_manager.is_scheduled_group_allowed(umo):
-                continue
-
-            # 配置管理器统一处理增量 inherit/白黑名单。
-            if self.config_manager.is_incremental_group_allowed(umo):
-                # 如果在增量名单内，则执行增量模式
-                effective_mode = "incremental"
-            else:
-                # 不在增量名单内，则执行普通模式
-                effective_mode = "traditional"
-
-            # 4. 模式过滤 (如果函数调用者要求过滤)
-            if mode_filter and effective_mode != mode_filter:
-                continue
-
-            result.append((group_id, platform_id, effective_mode))
-
-        logger.info(
-            f"分层调度解析完成：符合条件的群组共 {len(result)} 个"
-            + (f" (模式过滤: {mode_filter})" if mode_filter else "")
-        )
-        return result
+        """根据分层过滤逻辑判定所有应参与计划分析的目标群组及其分析策略（委托 ScheduledTargetResolver）。"""
+        return await self.target_resolver.get_scheduled_targets(mode_filter)
 
     # ================================================================
     # 统一报告调度入口
@@ -346,7 +290,9 @@ class AutoScheduler:
                 f"定时报告: {len(all_targets)} 个目标 (并发限制: {max_concurrent})"
             )
 
-            async def dispatch_group(gid, pid, mode):
+            async def dispatch_group(
+                gid: str, pid: str | None, mode: str
+            ) -> DailyAnalysisExecutionResult | dict[str, object] | None:
                 wait_started_at = time_mod.monotonic()
                 logger.debug(
                     "定时报告等待调度槽位: platform=%s, group=%s, mode=%s, available=%s/%s",
@@ -362,7 +308,7 @@ class AutoScheduler:
                             sem.acquire(), timeout=_SCHEDULED_DISPATCH_WARN_SECONDS
                         )
                         break
-                    except asyncio.TimeoutError:
+                    except TimeoutError:
                         logger.warning(
                             "定时报告等待调度槽位超过 %.0fs: platform=%s, group=%s, "
                             "mode=%s, available=%s/%s",
@@ -396,10 +342,9 @@ class AutoScheduler:
                         return await self._perform_incremental_final_report_for_group_with_timeout(
                             gid, pid
                         )
-                    else:
-                        return await self._perform_auto_analysis_for_group_with_timeout(
-                            gid, pid
-                        )
+                    return await self._perform_auto_analysis_for_group_with_timeout(
+                        gid, pid
+                    )
                 finally:
                     sem.release()
                     logger.debug(
@@ -478,19 +423,11 @@ class AutoScheduler:
     ):
         """为指定群执行自动分析并返回真实的分析与发送状态。"""
         try:
-            result = await asyncio.wait_for(
+            return await asyncio.wait_for(
                 self._perform_auto_analysis_for_group(group_id, target_platform_id),
                 timeout=1800,
             )
-            if not isinstance(result, dict):
-                return {
-                    "success": False,
-                    "analysis_success": False,
-                    "report_sent": False,
-                    "reason": "invalid_result",
-                }
-            return result
-        except asyncio.TimeoutError:
+        except TimeoutError:
             logger.error(f"群 {group_id} 分析超时（30分钟），跳过该群分析")
             return {
                 "success": False,
@@ -511,11 +448,18 @@ class AutoScheduler:
         self, group_id: str, target_platform_id: str | None = None
     ):
         """为指定群执行自动分析（业务逻辑委派给 AnalysisApplicationService）"""
+        trace = None
         try:
             # 解析可读群名以生成语义化的 TraceID
             group_name = await self._get_group_name_safe(group_id, target_platform_id)
             trace_id = TraceContext.generate(prefix="group", group_name=group_name)
-            TraceContext.set(trace_id)
+            trace = TraceContext.set(
+                trace_id=trace_id,
+                group_id=group_id,
+                group_name=group_name,
+                platform=target_platform_id or "",
+                trigger_type="auto",
+            )
 
             if self._terminating:
                 return {
@@ -532,6 +476,11 @@ class AutoScheduler:
             # 检查平台状态 (BotManager 为基础设施层，用于获取平台就绪状态)
             if not self.bot_manager.is_ready_for_auto_analysis():
                 logger.warning(f"群 {group_id} 自动分析跳过：bot管理器未就绪")
+                if trace and trace.status == "running":
+                    trace.finish(
+                        status="skipped",
+                        error_message=AUTO_ANALYSIS_SKIP_REASONS["bot_not_ready"],
+                    )
                 return {
                     "success": False,
                     "analysis_success": False,
@@ -546,30 +495,51 @@ class AutoScheduler:
             )
 
             if not result.get("success"):
-                reason = result.get("reason")
-                logger.info(f"群 {group_id} 自动分析跳过: {reason}")
+                reason = str(result.get("reason", "unknown"))
+                skip_msg = str(result.get("error") or result.get("message") or "")
+                is_skip = reason in AUTO_ANALYSIS_SKIP_REASONS
+                if trace and trace.status == "running":
+                    if is_skip:
+                        trace.finish(
+                            status="skipped",
+                            error_message=skip_msg
+                            or AUTO_ANALYSIS_SKIP_REASONS.get(
+                                reason, f"自动分析已跳过 ({reason})"
+                            ),
+                        )
+                    else:
+                        trace.finish(
+                            status="failed",
+                            error_message=str(
+                                result.get("error") or f"自动分析执行失败: {reason}"
+                            ),
+                        )
+                logger.info(
+                    f"群 {group_id} 自动分析未完成: {reason} - {result.get('error', '')}"
+                )
                 result["analysis_success"] = False
                 result["report_sent"] = False
                 return result
 
             # 获取分析结果及适配器
-            analysis_result = result["analysis_result"]
-            adapter = result["adapter"]
+            raw_analysis = result.get("analysis_result")
+            analysis_result = cast(
+                "AnalysisResultPayload",
+                raw_analysis if isinstance(raw_analysis, dict) else {},
+            )
+            adapter = result.get("adapter")
             dispatch_platform_id = (
                 adapter.platform_id
-                if hasattr(adapter, "platform_id")
+                if isinstance(adapter, PlatformAdapterProtocol)
                 else target_platform_id
             )
 
             # 调度导出并发送报告
-            comic_trigger = getattr(
-                getattr(self, "plugin_instance", None),
-                "_try_trigger_comic_generation",
-                None,
-            )
-            if callable(comic_trigger):
+            if self.plugin_instance is not None:
                 try:
-                    comic_trigger(group_id, dispatch_platform_id, analysis_result)
+                    self.plugin_instance.comic_command_handler.try_trigger_comic_generation(
+                        group_id, dispatch_platform_id, analysis_result
+                    )
                 except Exception as exc:
                     logger.error(
                         f"群 {group_id} 触发定时报告漫画失败: {exc}", exc_info=True
@@ -584,19 +554,30 @@ class AutoScheduler:
             result["analysis_success"] = True
             result["report_sent"] = bool(report_sent)
             if not report_sent:
+                if trace and trace.status == "running":
+                    trace.finish(
+                        status="failed", error_message="Report delivery failed"
+                    )
                 result["success"] = False
                 result["reason"] = "report_delivery_failed"
                 logger.error(f"群 {group_id} 自动分析完成，但报告发送失败")
                 return result
 
+            if trace and trace.status == "running":
+                trace.finish(status="succeeded")
             logger.info(f"群 {group_id} 自动分析及报告发送成功")
             return result
 
         except DuplicateGroupTaskError:
-            # group_lock 抛出的 DuplicateGroupTaskError 表示任务正在运行，优雅跳过
+            if trace and trace.status == "running":
+                trace.finish(
+                    status="aborted", error_message="Task already running in group"
+                )
             logger.debug(f"群 {group_id} 任务因并发锁冲突而跳过（已在运行）")
-            raise  # 重新抛出，让上层知道任务并没真正执行而是跳过了
+            raise
         except Exception as e:
+            if trace and trace.status == "running":
+                trace.finish(status="failed", error_message=str(e))
             logger.error(f"群 {group_id} 自动分析执行失败: {e}", exc_info=True)
             return {
                 "success": False,
@@ -611,7 +592,7 @@ class AutoScheduler:
     # 增量模式：增量分析
     # ================================================================
 
-    async def record_incremental_message(self, event) -> bool:
+    async def record_incremental_message(self, event: AstrMessageEvent) -> bool:
         """记录一条群消息，用于按消息量触发增量分析。
 
         Args:
@@ -624,12 +605,25 @@ class AutoScheduler:
             return False
         if str(event.get_sender_id()) == str(event.get_self_id()):
             return False
+
+        platform_id = str(event.get_platform_id() or "").strip()
+        group_id = str(event.get_group_id() or "").strip()
+        if not self.bot_manager.is_plugin_enabled(
+            platform_id, PLUGIN_NAME, group_id=group_id
+        ):
+            return False
+
         message_obj = getattr(event, "message_obj", None)
+        message_id = (
+            str(message_obj.message_id)
+            if message_obj and hasattr(message_obj, "message_id")
+            else ""
+        )
         return await self.incremental_trigger.record_message(
-            platform_id=event.get_platform_id(),
-            group_id=event.get_group_id(),
+            platform_id=platform_id,
+            group_id=group_id,
             unified_msg_origin=event.unified_msg_origin,
-            message_id=str(getattr(message_obj, "message_id", "") or ""),
+            message_id=message_id,
         )
 
     async def _trigger_incremental_analysis(
@@ -644,10 +638,9 @@ class AutoScheduler:
         Returns:
             增量分析结果。
         """
-        result = await self._perform_incremental_analysis_for_group_with_timeout(
+        return await self._perform_incremental_analysis_for_group_with_timeout(
             group_id, platform_id
         )
-        return result
 
     def _request_immediate_incremental_report(
         self, group_id: str, platform_id: str
@@ -704,7 +697,6 @@ class AutoScheduler:
                         group_id, platform_id
                     )
                 )
-                result = result if isinstance(result, dict) else {}
                 has_new_batch = (
                     self._immediate_report_versions.get(state_key, 0)
                     != requested_version
@@ -751,14 +743,13 @@ class AutoScheduler:
     ):
         """为指定群执行增量分析（带超时控制，10分钟）。"""
         try:
-            result = await asyncio.wait_for(
+            return await asyncio.wait_for(
                 self._perform_incremental_analysis_for_group(
                     group_id, target_platform_id
                 ),
                 timeout=600,
             )
-            return result
-        except asyncio.TimeoutError:
+        except TimeoutError:
             logger.error(f"群 {group_id} 增量分析超时（10分钟），跳过")
             return {"success": False, "reason": "timeout"}
         except Exception as e:
@@ -771,14 +762,21 @@ class AutoScheduler:
         target_platform_id: str | None = None,
     ):
         """为指定群执行增量分析（业务逻辑委派给 AnalysisApplicationService）"""
+        trace = None
         try:
             # 解析可读群名以生成语义化的 TraceID
             group_name = await self._get_group_name_safe(group_id, target_platform_id)
             trace_id = TraceContext.generate(prefix="incr", group_name=group_name)
-            TraceContext.set(trace_id)
+            trace = TraceContext.set(
+                trace_id=trace_id,
+                group_id=group_id,
+                group_name=group_name,
+                platform=target_platform_id or "",
+                trigger_type="incremental",
+            )
 
             if self._terminating:
-                return
+                return None
 
             logger.debug(
                 f"开始为群 {group_id} 执行增量分析 "
@@ -788,6 +786,11 @@ class AutoScheduler:
             # 检查平台状态
             if not self.bot_manager.is_ready_for_auto_analysis():
                 logger.warning(f"群 {group_id} 增量分析跳过：bot管理器未就绪")
+                if trace and trace.status == "running":
+                    trace.finish(
+                        status="skipped",
+                        error_message=AUTO_ANALYSIS_SKIP_REASONS["bot_not_ready"],
+                    )
                 return {"success": False, "reason": "bot_not_ready"}
 
             # 委派给应用层服务执行增量分析用例
@@ -798,25 +801,53 @@ class AutoScheduler:
             )
 
             if not result.get("success"):
-                reason = result.get("reason", "unknown")
+                reason = str(result.get("reason", "unknown"))
+                skip_msg = str(result.get("error") or result.get("message") or "")
+                is_skip = reason in AUTO_ANALYSIS_SKIP_REASONS
+                if trace and trace.status == "running":
+                    if is_skip:
+                        trace.finish(
+                            status="skipped",
+                            error_message=skip_msg
+                            or AUTO_ANALYSIS_SKIP_REASONS.get(
+                                reason, f"增量分析已跳过 ({reason})"
+                            ),
+                        )
+                    else:
+                        trace.finish(
+                            status="failed",
+                            error_message=str(
+                                result.get("error") or f"增量分析失败: {reason}"
+                            ),
+                        )
                 logger.debug(f"群 {group_id} 增量分析未完成: reason={reason}")
                 return result
 
             # 增量分析只累积数据，不发送报告
-            batch_summary = result.get("batch_summary", {})
+            raw_summary = result.get("batch_summary")
+            batch_summary: dict[str, object] = (
+                raw_summary if isinstance(raw_summary, dict) else {}
+            )
             logger.debug(
                 f"群 {group_id} 增量分析调度回调完成: "
                 f"消息数={result.get('messages_count', 0)}, "
                 f"话题={batch_summary.get('topics_count', 0)}, "
                 f"金句={batch_summary.get('quotes_count', 0)}"
             )
+            if trace and trace.status == "running":
+                trace.finish(status="succeeded")
             return result
 
         except DuplicateGroupTaskError:
-            # group_lock 抛出的 DuplicateGroupTaskError 表示任务正在运行，优雅跳过
+            if trace and trace.status == "running":
+                trace.finish(
+                    status="aborted", error_message="Task already running in group"
+                )
             logger.debug(f"群 {group_id} 增量分析因并发锁冲突而跳过（已在运行）")
             return {"success": False, "reason": "already_running"}
         except Exception as e:
+            if trace and trace.status == "running":
+                trace.finish(status="failed", error_message=str(e))
             logger.error(f"群 {group_id} 增量分析执行失败: {e}", exc_info=True)
             return {"success": False, "reason": str(e)}
         finally:
@@ -842,14 +873,6 @@ class AutoScheduler:
                 timeout=1800,
             )
 
-            if not isinstance(result, dict):
-                return {
-                    "success": False,
-                    "analysis_success": False,
-                    "report_sent": False,
-                    "reason": "invalid_result",
-                }
-
             # 判定是否需要触发回退 (例如：无增量数据等)
             if not result.get("success"):
                 reason = result.get("reason", "")
@@ -866,7 +889,7 @@ class AutoScheduler:
 
             return result
 
-        except asyncio.TimeoutError:
+        except TimeoutError:
             logger.error(f"群 {group_id} 最终报告超时（30分钟）")
             if self.config_manager.get_incremental_fallback_enabled():
                 logger.warning(f"群 {group_id} 增量报告超时，正在回退到传统全量分析...")
@@ -902,14 +925,6 @@ class AutoScheduler:
             result = await self._perform_auto_analysis_for_group_with_timeout(
                 group_id, target_platform_id
             )
-            if not isinstance(result, dict):
-                return {
-                    "success": False,
-                    "analysis_success": False,
-                    "report_sent": False,
-                    "fallback": True,
-                    "reason": "fallback_invalid_result",
-                }
             result["fallback"] = True
             return result
         except Exception as fallback_err:
@@ -929,11 +944,18 @@ class AutoScheduler:
         self, group_id: str, target_platform_id: str | None = None
     ):
         """为指定群生成增量最终报告（业务逻辑委派给 AnalysisApplicationService）"""
+        trace = None
         try:
             # 解析可读群名以生成语义化的 TraceID
             group_name = await self._get_group_name_safe(group_id, target_platform_id)
             trace_id = TraceContext.generate(prefix="report", group_name=group_name)
-            TraceContext.set(trace_id)
+            trace = TraceContext.set(
+                trace_id=trace_id,
+                group_id=group_id,
+                group_name=group_name,
+                platform=target_platform_id or "",
+                trigger_type="incremental_report",
+            )
 
             if self._terminating:
                 return {
@@ -943,7 +965,7 @@ class AutoScheduler:
                     "reason": "terminating",
                 }
 
-            incremental_trigger = getattr(self, "incremental_trigger", None)
+            incremental_trigger = self.incremental_trigger
             if (
                 incremental_trigger
                 and target_platform_id
@@ -952,6 +974,11 @@ class AutoScheduler:
                 )
             ):
                 logger.info(f"群 {group_id} 已移出增量名单，跳过最终报告")
+                if trace and trace.status == "running":
+                    trace.finish(
+                        status="skipped",
+                        error_message=AUTO_ANALYSIS_SKIP_REASONS["target_removed"],
+                    )
                 return {
                     "success": False,
                     "analysis_success": False,
@@ -967,6 +994,11 @@ class AutoScheduler:
             # 检查平台状态
             if not self.bot_manager.is_ready_for_auto_analysis():
                 logger.warning(f"群 {group_id} 最终报告跳过：bot管理器未就绪")
+                if trace and trace.status == "running":
+                    trace.finish(
+                        status="skipped",
+                        error_message=AUTO_ANALYSIS_SKIP_REASONS["bot_not_ready"],
+                    )
                 return {
                     "success": False,
                     "analysis_success": False,
@@ -981,18 +1013,40 @@ class AutoScheduler:
             )
 
             if not result.get("success"):
-                reason = result.get("reason", "unknown")
+                reason = str(result.get("reason", "unknown"))
+                skip_msg = str(result.get("error") or result.get("message") or "")
+                is_skip = reason in AUTO_ANALYSIS_SKIP_REASONS
+                if trace and trace.status == "running":
+                    if is_skip:
+                        trace.finish(
+                            status="skipped",
+                            error_message=skip_msg
+                            or AUTO_ANALYSIS_SKIP_REASONS.get(
+                                reason, f"增量最终报告已跳过 ({reason})"
+                            ),
+                        )
+                    else:
+                        trace.finish(
+                            status="failed",
+                            error_message=str(
+                                result.get("error") or f"增量最终报告失败: {reason}"
+                            ),
+                        )
                 logger.info(f"群 {group_id} 最终报告跳过: {reason}")
                 result["analysis_success"] = False
                 result["report_sent"] = False
                 return result
 
             # 获取分析结果及适配器，分发报告
-            analysis_result = result["analysis_result"]
-            adapter = result["adapter"]
+            raw_analysis = result.get("analysis_result")
+            analysis_result = cast(
+                "AnalysisResultPayload",
+                raw_analysis if isinstance(raw_analysis, dict) else {},
+            )
+            adapter = result.get("adapter")
             dispatch_platform_id = (
                 adapter.platform_id
-                if hasattr(adapter, "platform_id")
+                if isinstance(adapter, PlatformAdapterProtocol)
                 else target_platform_id
             )
 
@@ -1010,17 +1064,15 @@ class AutoScheduler:
                 logger.info(f"群 {group_id} 已移出增量名单，取消发送最终报告")
                 return result
 
-            comic_trigger = getattr(
-                getattr(self, "plugin_instance", None),
-                "_try_trigger_comic_generation",
-                None,
-            )
-            if callable(comic_trigger):
+            if self.plugin_instance is not None:
                 try:
-                    comic_trigger(group_id, dispatch_platform_id, analysis_result)
+                    self.plugin_instance.comic_command_handler.try_trigger_comic_generation(
+                        group_id, dispatch_platform_id, analysis_result
+                    )
                 except Exception as exc:
                     logger.error(
-                        f"群 {group_id} 触发增量报告漫画失败: {exc}", exc_info=True
+                        f"群 {group_id} 触发增量报告漫画失败: {exc}",
+                        exc_info=True,
                     )
 
             report_sent = await self.report_dispatcher.dispatch(
@@ -1032,6 +1084,10 @@ class AutoScheduler:
             result["analysis_success"] = True
             result["report_sent"] = bool(report_sent)
             if not report_sent:
+                if trace and trace.status == "running":
+                    trace.finish(
+                        status="failed", error_message="Report delivery failed"
+                    )
                 result["success"] = False
                 result["reason"] = "report_delivery_failed"
                 logger.error(f"群 {group_id} 最终报告生成完成，但报告发送失败")
@@ -1055,11 +1111,16 @@ class AutoScheduler:
                     f"群 {group_id} 过期批次清理失败（不影响报告）: {cleanup_err}"
                 )
 
+            if trace and trace.status == "running":
+                trace.finish(status="succeeded")
             logger.info(f"群 {group_id} 增量最终报告发送成功")
             return result
 
         except DuplicateGroupTaskError:
-            # group_lock 抛出的 DuplicateGroupTaskError 表示任务正在运行，优雅跳过
+            if trace and trace.status == "running":
+                trace.finish(
+                    status="aborted", error_message="Task already running in group"
+                )
             logger.debug(f"群 {group_id} 最终报告因并发锁冲突而跳过（已在运行）")
             return {
                 "success": False,
@@ -1068,6 +1129,8 @@ class AutoScheduler:
                 "reason": "already_running",
             }
         except Exception as e:
+            if trace and trace.status == "running":
+                trace.finish(status="failed", error_message=str(e))
             logger.error(f"群 {group_id} 最终报告执行失败: {e}", exc_info=True)
             return {
                 "success": False,
@@ -1079,95 +1142,9 @@ class AutoScheduler:
             logger.debug(f"群 {group_id} 最终报告流程结束")
 
     # ================================================================
-    # 群列表获取（基础设施层）
+    # 群列表获取（委托 ScheduledTargetResolver）
     # ================================================================
 
     async def _get_all_groups(self) -> list[tuple[str, str]]:
-        """
-        获取所有bot实例所在的群列表（使用 PlatformAdapter）
-
-        Returns:
-            list[tuple[str, str]]: [(platform_id, group_id), ...]
-        """
-        all_groups = set()
-
-        # 1. [韧性增强] 进入扫描前，尝试最后一次实时发现机器人
-        # 这确保了即使冷启动初始化失败，定时任务触发时仍能刷新状态
-        if hasattr(self.bot_manager, "auto_discover_bot_instances"):
-            try:
-                await self.bot_manager.auto_discover_bot_instances()
-            except Exception as e:
-                logger.warning(f"[AutoScheduler] 周期性扫描中的平台发现失败: {e}")
-
-        bot_ids = list(self.bot_manager._bot_instances.keys())
-
-        if not bot_ids:
-            logger.warning(
-                "[AutoScheduler] 分析周期开启，但全局未发现任何在线 Bot。任务将跳过。"
-            )
-            return []
-
-        logger.info(f"[AutoScheduler] 正在扫描 {len(bot_ids)} 个平台的群聊资源...")
-
-        for platform_id, bot_instance in self.bot_manager._bot_instances.items():
-            # 检查该平台是否启用了此插件
-            if not self.bot_manager.is_plugin_enabled(
-                platform_id, "astrbot_plugin_qq_group_daily_analysis"
-            ):
-                logger.debug(f"平台 {platform_id} 未启用此插件，跳过获取群列表")
-                continue
-
-            try:
-                # 1. 优先从 BotManager 获取已创建的适配器
-                adapter = self.bot_manager.get_adapter(platform_id)
-
-                # 2. 如果没有，尝试临时创建（降级方案）
-                platform_name = None
-                if not adapter:
-                    platform_name = self.bot_manager._detect_platform_name(bot_instance)
-                    if platform_name:
-                        adapter = PlatformAdapterFactory.create(
-                            platform_name,
-                            bot_instance,
-                            config={
-                                "bot_self_ids": self.config_manager.get_bot_self_ids(),
-                                "platform_id": str(platform_id),
-                            },
-                        )
-
-                # 3. 使用适配器获取群列表
-                if adapter:
-                    try:
-                        groups = await adapter.get_group_list()
-                        groups = [
-                            str(group_id).strip()
-                            for group_id in groups
-                            if str(group_id).strip()
-                        ]
-
-                        # 获取平台名称（仅用于日志）
-                        p_name = None
-                        if hasattr(adapter, "get_platform_name"):
-                            try:
-                                p_name = adapter.get_platform_name()
-                            except Exception:
-                                p_name = None
-
-                        for group_id in groups:
-                            all_groups.add((platform_id, str(group_id)))
-
-                        logger.info(
-                            f"平台 {platform_id} ({p_name or 'unknown'}) 成功获取 {len(groups)} 个群组"
-                        )
-                        continue
-
-                    except Exception as e:
-                        logger.warning(f"适配器 {platform_id} 获取群列表失败: {e}")
-
-                # 4. 降级：无法通过适配器获取
-                logger.debug(f"平台 {platform_id} 无法通过适配器获取群列表")
-
-            except Exception as e:
-                logger.error(f"平台 {platform_id} 获取群列表异常: {e}")
-
-        return list(all_groups)
+        """获取所有bot实例所在的群列表（委托 ScheduledTargetResolver）。"""
+        return await self.target_resolver.get_all_groups()

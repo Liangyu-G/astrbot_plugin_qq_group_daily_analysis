@@ -3,9 +3,11 @@
 专门处理用户称号和MBTI类型分析
 """
 
-from ....domain.models.data_models import TokenUsage, UserTitle
+from __future__ import annotations
+
+from ....domain.value_objects import TokenUsage, UserTitle
 from ....utils.logger import logger
-from ...utils.template_utils import render_template
+from ....utils.template_utils import render_template
 from ..utils.json_utils import extract_user_titles_with_regex
 from ..utils.response_validation import validate_user_title_items
 from ..utils.structured_output_schema import JSONObject, build_user_titles_schema
@@ -244,17 +246,14 @@ class UserTitleAnalyzer(BaseAnalyzer[UserTitle, dict]):
         user_activity: dict,
         umo: str | None = None,
         top_users: list[dict] | None = None,
-        session_id: str | None = None,
     ) -> tuple[list[UserTitle], TokenUsage]:
-        """
-        分析用户称号
+        """分析用户称号
 
         Args:
             messages: 群聊消息列表
-            user_analysis: 用户分析统计
+            user_activity: 用户分析统计
             umo: 模型唯一标识符
             top_users: 活跃用户列表(从get_top_users获取,可选)
-            session_id: 会话ID (用于调试模式)
 
         Returns:
             (用户称号列表, Token使用统计)
@@ -268,8 +267,8 @@ class UserTitleAnalyzer(BaseAnalyzer[UserTitle, dict]):
                 return [], TokenUsage()
 
             logger.info(f"开始分析 {len(user_data['user_summaries'])} 个活跃用户的称号")
-            return await self.analyze(user_data, umo, session_id)
+            return await self.analyze(user_data, umo)
 
         except Exception as e:
             logger.error(f"用户称号分析失败: {e}")
-            return [], TokenUsage()
+            raise

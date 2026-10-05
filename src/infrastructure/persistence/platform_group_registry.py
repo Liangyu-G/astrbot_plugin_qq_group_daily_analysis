@@ -1,8 +1,13 @@
 """Persistent registry of groups observed by event-driven platforms."""
 
+from __future__ import annotations
+
 import asyncio
-from datetime import datetime, timezone
-from typing import Any
+from datetime import UTC, datetime
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from astrbot.api.star import Star
 
 
 class PlatformGroupRegistry:
@@ -11,10 +16,14 @@ class PlatformGroupRegistry:
     _KV_KEY = "platform_seen_groups_v1"
     _LEGACY_TELEGRAM_KEY = "telegram_seen_groups_v1"
 
-    def __init__(self, plugin_instance: Any):
+    plugin: Star
+    _lock: asyncio.Lock
+    _known_groups: set[tuple[str, str]]
+
+    def __init__(self, plugin_instance: Star) -> None:
         self.plugin = plugin_instance
         self._lock = asyncio.Lock()
-        self._known_groups: set[tuple[str, str]] = set()
+        self._known_groups = set()
 
     async def upsert(
         self,
@@ -53,7 +62,7 @@ class PlatformGroupRegistry:
                 self._known_groups.add(identity)
                 return
 
-            now_iso = datetime.now(timezone.utc).isoformat()
+            now_iso = datetime.now(UTC).isoformat()
             platform_map[group_key] = {
                 "first_seen": now_iso,
                 "last_seen": now_iso,

@@ -28,13 +28,30 @@
                 "type": "int",
                 "description": "默认分析天数",
                 "default": 1,
-                "hint": "默认分析最近几天的消息，增量分析也基于此数据保存分析情况。QQ 官方 API 无历史拉取接口，只能分析插件启用后实时缓存到 AstrBot 本地库的消息。"
+                "hint": "默认分析最近几天的消息，增量分析也基于此数据保存分析情况。QQ 官方 API 及 Telegram 无历史拉取接口，只能分析本地库缓存的消息。"
             },
             "max_messages": {
                 "type": "int",
                 "description": "单次分析的获取最大消息条数基准",
                 "default": 1000,
                 "hint": "单次分析的获取最大消息条数基准值，如果当天群聊消息过多，已经获取到足够的消息(达到 max_messages)，停止获取，获取到的消息数量是最新一次获取到的超过 max_messages 的消息数量，建议500-2000"
+            },
+            "local_history_max_messages": {
+                "type": "int",
+                "description": "插件本地消息历史库消息保存上限 (条/群)",
+                "default": 10000,
+                "hint": "适用于无法拉取历史记录的平台（Telegram、QQ 官方机器人、Satori 等）。单群最多保留的历史消息条数，超出后自动修剪最旧消息。范围 10,000 ~ 100,000 条。",
+                "slider": {
+                    "min": 10000,
+                    "max": 100000,
+                    "step": 1000
+                }
+            },
+            "persist_only_allowed_groups": {
+                "type": "bool",
+                "description": "仅对已启用分析的群进行消息持久化",
+                "default": false,
+                "hint": "开启后，若群组权限模式设置为白名单或黑名单，未通过群权限校验的群聊消息将直接被忽略，不写入本地消息历史库，节省磁盘与数据库资源；默认关闭（即所有启用插件的群均正常缓存消息，方便后续加入白名单时立即可分析历史）。"
             },
             "min_messages_threshold": {
                 "type": "int",
@@ -63,6 +80,12 @@
                 "default": true,
                 "hint": "在分析中优先使用用户的群名片作为昵称显示"
             },
+            "enable_runtime_metrics": {
+                "type": "bool",
+                "description": "全链路性能指标与资源监控",
+                "default": true,
+                "hint": "开启后，插件将在分析任务执行全生命周期中精确采集各阶段耗时瀑布、进程内存增量(RSS)、I/O吞吐与Base64传输体积膨胀比，并在前端任务详情抽屉中呈现专属可视化 ECharts 图表。"
+            },
             "output_format": {
                 "type": "list",
                 "description": "输出格式（可多选）",
@@ -71,7 +94,9 @@
                     "text",
                     "html"
                 ],
-                "default": ["image"],
+                "default": [
+                    "image"
+                ],
                 "hint": "选择分析报告的输出方式（可多选）。image=图片、text=纯文本摘要、html=可交互式网页文件。多选仅在定时分析发送时时报告按顺序依次发送，手动触发时只发送第一个选中的格式，例如 image+html 会发送图片并通过外链提供 HTML 报告。QQ 官方图片/HTML 报告优先显示事件昵称，昵称缺失时使用群内稳定匿名名；文本报告由独立 Markdown 模块使用成员艾特展示身份。其他平台保持原有昵称文本格式。"
             },
             "report_template": {
@@ -86,10 +111,35 @@
                     "hack",
                     "spring_festival",
                     "simple",
+                    "art_nouveau",
+                    "deepseek_maid",
                     "format"
                 ],
-                "default": "scrapbook",
+                "default": "HatsuneMiku",
                 "hint": "分析报告使用的HTML模板名称，QQ 端可以使用 `/设置模板` 查看使用指南，使用`/查看模板` 命令查看模板样式效果。其他平台不支持合并转发，可以到 [模板](https://github.com/SXP-Simon/astrbot_plugin_qq_group_daily_analysis/tree/main/assets) 文件夹中查看模板样式效果"
+            },
+            "report_language": {
+                "type": "string",
+                "description": "报告语言",
+                "options": [
+                    "auto",
+                    "zh-Hans",
+                    "zh-Hant",
+                    "en",
+                    "ja"
+                ],
+                "labels": [
+                    "自动（按群聊判断）",
+                    "简体中文",
+                    "繁體中文",
+                    "ENGLISH",
+                    "日本語"
+                ],
+                "default": "auto",
+                "condition": {
+                    "report_template": "HatsuneMiku"
+                },
+                "hint": "群分析报告使用的语言。auto（默认）= 按本次分析的群聊消息正文自动判断，判断标准：某一语言占比超过 70% 且样本足够才判定，否则默认使用简体中文模板且不干预LLM生成内容，中文再按简繁特征字区分简体/繁体。选定某一语言则强制使用该语言。语言同时作用于三处：① 报告模板骨架文案、页面语言声明与字体优先级；② 报告日期格式；③ LLM 撰写的解说文案（标题、点评、总结等）。引用群友的原话与昵称不受影响，始终保留原文，不会被翻译或改写。本项仅作用于 HatsuneMiku[葱绿音乐] 模板。"
             },
             "profile_display_mode": {
                 "type": "string",
@@ -123,26 +173,20 @@
                 "description": "人格映射配置(JSON)",
                 "editor_mode": true,
                 "editor_language": "json",
-                "default": "{\n    \"mbti\": {\n        \"INTJ\": {\n            \"code\": \"INTJ\",\n            \"name_zh\": \"建筑师\"\n        },\n        \"INTP\": {\n            \"code\": \"INTP\",\n            \"name_zh\": \"逻辑学家\"\n        },\n        \"ENTJ\": {\n            \"code\": \"ENTJ\",\n            \"name_zh\": \"指挥官\"\n        },\n        \"ENTP\": {\n            \"code\": \"ENTP\",\n            \"name_zh\": \"辩论家\"\n        },\n        \"INFJ\": {\n            \"code\": \"INFJ\",\n            \"name_zh\": \"提倡者\"\n        },\n        \"INFP\": {\n            \"code\": \"INFP\",\n            \"name_zh\": \"调停者\"\n        },\n        \"ENFJ\": {\n            \"code\": \"ENFJ\",\n            \"name_zh\": \"主人公\"\n        },\n        \"ENFP\": {\n            \"code\": \"ENFP\",\n            \"name_zh\": \"竞选者\"\n        },\n        \"ISTJ\": {\n            \"code\": \"ISTJ\",\n            \"name_zh\": \"物流师\"\n        },\n        \"ISFJ\": {\n            \"code\": \"ISFJ\",\n            \"name_zh\": \"守卫者\"\n        },\n        \"ESTJ\": {\n            \"code\": \"ESTJ\",\n            \"name_zh\": \"总经理\"\n        },\n        \"ESTP\": {\n            \"code\": \"ESTP\",\n            \"name_zh\": \"企业家\"\n        },\n        \"ISTP\": {\n            \"code\": \"ISTP\",\n            \"name_zh\": \"鉴赏家\"\n        },\n        \"ISFP\": {\n            \"code\": \"ISFP\",\n            \"name_zh\": \"探险家\"\n        },\n        \"ESFJ\": {\n            \"code\": \"ESFJ\",\n            \"name_zh\": \"执政官\"\n        },\n        \"ESFP\": {\n            \"code\": \"ESFP\",\n            \"name_zh\": \"表演者\"\n        }\n    },\n    \"sbti\": {\n        \"INTJ\": {\n            \"code\": \"CTRL\",\n            \"name_zh\": \"拿捏者\",\n            \"asset_code\": \"CTRL\",\n            \"image\": \"https://fastly.jsdelivr.net/gh/SXP-Simon/profile_assets@main/sbti/CTRL.png\"\n        },\n        \"INTP\": {\n            \"code\": \"THIN-K\",\n            \"name_zh\": \"思考者\",\n            \"asset_code\": \"THIN-K\",\n            \"image\": \"https://fastly.jsdelivr.net/gh/SXP-Simon/profile_assets@main/sbti/THIN-K.png\"\n        },\n        \"ENTJ\": {\n            \"code\": \"BOSS\",\n            \"name_zh\": \"领导者\",\n            \"asset_code\": \"BOSS\",\n            \"image\": \"https://fastly.jsdelivr.net/gh/SXP-Simon/profile_assets@main/sbti/BOSS.png\"\n        },\n        \"ENTP\": {\n            \"code\": \"JOKE-R\",\n            \"name_zh\": \"小丑\",\n            \"asset_code\": \"JOKE-R\",\n            \"image\": \"https://fastly.jsdelivr.net/gh/SXP-Simon/profile_assets@main/sbti/JOKE-R.jpg\"\n        },\n        \"INFJ\": {\n            \"code\": \"LOVE-R\",\n            \"name_zh\": \"多情者\",\n            \"asset_code\": \"LOVE-R\",\n            \"image\": \"https://fastly.jsdelivr.net/gh/SXP-Simon/profile_assets@main/sbti/LOVE-R.png\"\n        },\n        \"INFP\": {\n            \"code\": \"SOLO\",\n            \"name_zh\": \"孤儿\",\n            \"asset_code\": \"SOLO\",\n            \"image\": \"https://fastly.jsdelivr.net/gh/SXP-Simon/profile_assets@main/sbti/SOLO.png\"\n        },\n        \"ENFJ\": {\n            \"code\": \"THAN-K\",\n            \"name_zh\": \"感恩者\",\n            \"asset_code\": \"THAN-K\",\n            \"image\": \"https://fastly.jsdelivr.net/gh/SXP-Simon/profile_assets@main/sbti/THAN-K.png\"\n        },\n        \"ENFP\": {\n            \"code\": \"GOGO\",\n            \"name_zh\": \"行者\",\n            \"asset_code\": \"GOGO\",\n            \"image\": \"https://fastly.jsdelivr.net/gh/SXP-Simon/profile_assets@main/sbti/GOGO.png\"\n        },\n        \"ISTJ\": {\n            \"code\": \"OH-NO\",\n            \"name_zh\": \"哦不人\",\n            \"asset_code\": \"OH-NO\",\n            \"image\": \"https://fastly.jsdelivr.net/gh/SXP-Simon/profile_assets@main/sbti/OH-NO.png\"\n        },\n        \"ISTP\": {\n            \"code\": \"POOR\",\n            \"name_zh\": \"贫困者\",\n            \"asset_code\": \"POOR\",\n            \"image\": \"https://fastly.jsdelivr.net/gh/SXP-Simon/profile_assets@main/sbti/POOR.png\"\n        },\n        \"ESTJ\": {\n            \"code\": \"SHIT\",\n            \"name_zh\": \"愤世者\",\n            \"asset_code\": \"SHIT\",\n            \"image\": \"https://fastly.jsdelivr.net/gh/SXP-Simon/profile_assets@main/sbti/SHIT.png\"\n        },\n        \"ESTP\": {\n            \"code\": \"WOC!\",\n            \"name_zh\": \"握草人\",\n            \"asset_code\": \"WOC\",\n            \"image\": \"https://fastly.jsdelivr.net/gh/SXP-Simon/profile_assets@main/sbti/WOC.png\"\n        },\n        \"ISFJ\": {\n            \"code\": \"MUM\",\n            \"name_zh\": \"妈妈\",\n            \"asset_code\": \"MUM\",\n            \"image\": \"https://fastly.jsdelivr.net/gh/SXP-Simon/profile_assets@main/sbti/MUM.png\"\n        },\n        \"ISFP\": {\n            \"code\": \"MALO\",\n            \"name_zh\": \"吗喽\",\n            \"asset_code\": \"MALO\",\n            \"image\": \"https://fastly.jsdelivr.net/gh/SXP-Simon/profile_assets@main/sbti/MALO.png\"\n        },\n        \"ESFJ\": {\n            \"code\": \"ATM-er\",\n            \"name_zh\": \"送钱者\",\n            \"asset_code\": \"ATM-er\",\n            \"image\": \"https://fastly.jsdelivr.net/gh/SXP-Simon/profile_assets@main/sbti/ATM-er.png\"\n        },\n        \"ESFP\": {\n            \"code\": \"SEXY\",\n            \"name_zh\": \"尤物\",\n            \"asset_code\": \"SEXY\",\n            \"image\": \"https://fastly.jsdelivr.net/gh/SXP-Simon/profile_assets@main/sbti/SEXY.png\"\n        }\n    },\n    \"acgti\": {\n        \"INTJ\": {\n            \"code\": \"MRTS-X\",\n            \"name_zh\": \"Mortis\",\n            \"image\": \"https://fastly.jsdelivr.net/gh/SXP-Simon/profile_assets@main/acgti/characters/MRTS-X.png\"\n        },\n        \"INTP\": {\n            \"code\": \"KNAN\",\n            \"name_zh\": \"江户川柯南\"\n        },\n        \"ENTJ\": {\n            \"code\": \"SAKI\",\n            \"name_zh\": \"丰川祥子\",\n            \"image\": \"https://fastly.jsdelivr.net/gh/SXP-Simon/profile_assets@main/acgti/characters/SAKI.png\"\n        },\n        \"ENTP\": {\n            \"code\": \"CHKA\",\n            \"name_zh\": \"藤原千花\"\n        },\n        \"INFJ\": {\n            \"code\": \"DLRS\",\n            \"name_zh\": \"三角初华\",\n            \"image\": \"https://fastly.jsdelivr.net/gh/SXP-Simon/profile_assets@main/acgti/characters/DLRS.png\"\n        },\n        \"INFP\": {\n            \"code\": \"BCHI\",\n            \"name_zh\": \"后藤一里\"\n        },\n        \"ENFJ\": {\n            \"code\": \"YCYO\",\n            \"name_zh\": \"月见八千代\",\n            \"image\": \"https://fastly.jsdelivr.net/gh/SXP-Simon/profile_assets@main/acgti/characters/YCYO.png\"\n        },\n        \"ENFP\": {\n            \"code\": \"HTMK\",\n            \"name_zh\": \"初音未来\"\n        },\n        \"ISTJ\": {\n            \"code\": \"MRTS\",\n            \"name_zh\": \"若叶睦\",\n            \"image\": \"https://fastly.jsdelivr.net/gh/SXP-Simon/profile_assets@main/acgti/characters/MRTS.png\"\n        },\n        \"ISTP\": {\n            \"code\": \"AYRE\",\n            \"name_zh\": \"绫波丽\"\n        },\n        \"ESTJ\": {\n            \"code\": \"MIKT\",\n            \"name_zh\": \"御坂美琴\",\n            \"image\": \"https://fastly.jsdelivr.net/gh/SXP-Simon/profile_assets@main/acgti/characters/MIKT.png\"\n        },\n        \"ESTP\": {\n            \"code\": \"ASKA\",\n            \"name_zh\": \"明日香\"\n        },\n        \"ISFJ\": {\n            \"code\": \"SOYO\",\n            \"name_zh\": \"长崎爽世\",\n            \"image\": \"https://fastly.jsdelivr.net/gh/SXP-Simon/profile_assets@main/acgti/characters/SOYO.png\"\n        },\n        \"ISFP\": {\n            \"code\": \"LTYI\",\n            \"name_zh\": \"洛天依\",\n            \"image\": \"https://fastly.jsdelivr.net/gh/SXP-Simon/profile_assets@main/acgti/characters/LTYI.png\"\n        },\n        \"ESFJ\": {\n            \"code\": \"ANON\",\n            \"name_zh\": \"千早爱音\",\n            \"image\": \"https://fastly.jsdelivr.net/gh/SXP-Simon/profile_assets@main/acgti/characters/ANON.png\"\n        },\n        \"ESFP\": {\n            \"code\": \"FRNA\",\n            \"name_zh\": \"芙宁娜\",\n            \"image\": \"https://fastly.jsdelivr.net/gh/SXP-Simon/profile_assets@main/acgti/characters/FRNA.png\"\n        }\n    }\n}",
+                "default": "{\n    \"mbti\": {\n        \"INTJ\": {\n            \"code\": \"INTJ\",\n            \"name_zh\": \"建筑师\"\n        },\n        \"INTP\": {\n            \"code\": \"INTP\",\n            \"name_zh\": \"逻辑学家\"\n        },\n        \"ENTJ\": {\n            \"code\": \"ENTJ\",\n            \"name_zh\": \"指挥官\"\n        },\n        \"ENTP\": {\n            \"code\": \"ENTP\",\n            \"name_zh\": \"辩论家\"\n        },\n        \"INFJ\": {\n            \"code\": \"INFJ\",\n            \"name_zh\": \"提倡者\"\n        },\n        \"INFP\": {\n            \"code\": \"INFP\",\n            \"name_zh\": \"调停者\"\n        },\n        \"ENFJ\": {\n            \"code\": \"ENFJ\",\n            \"name_zh\": \"主人公\"\n        },\n        \"ENFP\": {\n            \"code\": \"ENFP\",\n            \"name_zh\": \"竞选者\"\n        },\n        \"ISTJ\": {\n            \"code\": \"ISTJ\",\n            \"name_zh\": \"物流师\"\n        },\n        \"ISFJ\": {\n            \"code\": \"ISFJ\",\n            \"name_zh\": \"守卫者\"\n        },\n        \"ESTJ\": {\n            \"code\": \"ESTJ\",\n            \"name_zh\": \"总经理\"\n        },\n        \"ESTP\": {\n            \"code\": \"ESTP\",\n            \"name_zh\": \"企业家\"\n        },\n        \"ISTP\": {\n            \"code\": \"ISTP\",\n            \"name_zh\": \"鉴赏家\"\n        },\n        \"ISFP\": {\n            \"code\": \"ISFP\",\n            \"name_zh\": \"探险家\"\n        },\n        \"ESFJ\": {\n            \"code\": \"ESFJ\",\n            \"name_zh\": \"执政官\"\n        },\n        \"ESFP\": {\n            \"code\": \"ESFP\",\n            \"name_zh\": \"表演者\"\n        }\n    },\n    \"sbti\": {\n        \"INTJ\": {\n            \"code\": \"CTRL\",\n            \"name_zh\": \"拿捏者\",\n            \"asset_code\": \"CTRL\",\n            \"image\": \"https://cdn.jsdmirror.com/gh/SXP-Simon/profile_assets@main/sbti/CTRL.png\"\n        },\n        \"INTP\": {\n            \"code\": \"THIN-K\",\n            \"name_zh\": \"思考者\",\n            \"asset_code\": \"THIN-K\",\n            \"image\": \"https://cdn.jsdmirror.com/gh/SXP-Simon/profile_assets@main/sbti/THIN-K.png\"\n        },\n        \"ENTJ\": {\n            \"code\": \"BOSS\",\n            \"name_zh\": \"领导者\",\n            \"asset_code\": \"BOSS\",\n            \"image\": \"https://cdn.jsdmirror.com/gh/SXP-Simon/profile_assets@main/sbti/BOSS.png\"\n        },\n        \"ENTP\": {\n            \"code\": \"JOKE-R\",\n            \"name_zh\": \"小丑\",\n            \"asset_code\": \"JOKE-R\",\n            \"image\": \"https://cdn.jsdmirror.com/gh/SXP-Simon/profile_assets@main/sbti/JOKE-R.jpg\"\n        },\n        \"INFJ\": {\n            \"code\": \"LOVE-R\",\n            \"name_zh\": \"多情者\",\n            \"asset_code\": \"LOVE-R\",\n            \"image\": \"https://cdn.jsdmirror.com/gh/SXP-Simon/profile_assets@main/sbti/LOVE-R.png\"\n        },\n        \"INFP\": {\n            \"code\": \"SOLO\",\n            \"name_zh\": \"孤儿\",\n            \"asset_code\": \"SOLO\",\n            \"image\": \"https://cdn.jsdmirror.com/gh/SXP-Simon/profile_assets@main/sbti/SOLO.png\"\n        },\n        \"ENFJ\": {\n            \"code\": \"THAN-K\",\n            \"name_zh\": \"感恩者\",\n            \"asset_code\": \"THAN-K\",\n            \"image\": \"https://cdn.jsdmirror.com/gh/SXP-Simon/profile_assets@main/sbti/THAN-K.png\"\n        },\n        \"ENFP\": {\n            \"code\": \"GOGO\",\n            \"name_zh\": \"行者\",\n            \"asset_code\": \"GOGO\",\n            \"image\": \"https://cdn.jsdmirror.com/gh/SXP-Simon/profile_assets@main/sbti/GOGO.png\"\n        },\n        \"ISTJ\": {\n            \"code\": \"OH-NO\",\n            \"name_zh\": \"哦不人\",\n            \"asset_code\": \"OH-NO\",\n            \"image\": \"https://cdn.jsdmirror.com/gh/SXP-Simon/profile_assets@main/sbti/OH-NO.png\"\n        },\n        \"ISTP\": {\n            \"code\": \"POOR\",\n            \"name_zh\": \"贫困者\",\n            \"asset_code\": \"POOR\",\n            \"image\": \"https://cdn.jsdmirror.com/gh/SXP-Simon/profile_assets@main/sbti/POOR.png\"\n        },\n        \"ESTJ\": {\n            \"code\": \"SHIT\",\n            \"name_zh\": \"愤世者\",\n            \"asset_code\": \"SHIT\",\n            \"image\": \"https://cdn.jsdmirror.com/gh/SXP-Simon/profile_assets@main/sbti/SHIT.png\"\n        },\n        \"ESTP\": {\n            \"code\": \"WOC!\",\n            \"name_zh\": \"握草人\",\n            \"asset_code\": \"WOC\",\n            \"image\": \"https://cdn.jsdmirror.com/gh/SXP-Simon/profile_assets@main/sbti/WOC.png\"\n        },\n        \"ISFJ\": {\n            \"code\": \"MUM\",\n            \"name_zh\": \"妈妈\",\n            \"asset_code\": \"MUM\",\n            \"image\": \"https://cdn.jsdmirror.com/gh/SXP-Simon/profile_assets@main/sbti/MUM.png\"\n        },\n        \"ISFP\": {\n            \"code\": \"MALO\",\n            \"name_zh\": \"吗喽\",\n            \"asset_code\": \"MALO\",\n            \"image\": \"https://cdn.jsdmirror.com/gh/SXP-Simon/profile_assets@main/sbti/MALO.png\"\n        },\n        \"ESFJ\": {\n            \"code\": \"ATM-er\",\n            \"name_zh\": \"送钱者\",\n            \"asset_code\": \"ATM-er\",\n            \"image\": \"https://cdn.jsdmirror.com/gh/SXP-Simon/profile_assets@main/sbti/ATM-er.png\"\n        },\n        \"ESFP\": {\n            \"code\": \"SEXY\",\n            \"name_zh\": \"尤物\",\n            \"asset_code\": \"SEXY\",\n            \"image\": \"https://cdn.jsdmirror.com/gh/SXP-Simon/profile_assets@main/sbti/SEXY.png\"\n        }\n    },\n    \"acgti\": {\n        \"INTJ\": {\n            \"code\": \"MRTS-X\",\n            \"name_zh\": \"Mortis\",\n            \"image\": \"https://cdn.jsdmirror.com/gh/SXP-Simon/profile_assets@main/acgti/characters/MRTS-X.png\"\n        },\n        \"INTP\": {\n            \"code\": \"KNAN\",\n            \"name_zh\": \"江户川柯南\"\n        },\n        \"ENTJ\": {\n            \"code\": \"SAKI\",\n            \"name_zh\": \"丰川祥子\",\n            \"image\": \"https://cdn.jsdmirror.com/gh/SXP-Simon/profile_assets@main/acgti/characters/SAKI.png\"\n        },\n        \"ENTP\": {\n            \"code\": \"CHKA\",\n            \"name_zh\": \"藤原千花\"\n        },\n        \"INFJ\": {\n            \"code\": \"DLRS\",\n            \"name_zh\": \"三角初华\",\n            \"image\": \"https://cdn.jsdmirror.com/gh/SXP-Simon/profile_assets@main/acgti/characters/DLRS.png\"\n        },\n        \"INFP\": {\n            \"code\": \"BCHI\",\n            \"name_zh\": \"后藤一里\"\n        },\n        \"ENFJ\": {\n            \"code\": \"YCYO\",\n            \"name_zh\": \"月见八千代\",\n            \"image\": \"https://cdn.jsdmirror.com/gh/SXP-Simon/profile_assets@main/acgti/characters/YCYO.png\"\n        },\n        \"ENFP\": {\n            \"code\": \"HTMK\",\n            \"name_zh\": \"初音未来\"\n        },\n        \"ISTJ\": {\n            \"code\": \"MRTS\",\n            \"name_zh\": \"若叶睦\",\n            \"image\": \"https://cdn.jsdmirror.com/gh/SXP-Simon/profile_assets@main/acgti/characters/MRTS.png\"\n        },\n        \"ISTP\": {\n            \"code\": \"AYRE\",\n            \"name_zh\": \"绫波丽\"\n        },\n        \"ESTJ\": {\n            \"code\": \"MIKT\",\n            \"name_zh\": \"御坂美琴\",\n            \"image\": \"https://cdn.jsdmirror.com/gh/SXP-Simon/profile_assets@main/acgti/characters/MIKT.png\"\n        },\n        \"ESTP\": {\n            \"code\": \"ASKA\",\n            \"name_zh\": \"明日香\"\n        },\n        \"ISFJ\": {\n            \"code\": \"SOYO\",\n            \"name_zh\": \"长崎爽世\",\n            \"image\": \"https://cdn.jsdmirror.com/gh/SXP-Simon/profile_assets@main/acgti/characters/SOYO.png\"\n        },\n        \"ISFP\": {\n            \"code\": \"LTYI\",\n            \"name_zh\": \"洛天依\",\n            \"image\": \"https://cdn.jsdmirror.com/gh/SXP-Simon/profile_assets@main/acgti/characters/LTYI.png\"\n        },\n        \"ESFJ\": {\n            \"code\": \"ANON\",\n            \"name_zh\": \"千早爱音\",\n            \"image\": \"https://cdn.jsdmirror.com/gh/SXP-Simon/profile_assets@main/acgti/characters/ANON.png\"\n        },\n        \"ESFP\": {\n            \"code\": \"FRNA\",\n            \"name_zh\": \"芙宁娜\",\n            \"image\": \"https://cdn.jsdmirror.com/gh/SXP-Simon/profile_assets@main/acgti/characters/FRNA.png\"\n        }\n    }\n}",
                 "hint": "按 MBTI 覆盖当前展示模式的人格名称与图片地址。留空时自动使用插件内置默认映射和 manifest。插件不负责校验图片链接可访问性。"
-            },
-            "debug_mode": {
-                "type": "bool",
-                "description": "调试模式（建议关闭）",
-                "default": false,
-                "hint": "启用后，会在插件数据目录下的 debug_data 目录中保存每次分析的平台 API 原始历史消息和 Prompt 原文，用于调试和优化提示词。"
             },
             "enable_base64_image": {
                 "type": "bool",
                 "description": "图片传输使用 Base64 编码",
                 "default": true,
-                "hint": "启用后图片会被转为 Base64 编码传输。关闭后将直接传递文件路径或 URL 给 OneBot 实现端，适用于 Napcat/LLbot/SnowLuma 等支持本地路径的实现，可降低内存占用。"
+                "hint": "启用后图片会被转为 Base64 编码传输。关闭后将直接传递文件路径或 URL 给 OneBot 协议端，适用于 NapCat / LLOneBot / SnowLuma / Lagrange 等支持本地路径的实现，可降低内存占用。"
             },
             "napcat_stream_threshold_mb": {
                 "type": "float",
-                "description": "NapCat/Snowluma 流式上传阈值（MB）",
+                "description": "NapCat 流式上传阈值（MB）",
                 "default": 2.0,
-                "hint": "先按现有图片发送策略发送本地图片；发送失败且文件大小达到阈值时，复用当前 NapCat/Snowluma 连接调用 upload_file_stream 并重试一次。填 0 禁用。Docker / docker compose 环境建议保持默认或按图片大小调大。"
+                "hint": "NapCat 专属优化特性：先按常规策略发送本地图片；发送失败且文件大小达到阈值时，复用当前 NapCat 连接调用 upload_file_stream 分块流式上传并重试一次。填 0 禁用。Docker / 容器网络环境建议保持默认或按大图需求调大。"
             },
             "enable_analysis_reply": {
                 "type": "bool",
@@ -179,7 +223,10 @@
             "t2i_r1_type": {
                 "type": "string",
                 "description": "第一轮：图片格式",
-                "options": ["jpeg", "png"],
+                "options": [
+                    "jpeg",
+                    "png"
+                ],
                 "default": "png",
                 "hint": "建议：PNG 格式无损但体积较大；JPEG 格式体积较小。"
             },
@@ -197,7 +244,11 @@
             "t2i_r1_device_scale": {
                 "type": "string",
                 "description": "第一轮：分辨率等级",
-                "options": ["normal", "high", "ultra"],
+                "options": [
+                    "normal",
+                    "high",
+                    "ultra"
+                ],
                 "default": "ultra",
                 "hint": "影响图片清晰度。normal=1.0x, high=1.3x, ultra=1.8x。高质量日报建议 ultra。"
             },
@@ -237,7 +288,10 @@
             "t2i_r2_type": {
                 "type": "string",
                 "description": "第二轮 (回退)：图片格式",
-                "options": ["jpeg", "png"],
+                "options": [
+                    "jpeg",
+                    "png"
+                ],
                 "default": "jpeg",
                 "hint": "回退策略建议使用 jpeg 以减少渲染压力。"
             },
@@ -255,7 +309,11 @@
             "t2i_r2_device_scale": {
                 "type": "string",
                 "description": "第二轮 (回退)：分辨率等级",
-                "options": ["normal", "high", "ultra"],
+                "options": [
+                    "normal",
+                    "high",
+                    "ultra"
+                ],
                 "default": "high",
                 "hint": "回退建议使用 high/normal 以降低复杂页面的内存消耗和超时概率。"
             },
@@ -273,7 +331,10 @@
             "t2i_font_source": {
                 "type": "string",
                 "description": "t2i 渲染环境切换",
-                "options": ["Mainland", "Overseas"],
+                "options": [
+                    "Mainland",
+                    "Overseas"
+                ],
                 "default": "Overseas",
                 "hint": "字体和静态资源的访问环境，内地（Mainland）、海外（Overseas），切换环境会自动应用下方对应的镜像站地址、语言标识(简体中文/繁体中文)及字体优先级。（实测 Overseas 也可以正常渲染简体中文，没有特殊的情况都建议使用 Overseas，Mainland 配置下建议检查镜像站可用性，或者配置可靠的站点）"
             },
@@ -399,6 +460,12 @@
                 "description": "LLM 请求重试退避基值（秒）",
                 "default": 2,
                 "hint": "重试之间的基准等待时间（秒）。实际等待时间会随尝试次数指数增长，并加入少量随机抖动；当专用 Provider 失败后，会继续按队列尝试默认 Provider。"
+            },
+            "llm_hard_timeout": {
+                "type": "int",
+                "description": "LLM 请求硬超时上限 (秒)",
+                "default": 0,
+                "hint": "单次大模型请求的最大等待耗时（秒）。设为 0 时自动遵循 Provider 配置的 timeout（未配置时默认兜底 300 秒）。超过此时间将主动截断请求并触发重试/降级。"
             },
             "enable_streaming_llm_call": {
                 "type": "bool",
@@ -551,7 +618,12 @@
                                 "description": "角色参考图",
                                 "type": "file",
                                 "default": [],
-                                "file_types": ["jpg", "jpeg", "png", "webp"],
+                                "file_types": [
+                                    "jpg",
+                                    "jpeg",
+                                    "png",
+                                    "webp"
+                                ],
                                 "hint": "上传后点击 + 加入此角色方案。Images、Chat 和 Gemini 协议会按顺序传入全部参考图；Grok 协议仅使用第一张。"
                             },
                             "storyboard_prompt": {
@@ -559,7 +631,7 @@
                                 "type": "text",
                                 "editor_mode": true,
                                 "editor_language": "markdown",
-                                "default": "你是一个资深的漫画分镜师与 AI 绘画提示词专家。\n请根据以下给出的【群聊每日核心话题列表】，站在你【当前的人格角色设定】（详见系统注入的身份）的视角与语气，将其改编并设计为一个精彩的多格连环漫画（Comic Strip）全景视觉画图提示词 (Prompt)。\n\n【核心视觉、台词与双层排版规则】：\n1. 【全话题必须覆盖（共 ${topic_count} 个分格）】：给出的待创作核心话题列表中共有 ${topic_count} 个话题，你必须为每一个话题分别设计一个分格 Panel（即 Panel 1 到 Panel ${topic_count}），绝对不许随意裁减、挑选或遗漏任何一个话题！\n2. 【人设口语化台词改编】：绝对严禁将报告分析总结原文直接放进对话框！必须以【你当前的人格语气/性格/口吻】（例如傲娇、萌系或专属说话风格），将每个话题的事件提炼改编为一句角色在漫画中的生动台词或吐槽，【每条台词控制在 15 个汉字以内】（例如：“呜呜！家里云又断网了啦！”、“萝卜子才没有降智！那都是Gemini的错！”）。\n3. 【精美双层文字排版（气泡 + 可爱旁白字幕条）】：\n   - 【角色的气泡】：在描述英文 Prompt 时，指定样式为“adorable kawaii anime speech bubble, soft rounded cloud-like shape, cute pointer tail pointing to the speaker”。\n   - 【分格底部的事件旁白条】：将每个话题概括为生动精炼的短标题（控制在 30 字以内，严禁带有“【事件】”字样），在 Prompt 中指定样式为“cute pastel-colored kawaii caption strip at the bottom of the panel with soft rounded corners”，严禁死板白框！\n4. 【中文文本显式渲染】：画面整体构图与场景描述使用英文，但气泡与底部旁白条内渲染的中文必须显式指定（指令格式：containing a speech bubble with exact Chinese text \"人设吐槽台词\" 以及 and a cute caption strip at bottom with exact Chinese text \"精炼话题短标题\"），绝对禁止将中文翻译成英文！\n5. 【话题内容直传与文字渲染约束】：在生成传给生图 LLM 的英文提示词 (scene) 时，对于每一个分格，除了描述具体的视觉画面外，你必须将该话题的【完整详情（翻译为英文）】作为 Background Context 附加在该分格的提示词中，帮助生图模型理解剧情。但同时，必须极其强烈地警告生图模型：“绝对禁止将长篇上下文写在画面上，仅允许渲染短标题字幕条和气泡台词！”（示例：Background Context: [Details]. STRICT RULE: DO NOT render the background context text! ONLY render the exact Chinese text in the bubble and caption strip!）。\n6. 【核心角色强制全覆盖】：在提示词中必须明确要求并描述，每一个分格 (Panel) 都必须无一例外地出现你当前的人格设定（即参考图中的核心角色，例如 1girl, [特定外貌特征] 等），保持整篇连环画的主角绝对连贯！\n\n【待创作的群聊核心话题列表】：\n${chat_content}\n\n请输出包含 \"scene\" 字段的 JSON 对象。\n",
+                                "default": "你是一个资深的漫画分镜师与 AI 绘画提示词专家。\n请根据以下给出的【群聊每日核心话题列表】，站在你【当前的人格角色设定】（详见系统注入的身份）的视角与语气，将其改编并设计为一个精彩的多格连环漫画（Comic Strip）全景视觉画图提示词 (Prompt)。\n\n【核心视觉、台词与双层排版规则】：\n1. 【全话题必须覆盖（共 ${topic_count} 个分格）】：给出的待创作核心话题列表中共有 ${topic_count} 个话题，你必须为每一个话题分别设计一个分格 Panel（即 Panel 1 到 Panel ${topic_count}），绝对不许随意裁减、挑选或遗漏任何一个话题！\n2. 【人设口语化台词改编】：绝对严禁将报告分析总结原文直接放进对话框！必须以【你当前的人格语气/性格/口吻】（例如傲娇、萌系或专属说话风格），将每个话题的事件提炼改编为一句角色在漫画中的生动台词或吐槽，【每条台词控制在 15 个汉字以内】（例如：“呜呜！家里云又断网了啦！”、“萝卜子才没有降智！那都是Gemini的错！”）。\n3. 【精美双层文字排版（气泡 + 可爱旁白字幕条）】：\n   - 【角色的气泡】：在描述英文 Prompt 时，指定样式为“adorable kawaii anime speech bubble, soft rounded cloud-like shape, cute pointer tail pointing to the speaker”。\n   - 【分格底部的事件旁白条】：将每个话题概括为生动精炼的短标题（控制在 30 字以内，严禁带有“【事件】”字样），在 Prompt 中指定样式为“cute pastel-colored kawaii caption strip at the bottom of the panel with soft rounded corners”，严禁死板白框！\n4. 【中文文本显式渲染】：画面整体构图与场景描述使用英文，但气泡与底部旁白条内渲染的中文必须显式指定（指令格式：containing a speech bubble with exact Chinese text \"人设吐槽台词\" 以及 and a cute caption strip at bottom with exact Chinese text \"精炼话题短标题\"），绝对禁止将中文翻译成英文！\n5. 【话题内容直传与文字渲染约束】：在生成传给生图 LLM 的英文提示词 (scene) 时，对于每一个分格，除了描述具体的视觉画面外，你必须将该话题的【完整详情（翻译为英文）】作为 Background Context 附加在该分格的提示词中，帮助生图模型理解剧情。但同时，必须极其强烈地警告生图模型：“绝对禁止将长篇上下文写在画面上，仅允许渲染短标题字幕条和气泡台词！”（示例：Background Context: [Details]. STRICT RULE: DO NOT render the background context text! ONLY render the exact Chinese text in the bubble and caption strip!）。\n6. 【核心角色强制全覆盖】：在提示词中必须明确要求并描述，每一个分格 (Panel) 都必须无一例外地出现你当前的人格设定（即参考图中的核心角色，例如 1girl, [特定外貌特征] 等），保持整篇连环画的主角绝对连贯！\n\n【待创作的群聊核心话题列表】：\n${chat_content}\n\n【输出格式与正反例规范 (GOOD & BAD EXAMPLES)】：\n⚠️ 核心要求：AI 绘图引擎会直接读取 \"scene\" 字段作为唯一生图指令。你必须将全局角色总设以及 Panel 1 到 Panel ${topic_count} 的每一格完整描述全部写入 \"scene\" 字符串中！\n\n✅ 正确示范 (GOOD EXAMPLE - 必须严格遵循此格式输出纯 JSON)：\n{\n  \"scene\": \"A ${topic_count}-panel comic strip featuring [protagonist description] observing a chaotic QQ group chat.\\n\\nPanel 1: [Visual action] containing a speech bubble with exact Chinese text \\\"[人设吐槽台词 15字内]\\\" and a cute pastel caption strip at bottom with exact Chinese text \\\"[精炼短标题]\\\". Background Context: [English Details]. STRICT RULE: DO NOT render the background context text!\\n\\nPanel 2: [Visual action] containing a speech bubble with exact Chinese text \\\"[人设吐槽台词 15字内]\\\" and a cute pastel caption strip at bottom with exact Chinese text \\\"[精炼短标题]\\\". Background Context: [English Details]. STRICT RULE: DO NOT render the background context text!\\n\\n... (必须依次写完 Panel 1 到 Panel ${topic_count})\"\n}\n\n❌ 错误示范 (BAD EXAMPLE - 严禁以下行为)：\n1. 严禁把 scene 写成一句简短概括，却把具体话题藏在 panels 列表中（生图模型直接读取 scene，必须全内联写入 scene）！\n2. 严禁丢失气泡或字幕条里的 exact Chinese text 显式中文台词与短标题！\n3. 严禁在 JSON 之外输出任何多余的 Markdown 或闲聊文字！\n",
                                 "hint": "此角色专属的分镜、画风和台词规则。留空时回退到下方全局默认模板。"
                             }
                         }
@@ -570,14 +642,23 @@
                 "description": "旧版漫画参考图（兼容迁移）",
                 "type": "file",
                 "default": [],
-                "file_types": ["jpg", "jpeg", "png", "webp"],
+                "file_types": [
+                    "jpg",
+                    "jpeg",
+                    "png",
+                    "webp"
+                ],
                 "invisible": true,
                 "hint": "旧版配置仅用于自动迁移，不再在面板中显示。"
             },
             "drawing_backend": {
                 "description": "绘图后端",
                 "type": "string",
-                "options": ["builtin", "general_plugin", "big_banana"],
+                "options": [
+                    "builtin",
+                    "general_plugin",
+                    "big_banana"
+                ],
                 "default": "builtin",
                 "hint": "builtin=使用本插件内置绘图客户端；general_plugin=调用已安装的「通用生图」插件（https://cloud.astrbot.app/plugin/railgun19457/astrbot_plugin_image_generation）的公共 API；big_banana=调用已安装的「大香蕉」插件（https://cloud.astrbot.app/plugin/sukafon/astrbot_plugin_big_banana）的绘图管线（支持 Gemini、SiliconFlow 等多家服务）。使用外部后端时，需先在对应插件中配置其自身的 API/提供商；未安装、未激活或调用失败时自动回退内置后端。"
             },
@@ -824,7 +905,10 @@
                             "output_format": {
                                 "description": "响应格式",
                                 "type": "string",
-                                "options": ["url", "b64_json"],
+                                "options": [
+                                    "url",
+                                    "b64_json"
+                                ],
                                 "default": "url"
                             },
                             "timeout": {
@@ -877,7 +961,10 @@
                             "output_format": {
                                 "description": "响应格式",
                                 "type": "string",
-                                "options": ["url", "b64_json"],
+                                "options": [
+                                    "url",
+                                    "b64_json"
+                                ],
                                 "default": "url"
                             },
                             "timeout": {
@@ -930,7 +1017,10 @@
                             "output_format": {
                                 "description": "响应格式",
                                 "type": "string",
-                                "options": ["url", "b64_json"],
+                                "options": [
+                                    "url",
+                                    "b64_json"
+                                ],
                                 "default": "url"
                             },
                             "timeout": {
@@ -1078,27 +1168,44 @@
                                 "description": "图像质量",
                                 "type": "string",
                                 "hint": "OpenAI Images 的 quality 参数。GPT Image 模型通常支持 auto、low、medium、high；不兼容的中转服务可改为 auto。",
-                                "options": ["auto", "low", "medium", "high"],
+                                "options": [
+                                    "auto",
+                                    "low",
+                                    "medium",
+                                    "high"
+                                ],
                                 "default": "high"
                             },
                             "background": {
                                 "description": "背景模式",
                                 "type": "string",
                                 "hint": "仅 GPT Image 模型支持。auto 不发送该参数；transparent 适合透明背景素材，opaque 使用不透明背景。",
-                                "options": ["auto", "transparent", "opaque"],
+                                "options": [
+                                    "auto",
+                                    "transparent",
+                                    "opaque"
+                                ],
                                 "default": "auto"
                             },
                             "output_format": {
                                 "description": "输出格式",
                                 "type": "string",
-                                "options": ["png", "jpeg", "webp"],
+                                "options": [
+                                    "png",
+                                    "jpeg",
+                                    "webp"
+                                ],
                                 "default": "png"
                             },
                             "response_format": {
                                 "description": "响应图片格式",
                                 "type": "string",
                                 "hint": "留空由服务端决定；url 返回图片链接，b64_json 返回 Base64。部分 OpenAI 兼容服务只支持其中一种。",
-                                "options": ["", "url", "b64_json"],
+                                "options": [
+                                    "",
+                                    "url",
+                                    "b64_json"
+                                ],
                                 "default": ""
                             },
                             "output_compression": {
@@ -1111,7 +1218,10 @@
                                 "description": "审核模式",
                                 "type": "string",
                                 "hint": "仅 GPT Image 模型支持。留空不传；选择 low 时使用较低的审核强度。",
-                                "options": ["", "low"],
+                                "options": [
+                                    "",
+                                    "low"
+                                ],
                                 "default": ""
                             },
                             "max_reference_images": {
@@ -1150,7 +1260,10 @@
                             "endpoint_mode": {
                                 "description": "端点模式",
                                 "type": "string",
-                                "options": ["official", "agent_plan"],
+                                "options": [
+                                    "official",
+                                    "agent_plan"
+                                ],
                                 "default": "official"
                             },
                             "api_url": {
@@ -1179,14 +1292,20 @@
                                 "description": "模型能力标记",
                                 "type": "string",
                                 "hint": "使用无法从 Endpoint ID 判断能力的自建接入点时，标记为 Seedream 5.0 Pro 可正确限制参考图并禁用组图。",
-                                "options": ["auto", "seedream_5_pro"],
+                                "options": [
+                                    "auto",
+                                    "seedream_5_pro"
+                                ],
                                 "default": "auto"
                             },
                             "size_mode": {
                                 "description": "尺寸模式",
                                 "type": "string",
                                 "hint": "preset 使用图像分辨率；custom 直接发送自定义尺寸。",
-                                "options": ["preset", "custom"],
+                                "options": [
+                                    "preset",
+                                    "custom"
+                                ],
                                 "default": "preset"
                             },
                             "image_size": {
@@ -1198,21 +1317,34 @@
                                 "description": "预设尺寸",
                                 "type": "string",
                                 "hint": "仅 preset 模式生效，支持 1K、2K、3K、4K；具体模型支持范围以火山方舟文档为准。",
-                                "options": ["1K", "2K", "3K", "4K"],
+                                "options": [
+                                    "1K",
+                                    "2K",
+                                    "3K",
+                                    "4K"
+                                ],
                                 "default": "2K",
-                                "condition": {"size_mode": "preset"}
+                                "condition": {
+                                    "size_mode": "preset"
+                                }
                             },
                             "custom_size": {
                                 "description": "自定义尺寸",
                                 "type": "string",
                                 "hint": "仅 custom 模式生效，格式 WxH，例如 2048x2048 或 2304x1728。",
                                 "default": "2048x2048",
-                                "condition": {"size_mode": "custom"}
+                                "condition": {
+                                    "size_mode": "custom"
+                                }
                             },
                             "output_format": {
                                 "description": "输出格式",
                                 "type": "string",
-                                "options": ["png", "jpeg", "webp"],
+                                "options": [
+                                    "png",
+                                    "jpeg",
+                                    "webp"
+                                ],
                                 "default": "png"
                             },
                             "watermark": {
@@ -1225,14 +1357,21 @@
                                 "description": "提示词优化模式",
                                 "type": "string",
                                 "hint": "standard 偏向生成质量，fast 偏向更快的请求速度；留空不传。",
-                                "options": ["", "standard", "fast"],
+                                "options": [
+                                    "",
+                                    "standard",
+                                    "fast"
+                                ],
                                 "default": "standard"
                             },
                             "sequential_image_generation": {
                                 "description": "组图生成模式",
                                 "type": "string",
                                 "hint": "auto 允许模型自主生成连续组图；Seedream 5.0 Pro 不支持该能力，会自动忽略。",
-                                "options": ["disabled", "auto"],
+                                "options": [
+                                    "disabled",
+                                    "auto"
+                                ],
                                 "default": "disabled"
                             },
                             "sequential_max_images": {
@@ -1293,7 +1432,19 @@
                                 "description": "默认图像尺寸",
                                 "type": "string",
                                 "hint": "宽高比无法映射时使用。必须为 SenseNova U1 Fast 官方支持的尺寸。",
-                                "options": ["2048x2048", "2752x1536", "1536x2752", "2368x1760", "1760x2368", "2496x1664", "1664x2496", "2272x1824", "1824x2272", "3072x1376", "1344x3136"],
+                                "options": [
+                                    "2048x2048",
+                                    "2752x1536",
+                                    "1536x2752",
+                                    "2368x1760",
+                                    "1760x2368",
+                                    "2496x1664",
+                                    "1664x2496",
+                                    "2272x1824",
+                                    "1824x2272",
+                                    "3072x1376",
+                                    "1344x3136"
+                                ],
                                 "default": "2752x1536"
                             },
                             "n": {
@@ -1326,7 +1477,10 @@
                             "endpoint_mode": {
                                 "description": "端点模式",
                                 "type": "string",
-                                "options": ["dashscope", "token_plan"],
+                                "options": [
+                                    "dashscope",
+                                    "token_plan"
+                                ],
                                 "default": "dashscope"
                             },
                             "api_url": {
@@ -1365,7 +1519,10 @@
                                 "description": "尺寸模式",
                                 "type": "string",
                                 "hint": "preset 根据分辨率和宽高比换算官方建议尺寸；custom 直接发送自定义尺寸。",
-                                "options": ["preset", "custom"],
+                                "options": [
+                                    "preset",
+                                    "custom"
+                                ],
                                 "default": "preset"
                             },
                             "custom_size": {
@@ -1373,7 +1530,9 @@
                                 "type": "string",
                                 "hint": "仅 custom 模式生效。支持 WxH、W*H、W×H，或 wan2.7 的 1K、2K、4K 简写。",
                                 "default": "2048*2048",
-                                "condition": {"size_mode": "custom"}
+                                "condition": {
+                                    "size_mode": "custom"
+                                }
                             },
                             "n": {
                                 "description": "单次生成数量",
@@ -1435,7 +1594,12 @@
                             "api_protocol": {
                                 "description": "API 协议类型",
                                 "type": "string",
-                                "options": ["images", "chat", "grok", "gemini"],
+                                "options": [
+                                    "images",
+                                    "chat",
+                                    "grok",
+                                    "gemini"
+                                ],
                                 "default": "images"
                             },
                             "api_key": {
@@ -1493,7 +1657,9 @@
             "drawing_output_exception_retry_keywords": {
                 "description": "输出异常触发关键词",
                 "type": "list",
-                "items": { "type": "string" },
+                "items": {
+                    "type": "string"
+                },
                 "default": [],
                 "hint": "当绘图错误信息包含任一关键词时，将其视为内容生成或安全审核异常，并使用同一接口配置重试；重试耗尽后可由 LLM 改写 Prompt。留空则不执行此类内容重试和 Prompt 改写。"
             },
@@ -1581,7 +1747,7 @@
         "items": {
             "html_base_url": {
                 "type": "string",
-                "description": "外鏈 Base URL",
+                "description": "外链 Base URL",
                 "default": "",
                 "hint": "用于生成外链的 Base URL（可留空）。如果设置了此项，发送报告时会在消息中提供超连結 (${BASE_URL}/${FILENAME})。留空则不提供外链。"
             },
@@ -1601,44 +1767,44 @@
                 "type": "string",
                 "description": "HTML文件名格式",
                 "default": "群聊分析报告_${group_id}_${date}_${ulid}.html",
-                "hint": "HTML文件名格式，支持变量：${group_id}(群号)、${date}(日期)、${ulid}(时间排序ID)，支持子目录/层级。"
+                "hint": "HTML文件名格式，支持变量：${group_id}(群号)、${date}(日期)、${trace_id}(链路追踪ID)、${ulid}(时间排序ID)，支持子目录/层级。"
             }
         }
     },
     "qq_group_upload": {
         "description": "群文件/群相册上传设置",
         "type": "object",
-        "hint": "图片报告生成后自动上传到群文件目录或群相册。群文件上传基于 OneBot upload_group_file API。仅对 QQ（OneBot）平台的图片格式报告生效",
+        "hint": "图片报告生成后自动上传到群文件目录或群相册。支持 NapCat、LLOneBot 及各标准 OneBot v11 驱动。仅对 QQ（OneBot）平台的图片格式报告生效",
         "items": {
             "enable_group_file_upload": {
                 "type": "bool",
                 "description": "启用群文件上传",
                 "default": false,
-                "hint": "图片报告生成后，自动保存为 PNG 文件并上传到群文件目录。需要 OneBot 实现支持 upload_group_file API"
+                "hint": "图片报告生成后，自动保存为 JPG/PNG 文件并上传到群文件目录。插件已多层级兼容各种 OneBot 实现的响应结构"
             },
             "group_file_folder": {
                 "type": "string",
                 "description": "群文件上传目录名",
                 "default": "",
-                "hint": "上传到群文件中的子目录名称。留空则上传到根目录。如果指定的目录不存在，插件将尝试自动创建"
+                "hint": "上传到群文件中的子目录名称（如“群分析”）。留空则上传到根目录。若指定目录不存在，插件会自动创建"
             },
             "enable_group_album_upload": {
                 "type": "bool",
                 "description": "启用群相册上传",
                 "default": false,
-                "hint": "图片报告生成后，自动上传到群相册（确保 Bot 有权限上传群相册）。此功能为 NapCat 扩展 API，其他 OneBot 实现可能不支持"
+                "hint": "图片报告生成后，自动上传到群相册（确保 Bot 拥有上传相册权限）。插件内置多协议方言驱动，自动适配 NapCat、LLOneBot 及标准 OneBot 相册接口"
             },
             "group_album_name": {
                 "type": "string",
                 "description": "目标群相册名称",
                 "default": "",
-                "hint": "指定上传到哪个群相册（请确保已经存在这个名称的相册）。留空则上传到群默认相册。如果指定的相册不存在，将回退到默认相册"
+                "hint": "指定上传到哪个群相册（如“群分析”）。严格模式下未找到同名相册将放弃上传；关闭严格模式则回退到群默认相册"
             },
             "group_album_strict_mode": {
                 "type": "bool",
                 "description": "群相册上传严格模式",
                 "default": true,
-                "hint": "当启用该开关且设置了目标群相册名称时：如果插件在目标群组中找不到同名的相册，将放弃上传。关闭该开关时，找不到目标相册将回退到群组默认的第一个相册。"
+                "hint": "当启用该开关且设置了目标群相册名称时：如果插件在目标群组中找不到同名的相册，将安全停止上传，杜绝误传到群内其他无关相册。关闭该开关时，找不到目标相册将回退到群组默认的第一个相册。"
             },
             "enable_comic_album_upload": {
                 "type": "bool",
@@ -1647,8 +1813,8 @@
                 "hint": "生成的每日群漫画除了发送到群聊外，是否还需要额外静默上传到群相册"
             },
             "comic_album_name": {
-                "description": "漫画相册名称",
                 "type": "string",
+                "description": "漫画相册名称",
                 "default": "",
                 "hint": "指定每日群漫画上传到的群相册名称。群相册严格模式开启时，名称为空或找不到同名相册将放弃上传；关闭严格模式时可回退到默认相册。"
             }
@@ -1732,7 +1898,7 @@
                         "type": "text",
                         "editor_mode": true,
                         "editor_language": "markdown",
-                        "default": "你是一个资深的漫画分镜师与 AI 绘画提示词专家。\n请根据以下给出的【群聊每日核心话题列表】，站在你【当前的人格角色设定】（详见系统注入的身份）的视角与语气，将其改编并设计为一个精彩的多格连环漫画（Comic Strip）全景视觉画图提示词 (Prompt)。\n\n【核心视觉、台词与双层排版规则】：\n1. 【全话题必须覆盖（共 ${topic_count} 个分格）】：给出的待创作核心话题列表中共有 ${topic_count} 个话题，你必须为每一个话题分别设计一个分格 Panel（即 Panel 1 到 Panel ${topic_count}），绝对不许随意裁减、挑选或遗漏任何一个话题！\n2. 【人设口语化台词改编】：绝对严禁将报告分析总结原文直接放进对话框！必须以【你当前的人格语气/性格/口吻】（例如傲娇、萌系或专属说话风格），将每个话题的事件提炼改编为一句角色在漫画中的生动台词或吐槽，【每条台词控制在 15 个汉字以内】（例如：“呜呜！家里云又断网了啦！”、“萝卜子才没有降智！那都是Gemini的错！”）。\n3. 【精美双层文字排版（气泡 + 可爱旁白字幕条）】：\n   - 【角色的气泡】：在描述英文 Prompt 时，指定样式为“adorable kawaii anime speech bubble, soft rounded cloud-like shape, cute pointer tail pointing to the speaker”。\n   - 【分格底部的事件旁白条】：将每个话题概括为生动精炼的短标题（控制在 30 字以内，严禁带有“【事件】”字样），在 Prompt 中指定样式为“cute pastel-colored kawaii caption strip at the bottom of the panel with soft rounded corners”，严禁死板白框！\n4. 【中文文本显式渲染】：画面整体构图与场景描述使用英文，但气泡与底部旁白条内渲染的中文必须显式指定（指令格式：containing a speech bubble with exact Chinese text \"人设吐槽台词\" 以及 and a cute caption strip at bottom with exact Chinese text \"精炼话题短标题\"），绝对禁止将中文翻译成英文！\n5. 【话题内容直传与文字渲染约束】：在生成传给生图 LLM 的英文提示词 (scene) 时，对于每一个分格，除了描述具体的视觉画面外，你必须将该话题的【完整详情（翻译为英文）】作为 Background Context 附加在该分格的提示词中，帮助生图模型理解剧情。但同时，必须极其强烈地警告生图模型：“绝对禁止将长篇上下文写在画面上，仅允许渲染短标题字幕条和气泡台词！”（示例：Background Context: [Details]. STRICT RULE: DO NOT render the background context text! ONLY render the exact Chinese text in the bubble and caption strip!）。\n6. 【核心角色强制全覆盖】：在提示词中必须明确要求并描述，每一个分格 (Panel) 都必须无一例外地出现你当前的人格设定（即参考图中的核心角色，例如 1girl, [特定外貌特征] 等），保持整篇连环画的主角绝对连贯！\n\n【待创作的群聊核心话题列表】：\n${chat_content}\n\n请输出包含 \"scene\" 字段的 JSON 对象。\n",
+                        "default": "你是一个资深的漫画分镜师与 AI 绘画提示词专家。\n请根据以下给出的【群聊每日核心话题列表】，站在你【当前的人格角色设定】（详见系统注入的身份）的视角与语气，将其改编并设计为一个精彩的多格连环漫画（Comic Strip）全景视觉画图提示词 (Prompt)。\n\n【核心视觉、台词与双层排版规则】：\n1. 【全话题必须覆盖（共 ${topic_count} 个分格）】：给出的待创作核心话题列表中共有 ${topic_count} 个话题，你必须为每一个话题分别设计一个分格 Panel（即 Panel 1 到 Panel ${topic_count}），绝对不许随意裁减、挑选或遗漏任何一个话题！\n2. 【人设口语化台词改编】：绝对严禁将报告分析总结原文直接放进对话框！必须以【你当前的人格语气/性格/口吻】（例如傲娇、萌系或专属说话风格），将每个话题的事件提炼改编为一句角色在漫画中的生动台词或吐槽，【每条台词控制在 15 个汉字以内】（例如：“呜呜！家里云又断网了啦！”、“萝卜子才没有降智！那都是Gemini的错！”）。\n3. 【精美双层文字排版（气泡 + 可爱旁白字幕条）】：\n   - 【角色的气泡】：在描述英文 Prompt 时，指定样式为“adorable kawaii anime speech bubble, soft rounded cloud-like shape, cute pointer tail pointing to the speaker”。\n   - 【分格底部的事件旁白条】：将每个话题概括为生动精炼的短标题（控制在 30 字以内，严禁带有“【事件】”字样），在 Prompt 中指定样式为“cute pastel-colored kawaii caption strip at the bottom of the panel with soft rounded corners”，严禁死板白框！\n4. 【中文文本显式渲染】：画面整体构图与场景描述使用英文，但气泡与底部旁白条内渲染的中文必须显式指定（指令格式：containing a speech bubble with exact Chinese text \"人设吐槽台词\" 以及 and a cute caption strip at bottom with exact Chinese text \"精炼话题短标题\"），绝对禁止将中文翻译成英文！\n5. 【话题内容直传与文字渲染约束】：在生成传给生图 LLM 的英文提示词 (scene) 时，对于每一个分格，除了描述具体的视觉画面外，你必须将该话题的【完整详情（翻译为英文）】作为 Background Context 附加在该分格的提示词中，帮助生图模型理解剧情。但同时，必须极其强烈地警告生图模型：“绝对禁止将长篇上下文写在画面上，仅允许渲染短标题字幕条和气泡台词！”（示例：Background Context: [Details]. STRICT RULE: DO NOT render the background context text! ONLY render the exact Chinese text in the bubble and caption strip!）。\n6. 【核心角色强制全覆盖】：在提示词中必须明确要求并描述，每一个分格 (Panel) 都必须无一例外地出现你当前的人格设定（即参考图中的核心角色，例如 1girl, [特定外貌特征] 等），保持整篇连环画的主角绝对连贯！\n\n【待创作的群聊核心话题列表】：\n${chat_content}\n\n【输出格式与正反例规范 (GOOD & BAD EXAMPLES)】：\n⚠️ 核心要求：AI 绘图引擎会直接读取 \"scene\" 字段作为唯一生图指令。你必须将全局角色总设以及 Panel 1 到 Panel ${topic_count} 的每一格完整描述全部写入 \"scene\" 字符串中！\n\n✅ 正确示范 (GOOD EXAMPLE - 必须严格遵循此格式输出纯 JSON)：\n{\n  \"scene\": \"A ${topic_count}-panel comic strip featuring [protagonist description] observing a chaotic QQ group chat.\\n\\nPanel 1: [Visual action] containing a speech bubble with exact Chinese text \\\"[人设吐槽台词 15字内]\\\" and a cute pastel caption strip at bottom with exact Chinese text \\\"[精炼短标题]\\\". Background Context: [English Details]. STRICT RULE: DO NOT render the background context text!\\n\\nPanel 2: [Visual action] containing a speech bubble with exact Chinese text \\\"[人设吐槽台词 15字内]\\\" and a cute pastel caption strip at bottom with exact Chinese text \\\"[精炼短标题]\\\". Background Context: [English Details]. STRICT RULE: DO NOT render the background context text!\\n\\n... (必须依次写完 Panel 1 到 Panel ${topic_count})\"\n}\n\n❌ 错误示范 (BAD EXAMPLE - 严禁以下行为)：\n1. 严禁把 scene 写成一句简短概括，却把具体话题藏在 panels 列表中（生图模型直接读取 scene，必须全内联写入 scene）！\n2. 严禁丢失气泡或字幕条里的 exact Chinese text 显式中文台词与短标题！\n3. 严禁在 JSON 之外输出任何多余的 Markdown 或闲聊文字！\n",
                         "hint": "让大模型根据核心话题生成丰富生动的多格连环漫画画图提示词"
                     }
                 }

@@ -13,19 +13,23 @@ AstrBot 群消息事件
 └── GroupDailyAnalysis.count_incremental_group_message()
     └── IncrementalTriggerCoordinator
         ├── 按平台和群组累计待处理消息数
-        ├── 达到阈值后创建单群分析任务
-        └── AnalysisApplicationService.execute_incremental_analysis()
-            ├── 拉取并清洗断点后的消息
-            ├── 取最早的固定数量消息构成批次
-            ├── IncrementalStore.save_batch()
-            └── 保存成功后推进分析断点
+        ├── 达到阈值后创建单群分析任务 (TaskGuard 并发互斥锁管控)
+        └── IncrementalAnalysisService.execute_incremental_analysis()
+            ├── 拉取断点后的消息并通过 MessageCleanerService 规则清洗
+            ├── IncrementalBatchBuilder: 取最早固定规模消息切分批次并计算每小时统计
+            ├── LLM 并行提取增量话题 (SummaryTopic) 与金句 (GoldenQuote)
+            ├── IncrementalStore.save_batch() (保存至 IncrementalBatch 实体)
+            ├── CheckpointStore.save_checkpoint() (双写 INCREMENTAL_BATCH 快照)
+            └── 保存成功后原子推进分析断点游标
 
 每日最终报告定时任务
 └── AutoScheduler._run_scheduled_report()
-    └── AnalysisApplicationService.execute_incremental_final_report()
-        ├── 查询滑动窗口内的批次
-        ├── IncrementalMergeService.merge_batches()
-        └── 生成并发送最终报告
+    └── ScheduledTargetResolver: 分层名单与免打扰扫描解析目标群
+        └── IncrementalAnalysisService.execute_incremental_final_report()
+            ├── IncrementalStore: 查询滑动窗口内落盘的所有 IncrementalBatch
+            ├── IncrementalMergeService.merge_batches(): 聚合为 IncrementalState 并导出值对象
+            ├── RenderDataPreparer: 组装 Jinja2 报告上下文胶囊
+            └── ReportGenerator: 生成长图/HTML 报告并通过平台适配器分发
 ```
 
 ## 消息计数触发
@@ -47,6 +51,8 @@ AstrBot 没有内置的“某群达到 N 条消息”回调，因此插件监听
 
 批次 ID 根据平台、群组和批次消息标识生成确定性哈希。同一批消息重试时会覆盖同一个批次索引项；只有批次保存成功后才推进 `incr_last_ts_{group_id}` 断点，避免持久化失败造成消息永久跳过。
 
+每批分析成功后，除了写入增量批次存储外，还会自动双写一份以 `INCREMENTAL_BATCH_{batch_id}` 命名的 Checkpoint 快照至持久化仓储，支持通过 `checkpoint_store.get_checkpoints_by_group_date(group_id, date_str)` 快速聚合检索当日所有增量批次产物。
+
 ## 最终报告
 
 最终报告仍在 `scheduled.analysis_time` 配置的时间点执行。增量群只查询报告滑动窗口内已经落盘的批次，合并统计、话题和金句后发送报告。报告任务不会强制分析不足阈值的剩余消息。
@@ -65,7 +71,9 @@ AstrBot 没有内置的“某群达到 N 条消息”回调，因此插件监听
 | `incremental_report_immediately` | `false` | 调试时在每批完成后立即生成最终报告 |
 | `incremental_fallback_enabled` | `true` | 最终报告失败时是否回退全量分析 |
 
-## 持久化键
+## 持久化与 Checkpoint 存储
+
+### 1. AstrBot KV 存储键
 
 | KV 键 | 内容 |
 |-------|------|
@@ -73,6 +81,12 @@ AstrBot 没有内置的“某群达到 N 条消息”回调，因此插件监听
 | `incr_batch_index_{group_id}` | 群增量批次索引 |
 | `incr_batch_{group_id}_{batch_id}` | 单个增量批次数据 |
 | `incr_last_ts_{group_id}` | 最后成功分析的时间戳及该秒内消息 ID 游标 |
+
+### 2. Checkpoint 快照存储
+
+* **批次快照命名**：`stage_name = "INCREMENTAL_BATCH_{batch_id}"`
+* **聚合查询接口**：`checkpoint_store.get_checkpoints_by_group_date(group_id, date_str)`
+* **作用**：提供统一的阶段快照查询契约，便于在全链路追踪 Trace 中关联增量处理详情及历史审计。
 
 ## 命令
 

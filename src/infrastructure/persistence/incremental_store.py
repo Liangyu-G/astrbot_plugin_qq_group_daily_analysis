@@ -13,13 +13,19 @@ KV 键设计：
   值: {"timestamp": 1234567890, "message_ids": ["..."]}
 """
 
-from typing import Any
+from __future__ import annotations
+
+from typing import TYPE_CHECKING
 
 from ...domain.entities.incremental_state import IncrementalBatch
+from ...domain.repositories.persistence_repository import IIncrementalStore
 from ...utils.logger import logger
 
+if TYPE_CHECKING:
+    from astrbot.api.star import Star
 
-class IncrementalStore:
+
+class IncrementalStore(IIncrementalStore):
     """
     增量分析批次持久化仓储
 
@@ -35,8 +41,11 @@ class IncrementalStore:
     INDEX_PREFIX = "incr_batch_index"
     BATCH_PREFIX = "incr_batch"
     LAST_TS_PREFIX = "incr_last_ts"
+    GROUPS_REGISTRY_KEY = "incr_tracked_groups"
 
-    def __init__(self, star_instance: Any):
+    plugin: Star
+
+    def __init__(self, star_instance: Star) -> None:
         """
         初始化批次持久化仓储。
 
@@ -44,6 +53,34 @@ class IncrementalStore:
             star_instance: Star 插件实例，用于访问底层 KV 存储引擎
         """
         self.plugin = star_instance
+
+    async def _register_group(self, group_id: str) -> None:
+        """记录拥有增量数据的群号到全局注册表"""
+        try:
+            groups_data = await self.plugin.get_kv_data(self.GROUPS_REGISTRY_KEY, [])
+            current_groups = (
+                set(groups_data) if isinstance(groups_data, list) else set()
+            )
+            if group_id not in current_groups:
+                current_groups.add(str(group_id))
+                await self.plugin.put_kv_data(
+                    self.GROUPS_REGISTRY_KEY, sorted(current_groups)
+                )
+        except Exception as e:
+            logger.debug(f"注册增量群组记录异常: {e}")
+
+    async def get_tracked_groups(self) -> list[str]:
+        """获取所有记录过增量状态/批次的群号列表"""
+        try:
+            groups_data = await self.plugin.get_kv_data(self.GROUPS_REGISTRY_KEY, [])
+            return (
+                sorted({str(g) for g in groups_data})
+                if isinstance(groups_data, list)
+                else []
+            )
+        except Exception as e:
+            logger.error(f"读取增量群组注册表失败: {e}")
+            return []
 
     # ================================================================
     # 键构建
@@ -77,12 +114,9 @@ class IncrementalStore:
         """
         key = self._index_key(group_id)
         try:
-            data = await self.plugin.get_kv_data(key, None)
-            if data is None:
-                return []
+            data = await self.plugin.get_kv_data(key, default=[])
             if isinstance(data, list):
-                return data
-            logger.warning(f"批次索引数据格式异常 (Key: {key}): {type(data)}")
+                return [item for item in data if isinstance(item, dict)]
             return []
         except Exception as e:
             logger.error(f"读取批次索引失败 (Key: {key}): {e}", exc_info=True)
@@ -144,6 +178,7 @@ class IncrementalStore:
             else:
                 existing_entry["timestamp"] = batch.timestamp
             await self._save_index(group_id, index)
+            await self._register_group(group_id)
 
             logger.debug(
                 f"已保存批次 {batch.batch_id[:8]}... "
@@ -272,14 +307,98 @@ class IncrementalStore:
                     ),
                 },
             )
+            await self._register_group(group_id)
             logger.debug(f"更新最后分析游标: 群 {group_id}, ts={timestamp}")
         except Exception as e:
             logger.error(f"更新最后分析游标失败 (Key: {key}): {e}", exc_info=True)
             raise
 
     # ================================================================
-    # 过期批次清理
+    # 过期批次清理与单点删除 / 重置
     # ================================================================
+
+    async def get_batch_detail(
+        self, group_id: str, batch_id: str
+    ) -> IncrementalBatch | None:
+        """读取单条增量批次完整数据。
+
+        Args:
+            group_id: 群组 ID。
+            batch_id: 批次唯一 ID。
+
+        Returns:
+            IncrementalBatch | None: 完整批次实体，不存在时返回 None。
+        """
+        batch_key = self._batch_key(group_id, batch_id)
+        try:
+            data = await self.plugin.get_kv_data(batch_key, default={})
+            if isinstance(data, dict) and data:
+                return IncrementalBatch.from_dict(data)
+            return None
+        except Exception as e:
+            logger.error(
+                f"加载批次详情失败 (群 {group_id}, 批次 {batch_id[:8]}...): {e}",
+                exc_info=True,
+            )
+            return None
+
+    async def delete_batch(self, group_id: str, batch_id: str) -> bool:
+        """单点删除指定增量批次并更新索引。
+
+        Args:
+            group_id: 群组 ID。
+            batch_id: 批次唯一 ID。
+
+        Returns:
+            bool: 是否成功删除。
+        """
+        try:
+            index = await self._get_index(group_id)
+            retained = [e for e in index if e.get("batch_id") != batch_id]
+            if len(retained) == len(index):
+                return False
+
+            await self._save_index(group_id, retained)
+            batch_key = self._batch_key(group_id, batch_id)
+            await self.plugin.put_kv_data(batch_key, None)
+            logger.info(f"已删除增量批次: 群 {group_id}, 批次 {batch_id}")
+            return True
+        except Exception as e:
+            logger.error(
+                f"删除批次失败 (群 {group_id}, 批次 {batch_id}): {e}", exc_info=True
+            )
+            return False
+
+    async def reset_group(self, group_id: str) -> int:
+        """一键清空指定群的所有增量批次数据并将分析游标归零。
+
+        Args:
+            group_id: 群组 ID。
+
+        Returns:
+            int: 已删除的批次总数。
+        """
+        try:
+            index = await self._get_index(group_id)
+            count = len(index)
+            for entry in index:
+                b_id = entry.get("batch_id")
+                if b_id:
+                    await self.plugin.put_kv_data(self._batch_key(group_id, b_id), None)
+
+            # 清空索引与游标
+            await self._save_index(group_id, [])
+            await self.plugin.put_kv_data(
+                self._last_ts_key(group_id),
+                {"timestamp": 0, "message_ids": []},
+            )
+            logger.info(
+                f"已重置群 {group_id} 的全部增量批次数据与游标 (共清理 {count} 条批次)"
+            )
+            return count
+        except Exception as e:
+            logger.error(f"重置群增量数据失败 (群 {group_id}): {e}", exc_info=True)
+            return 0
 
     async def cleanup_old_batches(self, group_id: str, before_timestamp: float) -> int:
         """
@@ -372,3 +491,67 @@ class IncrementalStore:
         # 按时间戳升序排列
         index.sort(key=lambda x: x.get("timestamp", 0))
         return index
+
+    async def get_all_batches_with_details(
+        self, group_id: str
+    ) -> list[dict[str, object]]:
+        """获取指定群所有批次的概览详情列表（包含话题标签与基本指标）。
+
+        Args:
+            group_id: 群组 ID。
+
+        Returns:
+            list[dict[str, object]]: 批次卡片展示用字典列表。
+        """
+        index = await self._get_index(group_id)
+        index.sort(key=lambda x: x.get("timestamp", 0), reverse=True)
+
+        results: list[dict[str, object]] = []
+        for entry in index:
+            batch_id = entry.get("batch_id")
+            if not batch_id:
+                continue
+            batch = await self.get_batch_detail(group_id, batch_id)
+            if batch:
+                topics_summary = [
+                    {
+                        "topic": t.get("topic", ""),
+                        "contributors": t.get("contributors", []),
+                    }
+                    for t in batch.topics
+                ]
+
+                token_dict = batch.token_usage
+
+                participants_cnt = (
+                    len(batch.participant_ids)
+                    if batch.participant_ids
+                    else len(batch.user_stats)
+                )
+
+                results.append(
+                    {
+                        "batch_id": batch.batch_id,
+                        "group_id": batch.group_id,
+                        "timestamp": batch.timestamp,
+                        "messages_count": batch.messages_count,
+                        "characters_count": batch.characters_count,
+                        "topics": topics_summary,
+                        "participants_count": participants_cnt,
+                        "token_usage": token_dict,
+                    }
+                )
+            else:
+                results.append(
+                    {
+                        "batch_id": batch_id,
+                        "group_id": group_id,
+                        "timestamp": entry.get("timestamp", 0),
+                        "messages_count": 0,
+                        "characters_count": 0,
+                        "topics": [],
+                        "participants_count": 0,
+                        "token_usage": {"total_tokens": 0},
+                    }
+                )
+        return results

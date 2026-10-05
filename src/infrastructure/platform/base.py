@@ -2,9 +2,11 @@
 平台适配器基类
 """
 
+from __future__ import annotations
+
 from abc import ABC, abstractmethod
-from collections.abc import Mapping
-from typing import Any
+from datetime import datetime, timedelta, timezone
+from typing import TYPE_CHECKING, Generic, TypeVar
 
 from ...domain.repositories.avatar_repository import IAvatarRepository
 from ...domain.repositories.message_repository import (
@@ -12,51 +14,128 @@ from ...domain.repositories.message_repository import (
     IMessageRepository,
     IMessageSender,
 )
-from ...domain.value_objects.platform_capabilities import PlatformCapabilities
-from ...domain.value_objects.unified_message import UnifiedMessage
+from ...domain.repositories.platform_adapter_repository import PlatformAdapterProtocol
+
+if TYPE_CHECKING:
+    from collections.abc import Mapping
+
+    from astrbot.api.star import Context
+
+    from ...domain.value_objects.platform_capabilities import PlatformCapabilities
+    from ...domain.value_objects.unified_message import UnifiedMessage
+
+
+TBot = TypeVar("TBot")
 
 
 class PlatformAdapter(
-    IMessageRepository, IMessageSender, IGroupInfoRepository, IAvatarRepository, ABC
+    IMessageRepository,
+    IMessageSender,
+    IGroupInfoRepository,
+    IAvatarRepository,
+    PlatformAdapterProtocol,
+    Generic[TBot],
+    ABC,
 ):
-    """
-    基础设施：平台适配器基类
+    """基础设施：平台适配器基类。
 
     继承自多个领域接口（仓储、发送器、群组信息、头像），
     充当领域层与具体聊天平台（如 OneBot, Discord）之间的中转站。
 
     Attributes:
-        bot (Any): 平台对应的机器人 SDK 实例，显式标注为 Any 以支持动态属性调用
+        bot (TBot): 平台对应的机器人 SDK 实例
         config (dict): 针对该平台的特定配置
     """
 
-    bot: Any
+    bot: TBot
+    config: dict[str, object]
+    _platform_id: str
+    bot_self_ids: list[str]
+    _capabilities: PlatformCapabilities | None
+    platform_name: str = "unknown"
 
     def __init__(
         self,
-        bot_instance: Any,
-        config: Mapping[str, Any] | None = None,
-    ):
-        """
-        初始化平台适配器。
+        bot_instance: TBot,
+        config: Mapping[str, object] | None = None,
+    ) -> None:
+        """初始化平台适配器。
 
         Args:
-            bot_instance (Any): 后端机器人实例
-            config (dict, optional): 平台特定配置项
+            bot_instance: 后端机器人实例。
+            config: 平台特定配置项。
         """
         self.bot = bot_instance
         self.config: dict[str, object] = dict(config) if config is not None else {}
+        self._platform_id: str = str(self.config.get("platform_id", "")).strip()
         self.bot_self_ids: list[str] = []
         self._capabilities: PlatformCapabilities | None = None
 
-    def set_context(self, context: Any):
-        """
-        设置上下文对象（用于部分需要 ctx 的平台如 Telegram）。
+    @staticmethod
+    def calculate_effective_start_timestamp(
+        days: int = 1,
+        since_ts: int | float | None = None,
+        now: datetime | None = None,
+    ) -> int:
+        """统一计算历史消息拉取的生效起始时间戳（Unix epoch 秒）。
+
+        确保无论传入的增量游标 since_ts 为何值（即使因停机多天严重过期），
+        起始时间点始终严格约束在 [now - days, now] 窗口之内，避免跨天历史数据污染。
 
         Args:
-            context (Any): 上下文对象
+            days: 历史拉取天数窗口（如 1 天）。
+            since_ts: 可选的上次分析游标时间戳。
+            now: 可选的基准当前时间（便于测试注入）。
+
+        Returns:
+            int: 严格约束后的最远历史起始 Unix 时间戳。
         """
-        pass
+        now_dt = now if now is not None else datetime.now(timezone.utc)
+        if now_dt.tzinfo is None:
+            now_dt = now_dt.replace(tzinfo=timezone.utc)
+        days_start_ts = max(
+            0, int((now_dt - timedelta(days=max(1, int(days)))).timestamp())
+        )
+        if since_ts and since_ts > 0:
+            return max(int(since_ts), days_start_ts)
+        return days_start_ts
+
+    @staticmethod
+    def calculate_effective_cutoff_datetime(
+        days: int = 1,
+        since_ts: int | float | None = None,
+        tz: timezone | None = timezone.utc,
+        now: datetime | None = None,
+    ) -> datetime:
+        """统一计算历史消息拉取的生效起始 datetime 对象。
+
+        Args:
+            days: 历史拉取天数窗口。
+            since_ts: 可选的上次分析游标时间戳。
+            tz: 目标时区（如 UTC 或 None）。
+            now: 可选的基准当前时间。
+
+        Returns:
+            datetime: 严格约束后的最远历史起始 datetime 对象。
+        """
+        ts = PlatformAdapter.calculate_effective_start_timestamp(
+            days=days, since_ts=since_ts, now=now
+        )
+        if tz is None:
+            return datetime.fromtimestamp(ts)
+        return datetime.fromtimestamp(ts, tz=tz)
+
+    @property
+    def platform_id(self) -> str:
+        """获取当前适配器的平台实例 ID（如 nuits）"""
+        return self._platform_id
+
+    def set_context(self, context: Context | None) -> None:
+        """设置上下文对象（用于部分需要 ctx 的平台如 Telegram）。
+
+        Args:
+            context: 上下文对象。
+        """
 
     @property
     def capabilities(self) -> PlatformCapabilities:
@@ -150,8 +229,7 @@ class PlatformAdapter(
                 if not await self.send_text(group_id, chunk):
                     return False
             return True
-        else:
-            return await self.send_text(group_id, full_text)
+        return await self.send_text(group_id, full_text)
 
     async def set_reaction(
         self, group_id: str, message_id: str, emoji: str | int, is_add: bool = True
@@ -170,7 +248,12 @@ class PlatformAdapter(
         """
         return False
 
-    async def send_text_report(self, group_id: str, content: str) -> bool:
+    async def send_text_report(
+        self,
+        group_id: str,
+        content: str,
+        fallback_content: str | None = None,
+    ) -> bool:
         """
         以最适合当前平台的方式发送长文本报告。
         默认逻辑：将长文本切分为多个节点，然后调用 send_forward_msg。
@@ -208,7 +291,7 @@ class PlatformAdapter(
             return await self.send_forward_msg(group_id, nodes)
         except Exception:
             # 兜底：直接发送
-            return await self.send_text(group_id, str(content))
+            return await self.send_text(group_id, str(fallback_content or content))
 
     async def is_group_muted(self, group_id: str) -> bool:
         """

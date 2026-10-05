@@ -2,6 +2,8 @@
 常量 - 插件中使用的共享常量
 """
 
+from __future__ import annotations
+
 from enum import Enum
 
 
@@ -17,7 +19,30 @@ class Platform(str, Enum):
     TELEGRAM = "telegram"
     DISCORD = "discord"
     SLACK = "slack"
-    LARK = "lark"
+    SATORI = "satori"
+    QQ_OFFICIAL = "qq_official"
+
+
+class AnalysisStage(str, Enum):
+    """
+    分析与渲染流水线阶段枚举
+
+    定义了全链路追踪、活跃任务打点与 Checkpoint 存储所使用的标准阶段名称。
+    """
+
+    FETCH_MESSAGES = "FETCH_MESSAGES"
+    CLEAN_MESSAGES = "CLEAN_MESSAGES"
+    STATS_ANALYSIS = "STATS_ANALYSIS"
+    LLM_ANALYSIS = "LLM_ANALYSIS"
+    SAVE_SUMMARY = "SAVE_SUMMARY"
+    RENDER_REPORT = "RENDER_REPORT"
+    DISPATCH_REPORT = "DISPATCH_REPORT"
+    CHECKPOINT_RESTORE = "CHECKPOINT_RESTORE"
+    # 按需轻量分析阶段 (LLM Tool 专用快照隔离)
+    ON_DEMAND_ANALYSIS = "ON_DEMAND_ANALYSIS"
+    # 漫画生成扩展阶段
+    COMIC_STORYBOARD = "COMIC_STORYBOARD"
+    COMIC_DRAWING = "COMIC_DRAWING"
 
 
 class TaskStatus(str, Enum):
@@ -32,6 +57,8 @@ class TaskStatus(str, Enum):
     COMPLETED = "completed"
     FAILED = "failed"
     CANCELLED = "cancelled"
+    ABORTED = "aborted"
+    SKIPPED = "skipped"
 
 
 class ContentType(str, Enum):
@@ -66,9 +93,23 @@ class ReportFormat(str, Enum):
     HTML = "html"
 
 
-# 插件元数据
+# 插件元数据与仓库配置
 PLUGIN_NAME = "astrbot_plugin_qq_group_daily_analysis"
-PLUGIN_VERSION = "2.0.0"
+GITHUB_REPO_OWNER = "SXP-Simon"
+GITHUB_REPO_NAME = "astrbot_plugin_qq_group_daily_analysis"
+GITHUB_REPO_BRANCH = "main"
+
+# ==========================================
+# 静态资源与 CDN 配置常量
+# ==========================================
+DEFAULT_CDN_HOST = "https://cdn.jsdmirror.com"
+DEFAULT_GITHUB_REPO_CDN = (
+    f"{DEFAULT_CDN_HOST}/gh/{GITHUB_REPO_OWNER}/{GITHUB_REPO_NAME}@{GITHUB_REPO_BRANCH}"
+)
+DEFAULT_ASSETS_CDN_URL = f"{DEFAULT_GITHUB_REPO_CDN}/assets"
+DEFAULT_ATRI_ASSETS_CDN_URL = f"{DEFAULT_ASSETS_CDN_URL}/ATRI"
+DEFAULT_MIKU_ASSETS_CDN_URL = f"{DEFAULT_ASSETS_CDN_URL}/HatsuneMiku"
+DEFAULT_NPM_CDN_URL = f"{DEFAULT_CDN_HOST}/npm"
 
 # 平台标识符
 SUPPORTED_PLATFORMS = [

@@ -5,20 +5,24 @@
 将接口错误页、内网地址或超大内容作为漫画图片继续投递。
 """
 
+from __future__ import annotations
+
 import asyncio
 import base64
 import binascii
-import ipaddress
 import re
-import socket
-from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
-from typing import Any, Protocol
+from typing import TYPE_CHECKING, Protocol
 from urllib.parse import urlsplit, urlunsplit
 
 import httpx
 
 from ...utils.logger import logger
+
+if TYPE_CHECKING:
+    from collections.abc import Awaitable, Callable
+
+    from ..config.config_manager import ConfigManager
 
 
 class ImageDownloadFailedError(Exception):
@@ -32,7 +36,7 @@ class ImageDownloadFailedError(Exception):
 class DrawingImageResponseHooks(Protocol):
     """描述图片响应服务依赖的宿主能力。"""
 
-    config_manager: Any
+    config_manager: ConfigManager
 
 
 @dataclass(slots=True)
@@ -51,7 +55,7 @@ class DrawingImageResponseService:
     IMAGE_DOWNLOAD_TOTAL_TIMEOUT = 90
 
     async def extract_image_from_response(
-        self, data: Any, proxy: str | None = None
+        self, data: object, proxy: str | None = None
     ) -> bytes | None:
         """递归提取绘图响应中的图片数据。"""
         encoded: list[tuple[str, str]] = []
@@ -60,7 +64,7 @@ class DrawingImageResponseService:
         content_urls: list[tuple[str, str]] = []
         fallback_urls: list[tuple[str, str]] = []
 
-        def collect(value: Any, path: tuple[str, ...] = ()) -> None:
+        def collect(value: object, path: tuple[str, ...] = ()) -> None:
             if isinstance(value, dict):
                 for name, item in value.items():
                     collect(item, (*path, name.lower()))
@@ -206,7 +210,7 @@ class DrawingImageResponseService:
                 self._download_image_inner(url, proxy),
                 timeout=self.IMAGE_DOWNLOAD_TOTAL_TIMEOUT,
             )
-        except asyncio.TimeoutError as exc:
+        except TimeoutError as exc:
             raise httpx.TimeoutException(
                 f"图片下载超过 {self.IMAGE_DOWNLOAD_TOTAL_TIMEOUT}s 总超时限制: {self.sanitize_url(url)}"
             ) from exc
@@ -261,29 +265,12 @@ class DrawingImageResponseService:
         raise ValueError("图片下载失败")
 
     async def _validate_public_image_url(self, url: str) -> None:
-        """拒绝非 HTTP 协议及解析到本机或私网的图片地址。"""
+        """校验图片地址协议与基础合法性，兼容本地与私网自建绘图服务。"""
         parsed = urlsplit(url)
         if parsed.scheme not in {"http", "https"} or not parsed.hostname:
             raise ValueError("图片地址必须是有效的 HTTP/HTTPS URL")
         if parsed.username or parsed.password:
             raise ValueError("图片地址不允许包含用户凭据")
-        hostname = parsed.hostname.rstrip(".").lower()
-        if hostname == "localhost" or hostname.endswith(".localhost"):
-            raise ValueError("图片地址不允许访问本机或私网")
-        try:
-            addresses = await asyncio.to_thread(
-                socket.getaddrinfo,
-                hostname,
-                parsed.port or (443 if parsed.scheme == "https" else 80),
-                type=socket.SOCK_STREAM,
-            )
-        except socket.gaierror as exc:
-            request = httpx.Request("GET", url)
-            raise httpx.ConnectError("图片地址 DNS 解析失败", request=request) from exc
-        if not addresses or any(
-            not ipaddress.ip_address(item[4][0]).is_global for item in addresses
-        ):
-            raise ValueError("图片地址不允许访问本机或私网")
 
     @staticmethod
     def sanitize_url(url: str) -> str:
@@ -295,10 +282,10 @@ class DrawingImageResponseService:
         return urlunsplit((parsed.scheme, host, parsed.path, "", ""))
 
     @staticmethod
-    def summarize_response(data: Any) -> str:
+    def summarize_response(data: object) -> str:
         """生成不包含响应正文和 Base64 的结构摘要。"""
 
-        def summarize(value: Any, depth: int = 0) -> str:
+        def summarize(value: object, depth: int = 0) -> str:
             if isinstance(value, str):
                 return f"<str len={len(value)}>"
             if depth >= 3:

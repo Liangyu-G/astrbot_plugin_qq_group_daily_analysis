@@ -49,18 +49,124 @@ def load_main_method(name: str):
     isolated_module = ast.fix_missing_locations(
         ast.Module(body=[isolated_class], type_ignores=[])
     )
+    from collections.abc import AsyncGenerator
+    from datetime import datetime
+
+    from src.application.handlers.analysis_command_handler import (
+        AnalysisCommandHandler,
+    )
+    from src.application.handlers.comic_command_handler import ComicCommandHandler
+    from src.application.handlers.settings_command_handler import (
+        SettingsCommandHandler,
+    )
+    from src.domain.repositories import PlatformAdapterProtocol
+    from src.domain.value_objects import AnalysisResultPayload
+    from src.shared.trace_context import TraceContext
+
     namespace = {
-        "AsyncGenerator": object,
+        "Any": Any,
+        "AsyncGenerator": AsyncGenerator,
         "AstrMessageEvent": object,
+        "MessageEventResult": object,
         "DuplicateGroupTaskError": RuntimeError,
+        "SettingsCommandHandler": SettingsCommandHandler,
+        "ComicCommandHandler": ComicCommandHandler,
+        "AnalysisCommandHandler": AnalysisCommandHandler,
+        "PlatformAdapterProtocol": PlatformAdapterProtocol,
+        "AnalysisResultPayload": AnalysisResultPayload,
         "asyncio": asyncio,
+        "datetime": datetime,
         "logger": Mock(),
         "os": os,
+        "Path": Path,
         "PLUGIN_NAME": "test_plugin",
         "StarTools": SimpleNamespace(get_data_dir=Mock()),
+        "TraceContext": TraceContext,
     }
     exec(compile(isolated_module, str(main_path), "exec"), namespace)
-    return getattr(namespace["MainMethodHarness"], name)
+    target_func = getattr(namespace["MainMethodHarness"], name)
+
+    import functools
+    import inspect
+
+    def _ensure_plugin_handlers(plugin):
+        if not hasattr(plugin, "__dict__"):
+            return
+        if not hasattr(plugin, "_get_platform_id_from_event"):
+            plugin._get_platform_id_from_event = lambda e: (
+                getattr(e, "get_platform_id", lambda: "")() or "default"
+            )
+        if not hasattr(plugin, "_get_group_id_from_event"):
+            plugin._get_group_id_from_event = lambda e: getattr(
+                e, "get_group_id", lambda: None
+            )()
+        if not hasattr(plugin, "settings_command_handler"):
+            plugin.settings_command_handler = SettingsCommandHandler(
+                config_manager=getattr(plugin, "config_manager", None),
+                template_command_service=getattr(
+                    plugin, "template_command_service", None
+                ),
+                template_preview_router=getattr(
+                    plugin, "template_preview_router", None
+                ),
+                auto_scheduler=getattr(plugin, "auto_scheduler", None),
+                incremental_store=getattr(plugin, "incremental_store", None),
+                incremental_merge_service=getattr(
+                    plugin, "incremental_merge_service", None
+                ),
+                bot_manager=getattr(plugin, "bot_manager", None),
+                context=getattr(plugin, "context", None),
+            )
+        if not hasattr(plugin, "comic_command_handler"):
+            plugin.comic_command_handler = ComicCommandHandler(
+                config_manager=getattr(plugin, "config_manager", None),
+                bot_manager=getattr(plugin, "bot_manager", None),
+                comic_service=getattr(plugin, "comic_service", None),
+                analysis_service=getattr(plugin, "analysis_service", None),
+                active_task_manager=getattr(plugin, "active_task_manager", None),
+                plugin_data_dir=getattr(plugin, "plugin_data_dir", None),
+                plugin_instance=plugin,
+            )
+        if not hasattr(plugin, "analysis_command_handler"):
+            plugin.analysis_command_handler = AnalysisCommandHandler(
+                config_manager=getattr(plugin, "config_manager", None),
+                bot_manager=getattr(plugin, "bot_manager", None),
+                analysis_service=getattr(plugin, "analysis_service", None),
+                report_generator=getattr(plugin, "report_generator", None),
+                html_render=getattr(plugin, "html_render", None),
+                active_task_manager=getattr(plugin, "active_task_manager", None),
+                trace_store=getattr(plugin, "trace_store", None),
+                message_sender=getattr(plugin, "message_sender", None),
+                comic_handler=plugin.comic_command_handler,
+                plugin_data_dir=getattr(plugin, "plugin_data_dir", None),
+                plugin_instance=plugin,
+            )
+
+    if inspect.iscoroutinefunction(target_func):
+
+        @functools.wraps(target_func)
+        async def async_wrapper(plugin, *args, **kwargs):
+            _ensure_plugin_handlers(plugin)
+            return await target_func(plugin, *args, **kwargs)
+
+        return async_wrapper
+    elif inspect.isasyncgenfunction(target_func):
+
+        @functools.wraps(target_func)
+        async def async_gen_wrapper(plugin, *args, **kwargs):
+            _ensure_plugin_handlers(plugin)
+            async for item in target_func(plugin, *args, **kwargs):
+                yield item
+
+        return async_gen_wrapper
+    else:
+
+        @functools.wraps(target_func)
+        def sync_wrapper(plugin, *args, **kwargs):
+            _ensure_plugin_handlers(plugin)
+            return target_func(plugin, *args, **kwargs)
+
+        return sync_wrapper
 
 
 def load_comic_service_method(name: str):
@@ -103,7 +209,22 @@ def load_comic_service_method(name: str):
     isolated_module = ast.fix_missing_locations(
         ast.Module(body=[isolated_class], type_ignores=[])
     )
-    namespace = {"Path": Path, "mimetypes": mimetypes, "logger": Mock(), "Any": Any}
+    from collections.abc import Sequence
+    from contextlib import nullcontext
+    from src.domain.value_objects import ComicStoryboard, SummaryTopic
+    from src.shared.trace_context import TraceContext
+
+    namespace = {
+        "Path": Path,
+        "mimetypes": mimetypes,
+        "logger": Mock(),
+        "Any": Any,
+        "Sequence": Sequence,
+        "SummaryTopic": SummaryTopic,
+        "ComicStoryboard": ComicStoryboard,
+        "TraceContext": TraceContext,
+        "nullcontext": nullcontext,
+    }
     exec(compile(isolated_module, str(service_path), "exec"), namespace)
     return getattr(namespace["ComicServiceHarness"], name)
 
@@ -141,7 +262,6 @@ def load_config_manager_class(plugin_data_dir: Path):
         "_migrate_daily_comic_characters",
         "_migrate_daily_comic_character_prompts",
         "_protect_upgrade_data",
-        "_protect_custom_t2i_templates",
         "_read_upgrade_protection_state",
         "_save_upgrade_protection_state",
         "_write_upgrade_config_backup",
@@ -180,6 +300,8 @@ def load_config_manager_class(plugin_data_dir: Path):
         "_get_comic_character_state_path",
         "_read_comic_character_state",
         "_save_comic_character_state",
+        "_is_legacy_default_comic_prompt",
+        "_migrate_legacy_comic_storyboard_prompts",
     }
     methods = [
         node
@@ -197,6 +319,8 @@ def load_config_manager_class(plugin_data_dir: Path):
         ast.Module(body=[isolated_class], type_ignores=[])
     )
     namespace = {
+        "__name__": "src.infrastructure.config.config_manager",
+        "__package__": "src.infrastructure.config",
         "AstrBotConfig": object,
         "StarTools": SimpleNamespace(get_data_dir=Mock(return_value=plugin_data_dir)),
         "PLUGIN_NAME": "test_plugin",
@@ -212,6 +336,10 @@ def load_config_manager_class(plugin_data_dir: Path):
         "re": re,
         "shutil": shutil,
         "logger": Mock(),
+        "ConfigMigrator": __import__(
+            "src.infrastructure.config.config_migrator",
+            fromlist=["ConfigMigrator"],
+        ).ConfigMigrator,
     }
     exec(compile(isolated_module, str(config_path), "exec"), namespace)
     return namespace["ConfigManagerHarness"]
@@ -253,13 +381,16 @@ def test_qq_official_webhook_uses_official_report_capabilities():
         adapter = SimpleNamespace(
             get_platform_name=Mock(return_value="qq_official_webhook")
         )
+        mock_comic_trigger = Mock()
         plugin = SimpleNamespace(
             _terminating=False,
             config_manager=SimpleNamespace(
                 get_output_format=Mock(return_value=["text"])
             ),
             _send_text_reports=AsyncMock(return_value=True),
-            _try_trigger_comic_generation=Mock(),
+            comic_command_handler=SimpleNamespace(
+                try_trigger_comic_generation=mock_comic_trigger
+            ),
         )
         result = {
             "group_id": "123456",
@@ -272,9 +403,7 @@ def test_qq_official_webhook_uses_official_report_capabilities():
             pass
 
         assert plugin._send_text_reports.await_args.args[2] is True
-        plugin._try_trigger_comic_generation.assert_called_once_with(
-            "123456", "qq-official-main", {}
-        )
+        mock_comic_trigger.assert_called_once_with("123456", "qq-official-main", {})
 
     asyncio.run(scenario())
 
@@ -634,90 +763,34 @@ def test_t2i_viewport_fallback_only_fills_missing_meta_dimension():
     assert description == "模板width=980，兜底height=900"
 
 
-def test_custom_t2i_template_is_copied_after_user_edit(tmp_path: Path):
-    """模板哈希变化时应保留用户修改的副本。"""
-    config_manager_class = load_config_manager_class(tmp_path)
-    plugin_root = tmp_path / "plugin"
-    template_path = (
-        plugin_root
-        / "src"
-        / "infrastructure"
-        / "reporting"
-        / "templates"
-        / "simple"
-        / "image_template.html"
-    )
-    template_path.parent.mkdir(parents=True)
-    template_path.write_text("官方模板", encoding="utf-8")
-    (plugin_root / "metadata.yaml").write_text("version: v1.0.0\n", encoding="utf-8")
-    (plugin_root / "_conf_schema.json").write_text("{}", encoding="utf-8")
-    config_manager_class._get_plugin_root = staticmethod(lambda: plugin_root)
-
-    class Config(dict):
-        save_config = Mock()
-
-    config_manager_class(Config())
-    template_path.write_text("用户修改模板", encoding="utf-8")
-    config_manager_class(Config())
-
-    protected_template = (
-        tmp_path
-        / "custom_t2i_templates"
-        / "reporting_templates"
-        / "simple"
-        / "image_template.html"
-    )
-    assert protected_template.read_text(encoding="utf-8") == "用户修改模板"
-
-
-def test_standalone_t2i_template_is_copied_on_first_start(tmp_path: Path):
-    """插件目录中的独立 T2I 模板首次启动即应归档。"""
-    config_manager_class = load_config_manager_class(tmp_path)
-    plugin_root = tmp_path / "plugin"
-    standalone_template = plugin_root / "data" / "t2i_templates" / "custom.html"
-    standalone_template.parent.mkdir(parents=True)
-    standalone_template.write_text("独立自定义模板", encoding="utf-8")
-    (plugin_root / "metadata.yaml").write_text("version: v1.0.0\n", encoding="utf-8")
-    (plugin_root / "_conf_schema.json").write_text("{}", encoding="utf-8")
-    config_manager_class._get_plugin_root = staticmethod(lambda: plugin_root)
-
-    class Config(dict):
-        save_config = Mock()
-
-    config_manager_class(Config())
-
-    protected_template = (
-        tmp_path / "custom_t2i_templates" / "standalone_templates" / "custom.html"
-    )
-    assert protected_template.read_text(encoding="utf-8") == "独立自定义模板"
-
-
-def test_custom_report_template_overrides_only_matching_file(tmp_path: Path):
-    """用户模板副本应优先加载，缺失文件仍回退到内置模板。"""
-    builtin_template_dir = tmp_path / "builtin" / "simple"
-    custom_template_dir = tmp_path / "custom" / "simple"
-    builtin_template_dir.mkdir(parents=True)
+def test_custom_report_template_falls_back_to_scrapbook_for_missing_components(
+    tmp_path: Path,
+):
+    """自定义报告模板若未提供局部组件，自动回退到内置默认手账模板（scrapbook）。"""
+    scrapbook_dir = tmp_path / "builtin" / "scrapbook"
+    custom_template_dir = tmp_path / "custom" / "my_custom_theme"
+    scrapbook_dir.mkdir(parents=True)
     custom_template_dir.mkdir(parents=True)
-    (builtin_template_dir / "image_template.html").write_text(
-        "内置图片模板", encoding="utf-8"
+    (scrapbook_dir / "image_template.html").write_text(
+        "默认手账图片模板", encoding="utf-8"
     )
-    (builtin_template_dir / "topic_item.html").write_text(
-        "内置话题模板", encoding="utf-8"
-    )
+    (scrapbook_dir / "topic_item.html").write_text("默认手账话题模板", encoding="utf-8")
     (custom_template_dir / "image_template.html").write_text(
-        "用户图片模板", encoding="utf-8"
+        "自定义主题图片模板", encoding="utf-8"
     )
     templates = HTMLTemplates(
         SimpleNamespace(
-            get_report_template=Mock(return_value="simple"),
+            get_report_template=Mock(return_value="my_custom_theme"),
             get_custom_report_template_dir=Mock(return_value=custom_template_dir),
         )
     )
     templates.base_dir = str(tmp_path / "builtin")
     environment = templates._get_env_sync()
 
-    assert environment.get_template("image_template.html").render() == "用户图片模板"
-    assert environment.get_template("topic_item.html").render() == "内置话题模板"
+    assert (
+        environment.get_template("image_template.html").render() == "自定义主题图片模板"
+    )
+    assert environment.get_template("topic_item.html").render() == "默认手账话题模板"
 
 
 def test_comic_is_skipped_without_valid_topics():
@@ -797,18 +870,25 @@ def test_auto_comic_switch_skips_report_trigger():
 
 def test_standalone_comic_command_is_decoupled_from_analysis_permission():
     """手动漫画命令不应直接检查分析名单，避免只开漫画时被分析权限拦住。"""
-    main_path = Path(__file__).parents[1] / "main.py"
-    module = ast.parse(main_path.read_text(encoding="utf-8"), filename=str(main_path))
-    plugin_class = next(
+    handler_path = (
+        Path(__file__).parents[1]
+        / "src"
+        / "application"
+        / "handlers"
+        / "comic_command_handler.py"
+    )
+    module = ast.parse(
+        handler_path.read_text(encoding="utf-8"), filename=str(handler_path)
+    )
+    handler_class = next(
         node
         for node in module.body
-        if isinstance(node, ast.ClassDef) and node.name == "GroupDailyAnalysis"
+        if isinstance(node, ast.ClassDef) and node.name == "ComicCommandHandler"
     )
     method = next(
         node
-        for node in plugin_class.body
-        if isinstance(node, ast.AsyncFunctionDef)
-        and node.name == "generate_group_comic"
+        for node in handler_class.body
+        if isinstance(node, ast.AsyncFunctionDef) and node.name == "handle_group_comic"
     )
     attribute_names = {
         node.attr for node in ast.walk(method) if isinstance(node, ast.Attribute)
@@ -1396,7 +1476,7 @@ def test_comic_delivery_sniffs_cached_file_extension_after_generation(tmp_path):
 
     sent_path = adapter.send_image.await_args.args[1]
     assert sent_path.endswith(".jpg")
-    assert not Path(sent_path).exists()
+    assert Path(sent_path).exists()
     plugin._try_upload_image.assert_awaited_once_with(
         "123456", sent_path, "onebot", is_comic=True
     )
@@ -1432,3 +1512,160 @@ def test_comic_album_upload_sniffs_local_cached_image_extension(tmp_path):
         album_name="comic",
         strict_mode=False,
     )
+
+
+def test_comic_storyboard_assembler_combines_scene_and_panels():
+    """测试分镜分析器在 LLM 输出 scene 头部和 panels 列表时能够完整拼接所有分格提示词。"""
+    from src.infrastructure.analysis.analyzers.comic_analyzer import (
+        ComicStoryboardAnalyzer,
+    )
+
+    analyzer = ComicStoryboardAnalyzer(context=Mock(), config_manager=Mock())
+    llm_output = json.dumps(
+        {
+            "scene": "A 6-panel comic strip featuring an anthropologist observing chat.",
+            "panels": [
+                {
+                    "panel": 1,
+                    "topic": "宽带与搬家记",
+                    "speech_bubble_text": "断网如断魂！",
+                    "caption_strip_text": "宽带受难记",
+                    "prompt": "Panel 1: The anthropologist sits on floor with router. Bubble: 断网如断魂！ Caption: 宽带受难记",
+                },
+                {
+                    "panel": 2,
+                    "topic": "应届生出路",
+                    "prompt": "Panel 2: Multiple screens glowing. Bubble: 迷路之人！ Caption: 毕业迷茫",
+                },
+            ],
+        },
+        ensure_ascii=False,
+    )
+
+    success, result, error = analyzer.parse_structured_response(llm_output)
+    assert success is True
+    assert result is not None
+    assert len(result) == 1
+    scene = result[0]["scene"]
+    assert "A 6-panel comic strip" in scene
+    assert "Panel 1: The anthropologist" in scene
+    assert "Panel 2: Multiple screens" in scene
+    assert "断网如断魂！" in scene
+
+
+def test_comic_storyboard_prompt_contains_good_and_bad_examples():
+    """测试默认分镜 Prompt 模板包含明确的 GOOD / BAD 正反例与全景约束。"""
+    from src.infrastructure.analysis.analyzers.comic_analyzer import (
+        ComicStoryboardAnalyzer,
+    )
+
+    config_mock = Mock()
+    config_mock.get_comic_storyboard_prompt.return_value = ""
+    config_mock.get_max_topics.return_value = 6
+    analyzer = ComicStoryboardAnalyzer(context=Mock(), config_manager=config_mock)
+
+    prompt = analyzer.build_prompt([{"topic": "宽带", "detail": "装宽带"}])
+    assert "GOOD EXAMPLE" in prompt
+    assert "BAD EXAMPLE" in prompt
+    assert "Panel 1" in prompt
+    assert "exact Chinese text" in prompt
+
+
+def test_comic_storyboard_fuzzy_json_consolidation():
+    """测试分镜分析器对任意多层级、自定义键名的未知 JSON 进行递归提取与合并。"""
+    from src.infrastructure.analysis.analyzers.comic_analyzer import (
+        ComicStoryboardAnalyzer,
+    )
+
+    analyzer = ComicStoryboardAnalyzer(context=Mock(), config_manager=Mock())
+
+    # 1. 任意多层嵌套与自定义键名 (如 shots, custom_key)
+    nested_output = json.dumps(
+        {
+            "status": "success",
+            "data": {
+                "header": "A 4-panel comic strip in cyberpunk style.",
+                "story": {
+                    "shots": [
+                        {"description": "Shot 1: Neon city alley with rain."},
+                        {"description": "Shot 2: Terminal glowing with error code."},
+                    ]
+                },
+            },
+        }
+    )
+    success, result, _ = analyzer.parse_structured_response(nested_output)
+    assert success is True
+    assert result is not None
+    scene = result[0]["scene"]
+    assert "A 4-panel comic strip in cyberpunk style." in scene
+    assert "Shot 1: Neon city alley" in scene
+    assert "Shot 2: Terminal glowing" in scene
+
+    # 2. 顶层为数组格式
+    array_output = json.dumps(
+        [
+            {"custom_prompt": "Panel 1: Anime girl drinking coffee."},
+            {"custom_prompt": "Panel 2: Cat jumping onto the table."},
+        ]
+    )
+    success, result, _ = analyzer.parse_structured_response(array_output)
+    assert success is True
+    assert result is not None
+    scene = result[0]["scene"]
+    assert "Panel 1: Anime girl drinking coffee." in scene
+    assert "Panel 2: Cat jumping onto the table." in scene
+
+
+def test_comic_legacy_prompt_auto_migration(tmp_path: Path):
+    """测试 ConfigManager 在初始化时自动将旧版默认提示词迁移为新版 GOOD/BAD 正反例模板。"""
+    from src.infrastructure.analysis.analyzers.comic_analyzer import (
+        DEFAULT_COMIC_STORYBOARD_PROMPT,
+    )
+
+    config_manager_class = load_config_manager_class(tmp_path)
+
+    raw_config = {
+        "prompts": {
+            "comic_analysis_prompts": {
+                "comic_storyboard_prompt": '你是一个资深的漫画分镜师与 AI 绘画提示词专家。\n【核心视觉、台词与双层排版规则】\n请输出包含 "scene" 字段的 JSON 对象。'
+            }
+        },
+        "daily_comic": {
+            "comic_characters": [
+                {
+                    "name": "旧人设",
+                    "storyboard_prompt": '你是一个资深的漫画分镜师与 AI 绘画提示词专家。\n【核心视觉、台词与双层排版规则】\n请输出包含 "scene" 字段的 JSON 对象。',
+                },
+                {
+                    "name": "自定义人设",
+                    "storyboard_prompt": "我的完全自定义专属提示词，不应被覆盖",
+                },
+            ]
+        },
+    }
+
+    class MockConfig(dict):
+        save_config = Mock()
+
+    config_instance = MockConfig(raw_config)
+    _ = config_manager_class(config_instance)
+
+    # 1. 全局旧版默认应被迁移为新版
+    assert (
+        raw_config["prompts"]["comic_analysis_prompts"]["comic_storyboard_prompt"]
+        == DEFAULT_COMIC_STORYBOARD_PROMPT
+    )
+
+    # 2. 角色列表中的旧版默认应被迁移为新版
+    assert (
+        raw_config["daily_comic"]["comic_characters"][0]["storyboard_prompt"]
+        == DEFAULT_COMIC_STORYBOARD_PROMPT
+    )
+
+    # 3. 用户的自定义专属提示词必须完好保留
+    assert (
+        raw_config["daily_comic"]["comic_characters"][1]["storyboard_prompt"]
+        == "我的完全自定义专属提示词，不应被覆盖"
+    )
+    config_instance.save_config.assert_called()

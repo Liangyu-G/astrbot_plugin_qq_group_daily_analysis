@@ -1,35 +1,41 @@
-"""
-群日常分析插件
-基于群聊记录生成精美的日常分析报告，包含话题总结、用户画像、统计数据等
+"""群日常分析插件。
 
-重构版本 - 使用模块化架构，支持跨平台
+基于群聊记录生成日常分析报告，包含话题总结、用户画像与聚合统计数据。
+遵循整洁架构与领域驱动设计 (DDD)，提供跨平台支持与 WebUI 管理能力。
 """
+
+from __future__ import annotations
 
 import asyncio
 import os
-from collections.abc import AsyncGenerator, Callable
+from collections.abc import AsyncGenerator
 from pathlib import Path
-from urllib.parse import quote
+from typing import TYPE_CHECKING
 
 from astrbot.api import AstrBotConfig
-from astrbot.api import logger as astrbot_logger
-from astrbot.api.event import AstrMessageEvent, filter
+from astrbot.api.event import AstrMessageEvent, MessageEventResult, filter
 from astrbot.api.event.filter import PermissionType
 from astrbot.api.star import Context, Star, StarTools
 
-# File is only available via astrbot.core (internal API — may change).
-from astrbot.core.message.components import File
-
-from .src.application.commands.template_command_service import (
-    TemplateCommandService,
+from .src.application.handlers.analysis_command_handler import (
+    AnalysisCommandHandler,
+)
+from .src.application.handlers.comic_command_handler import ComicCommandHandler
+from .src.application.handlers.settings_command_handler import (
+    SettingsCommandHandler,
 )
 from .src.application.services.analysis_application_service import (
     AnalysisApplicationService,
-    DuplicateGroupTaskError,
 )
+from .src.application.services.analysis_trigger_service import AnalysisTriggerService
 from .src.application.services.comic_application_service import ComicApplicationService
+from .src.application.services.crash_recovery_service import CrashRecoveryService
 from .src.application.services.message_processing_service import (
     MessageProcessingService,
+)
+from .src.application.services.report_query_service import ReportQueryService
+from .src.application.services.template_command_service import (
+    TemplateCommandService,
 )
 from .src.domain.services.analysis_domain_service import AnalysisDomainService
 from .src.domain.services.incremental_merge_service import IncrementalMergeService
@@ -38,11 +44,16 @@ from .src.infrastructure.analysis.llm_analyzer import LLMAnalyzer
 from .src.infrastructure.config.config_manager import ConfigManager
 from .src.infrastructure.drawing.drawing_client import DrawingClient
 from .src.infrastructure.messaging.message_sender import MessageSender
+from .src.infrastructure.persistence.checkpoint_store import CheckpointStore
+from .src.infrastructure.persistence.event_deduplication_store import (
+    EventDeduplicationStore,
+)
 from .src.infrastructure.persistence.history_manager import HistoryManager
 from .src.infrastructure.persistence.incremental_store import IncrementalStore
 from .src.infrastructure.persistence.platform_group_registry import (
     PlatformGroupRegistry,
 )
+from .src.infrastructure.persistence.trace_sqlite_store import TraceSQLiteStore
 from .src.infrastructure.platform.bot_manager import BotManager
 from .src.infrastructure.platform.template_preview import (
     TelegramTemplatePreviewHandler,
@@ -51,10 +62,16 @@ from .src.infrastructure.platform.template_preview import (
 from .src.infrastructure.reporting.generators import ReportGenerator
 from .src.infrastructure.scheduler.auto_scheduler import AutoScheduler
 from .src.infrastructure.visualization.activity_charts import ActivityVisualizer
+from .src.infrastructure.webui.active_task_manager import ActiveTaskManager
+from .src.infrastructure.webui.plugin_page_bridge import PluginPageWebUIBridge
 from .src.shared.constants import PLUGIN_NAME
-from .src.shared.trace_context import TraceContext, TraceLogFilter
+from .src.shared.trace_context import TraceContext
 from .src.utils.logger import logger
 from .src.utils.resilience import GlobalRateLimiter
+
+if TYPE_CHECKING:
+    from .src.domain.repositories import PlatformAdapterProtocol
+    from .src.domain.value_objects import AnalysisResultPayload
 
 
 class GroupDailyAnalysis(Star):
@@ -65,8 +82,8 @@ class GroupDailyAnalysis(Star):
     config_manager: ConfigManager
     bot_manager: BotManager
     history_manager: HistoryManager
+    plugin_data_dir: Path
     report_generator: ReportGenerator
-    html_render: Callable
     platform_group_registry: PlatformGroupRegistry
     statistics_service: StatisticsService
     analysis_domain_service: AnalysisDomainService
@@ -74,12 +91,30 @@ class GroupDailyAnalysis(Star):
     incremental_store: IncrementalStore
     incremental_merge_service: IncrementalMergeService
     analysis_service: AnalysisApplicationService
+    drawing_client: DrawingClient
+    comic_service: ComicApplicationService
     message_processing_service: MessageProcessingService
     template_command_service: TemplateCommandService
     telegram_template_preview_handler: TelegramTemplatePreviewHandler
     template_preview_router: TemplatePreviewRouter
     auto_scheduler: AutoScheduler
     message_sender: MessageSender
+    trace_store: TraceSQLiteStore
+    event_dedup_store: EventDeduplicationStore
+    checkpoint_store: CheckpointStore
+    active_task_manager: ActiveTaskManager
+    webui_bridge: PluginPageWebUIBridge
+    crash_recovery_service: CrashRecoveryService
+    settings_command_handler: SettingsCommandHandler
+    comic_command_handler: ComicCommandHandler
+    analysis_command_handler: AnalysisCommandHandler
+    report_query_service: ReportQueryService
+    analysis_trigger_service: AnalysisTriggerService
+    _initialized: bool
+    _terminating: bool
+    _init_lock: asyncio.Lock
+    _init_task: asyncio.Task[None] | None
+    _discovery_run: bool
 
     def __init__(self, context: Context, config: AstrBotConfig):
         super().__init__(context)
@@ -93,11 +128,20 @@ class GroupDailyAnalysis(Star):
         self.history_manager = HistoryManager(self)
 
         plugin_data_dir = StarTools.get_data_dir(PLUGIN_NAME)
+        self.plugin_data_dir = plugin_data_dir
 
         self.report_generator = ReportGenerator(self.config_manager, plugin_data_dir)
 
         # Telegram 注册表 (持久层)
         self.platform_group_registry = PlatformGroupRegistry(self)
+
+        # 1.1 Trace & Checkpoint 基础设施 (持久化)
+        self.trace_store = TraceSQLiteStore(plugin_data_dir / "traces.db")
+        TraceContext.set_global_store(self.trace_store)
+        TraceContext.set_metrics_enabled(
+            self.config_manager.get_enable_runtime_metrics()
+        )
+        self.checkpoint_store = CheckpointStore(plugin_data_dir / "traces.db")
 
         # 2. 领域层
         activity_visualizer = ActivityVisualizer()
@@ -122,6 +166,8 @@ class GroupDailyAnalysis(Star):
             self.analysis_domain_service,
             incremental_store=self.incremental_store,
             incremental_merge_service=self.incremental_merge_service,
+            checkpoint_store=self.checkpoint_store,
+            html_render=self.html_render,
         )
         self.drawing_client = DrawingClient(self.config_manager)
         self.comic_service = ComicApplicationService(
@@ -132,16 +178,21 @@ class GroupDailyAnalysis(Star):
             context=context,
         )
 
+        # 1.15 事件去重持久化仓储
+        self.event_dedup_store = EventDeduplicationStore(plugin_data_dir / "dedup.db")
+        try:
+            self.event_dedup_store.prune_older_than(days=7)
+        except Exception as e:
+            logger.warning(f"[事件去重] 启动清理过期记录失败: {e}")
+
         # 消息处理服务
         self.message_processing_service = MessageProcessingService(
-            context, self.platform_group_registry
+            context,
+            self.platform_group_registry,
+            dedup_store=self.event_dedup_store,
+            config_manager=self.config_manager,
         )
 
-        # 漫画生成并发与同群任务去重。
-        self._comic_semaphore = asyncio.Semaphore(
-            max(1, self.config_manager.get_t2i_max_concurrent())
-        )
-        self._comic_group_tasks: dict[str, asyncio.Task] = {}
         self.template_command_service = TemplateCommandService(
             plugin_root=os.path.dirname(__file__)
         )
@@ -164,11 +215,83 @@ class GroupDailyAnalysis(Star):
             plugin_instance=self,
         )
 
+        # 1.2 WebUI 控制台与 Task Reaper 孤儿回收器
+        self.active_task_manager = ActiveTaskManager(trace_store=self.trace_store)
+        TraceContext.set_active_task_manager(self.active_task_manager)
+        self.active_task_manager.start_reaper(interval_seconds=30, timeout_seconds=180)
+        self.webui_bridge = PluginPageWebUIBridge(
+            context=context,
+            trace_store=self.trace_store,
+            active_task_manager=self.active_task_manager,
+            analysis_service=self.analysis_service,
+            report_dispatcher=self.auto_scheduler.report_dispatcher,
+            report_output_dir=plugin_data_dir / "reports",
+        )
+        self.webui_bridge.register_routes()
+
+        # 开机崩溃对账与自愈恢复服务
+        self.crash_recovery_service = CrashRecoveryService(
+            trace_store=self.trace_store,
+            checkpoint_store=self.checkpoint_store,
+            analysis_service=self.analysis_service,
+            report_dispatcher=self.auto_scheduler.report_dispatcher,
+        )
+
+        # 指令处理器
+        self.settings_command_handler = SettingsCommandHandler(
+            config_manager=self.config_manager,
+            template_command_service=self.template_command_service,
+            template_preview_router=self.template_preview_router,
+            auto_scheduler=self.auto_scheduler,
+            incremental_store=self.incremental_store,
+            incremental_merge_service=self.incremental_merge_service,
+            bot_manager=self.bot_manager,
+            context=context,
+        )
+        self.comic_command_handler = ComicCommandHandler(
+            config_manager=self.config_manager,
+            bot_manager=self.bot_manager,
+            comic_service=self.comic_service,
+            analysis_service=self.analysis_service,
+            active_task_manager=self.active_task_manager,
+            plugin_data_dir=plugin_data_dir,
+            plugin_instance=self,
+        )
+        self.analysis_command_handler = AnalysisCommandHandler(
+            config_manager=self.config_manager,
+            bot_manager=self.bot_manager,
+            analysis_service=self.analysis_service,
+            report_generator=self.report_generator,
+            html_render=self.html_render,
+            active_task_manager=self.active_task_manager,
+            trace_store=self.trace_store,
+            message_sender=self.message_sender,
+            comic_handler=self.comic_command_handler,
+            plugin_data_dir=plugin_data_dir,
+            plugin_instance=self,
+        )
+
+        # 6. LLM Tool 业务服务
+        self.report_query_service = ReportQueryService(
+            config_manager=self.config_manager,
+            checkpoint_store=self.checkpoint_store,
+            history_manager=self.history_manager,
+            trace_store=self.trace_store,
+        )
+        self.analysis_trigger_service = AnalysisTriggerService(
+            config_manager=self.config_manager,
+            analysis_service=self.analysis_service,
+            report_query_service=self.report_query_service,
+            active_task_manager=self.active_task_manager,
+            trace_store=self.trace_store,
+            report_dispatcher=self.auto_scheduler.report_dispatcher,
+        )
+
         # 同步全局限流并进行初始化配置
         GlobalRateLimiter.get_instance(self.config_manager.get_llm_max_concurrent())
 
         self._initialized = False
-        self._terminating = False  # 生命周期标志
+        self._terminating = False
         self._init_lock = asyncio.Lock()
         self._background_tasks: set[asyncio.Task] = set()
 
@@ -183,28 +306,19 @@ class GroupDailyAnalysis(Star):
         except RuntimeError:
             self._init_task = None
 
-    # orchestrators 缓存已移至 应用层逻辑 (分析服务) 或 暂时移除以简化。
-    # 如果需要高性能缓存，后续可由 AnalysisApplicationService 内部维护。
-
     @filter.on_platform_loaded()
     async def on_platform_loaded(self):
         """平台加载完成后初始化"""
         await self._run_initialization("Platform Loaded")
 
     async def initialize(self):
-        """在 AstrBot 插件生命周期中确认初始化已经完成。
-
-        Returns:
-            None: 初始化任务完成或恢复初始化完成后返回。
-        """
-        init_task = getattr(self, "_init_task", None)
+        """在 AstrBot 插件生命周期中确认初始化已经完成。"""
+        init_task = self._init_task
         if init_task is None:
             await self._run_initialization("Plugin Lifecycle")
             return
 
         try:
-            # 构造函数中的任务负责避免阻塞 AstrBot 启动；生命周期入口负责等待
-            # 它完成，确保插件重载不会在平台刷新之前被判定为加载成功。
             await asyncio.shield(init_task)
         except asyncio.CancelledError:
             if self._terminating:
@@ -217,32 +331,15 @@ class GroupDailyAnalysis(Star):
             await self._run_initialization("Plugin Lifecycle Recovery")
 
     async def _run_initialization(self, source: str):
-        """执行插件初始化，避免阻塞平台启动流程。
-
-        Args:
-            source: 触发本次初始化的来源标识。
-
-        Returns:
-            None: 就地完成插件状态初始化或刷新。
-        """
+        """执行插件初始化，避免阻塞平台启动流程。"""
         async with self._init_lock:
             if self._terminating or not self.bot_manager:
                 return
 
             try:
-                # 核心配置迁移和定时任务只执行一次。
                 if not self._initialized:
-                    # 注册 TraceID 过滤器。
-                    trace_filter = TraceLogFilter()
-                    if not any(
-                        isinstance(f, TraceLogFilter) for f in astrbot_logger.filters
-                    ):
-                        astrbot_logger.addFilter(trace_filter)
-                        astrbot_logger.info("[Trace] 已启用 TraceID 日志追踪")
-
                     logger.info(f"开始初始化插件（来源：{source}）...")
 
-                    # 升级旧版 prompt 模板并回写迁移后的配置。
                     try:
                         self.config_manager.upgrade_prompt_templates()
                     except Exception as e:
@@ -253,11 +350,8 @@ class GroupDailyAnalysis(Star):
                     except Exception as e:
                         logger.warning(f"迁移旧版配置失败：{e}")
 
-                # AstrBot 会为每个平台调用一次此回调。平台发现只检查已创建的
-                # 平台对象，可以安全重复执行；这样后加载的平台也不会被遗漏。
                 await self.bot_manager.initialize_from_config()
 
-                # 模板预览处理器依赖平台实例，因此每个平台加载时都要刷新。
                 if self.template_preview_router:
                     await self.template_preview_router.ensure_handlers_registered(
                         self.context
@@ -269,10 +363,21 @@ class GroupDailyAnalysis(Star):
                     )
                     return
 
-                # 插件基础设施准备完成后注册定时任务。
                 if self.auto_scheduler:
                     self.auto_scheduler.schedule_jobs(self.context)
                     await self.auto_scheduler.start_incremental_trigger()
+
+                crash_recovery = getattr(self, "crash_recovery_service", None)
+                if crash_recovery:
+                    try:
+                        loop = asyncio.get_running_loop()
+                        recovery_task = loop.create_task(
+                            crash_recovery.recover_crashed_tasks()
+                        )
+                        self._background_tasks.add(recovery_task)
+                        recovery_task.add_done_callback(self._background_tasks.discard)
+                    except RuntimeError:
+                        pass
 
                 self._initialized = True
                 self._discovery_run = True
@@ -287,24 +392,24 @@ class GroupDailyAnalysis(Star):
             return
         self._terminating = True
 
+        self.analysis_command_handler.set_terminating(True)
+        self.comic_command_handler.set_terminating(True)
+
         try:
             logger.info("开始清理群日常分析插件资源...")
 
-            # 1. 停止所有后台任务
             if self._background_tasks:
                 logger.info(f"正在取消 {len(self._background_tasks)} 个运行中的任务...")
                 for task in self._background_tasks:
                     if not task.done():
                         task.cancel()
 
-                # 等待任务结束，给予 3 秒宽限期
                 try:
                     await asyncio.wait(list(self._background_tasks), timeout=3.0)
                 except Exception:
                     pass
                 self._background_tasks.clear()
 
-            # 2. 停止各个组件 (顺序：先调度器，后底层服务)
             if self.auto_scheduler:
                 logger.debug("正在停止自动调度器...")
                 await self.auto_scheduler.shutdown(self.context)
@@ -315,11 +420,13 @@ class GroupDailyAnalysis(Star):
             if self.report_generator:
                 await self.report_generator.close()
 
-            # 3. [关键修复] 只有在任务全部清理后，才清理引用。
-            # 实际上，在 terminate 结束后，self 本身就会被 GC 释放，
-            # 这里的显式 None 更多是为了协助循环引用清理，但由于异步任务存在竞态，
-            # 我们可以通过 check _terminating 标志位来保护。
-            # 为了彻底解决 #125，我们保留引用，让 GC 自然回收。
+            if hasattr(self, "event_dedup_store"):
+                try:
+                    self.event_dedup_store.prune_older_than(days=7)
+                except Exception:
+                    pass
+                self.event_dedup_store.close()
+
             logger.info("群日常分析插件资源清理完成")
 
         except Exception as e:
@@ -332,32 +439,46 @@ class GroupDailyAnalysis(Star):
         priority=100,
     )
     async def count_incremental_group_message(self, event: AstrMessageEvent):
-        """记录目标群消息，达到配置阈值后触发增量分析。
-
-        Args:
-            event: AstrBot 群消息事件。
-
-        Returns:
-            None: 计数完成后继续消息流水线。
-        """
-        # QQ 官方和 Telegram 会在各自的持久化钩子成功后计数，避免任务先于入库启动。
+        """记录目标群消息，达到配置阈值后触发增量分析。"""
+        if not self.bot_manager.is_plugin_enabled(
+            event.get_platform_id(), PLUGIN_NAME, group_id=event.get_group_id()
+        ):
+            return
         if str(event.get_platform_name() or "").strip().lower() in {
             "qq_official",
             "qq_official_webhook",
             "telegram",
+            "satori",
         }:
             return
         if self.auto_scheduler:
             await self.auto_scheduler.record_incremental_message(event)
 
     @filter.event_message_type(filter.EventMessageType.GROUP_MESSAGE)
+    @filter.platform_adapter_type(filter.PlatformAdapterType.SATORI)
+    async def intercept_satori_messages(self, event: AstrMessageEvent):
+        """拦截 Satori 群消息并存储到本地数据库"""
+        if not self.bot_manager.is_plugin_enabled(
+            event.get_platform_id(), PLUGIN_NAME, group_id=event.get_group_id()
+        ):
+            return
+        try:
+            stored = await self.message_processing_service.process_message(event)
+            if stored and self.auto_scheduler:
+                await self.auto_scheduler.record_incremental_message(event)
+        except (ValueError, RuntimeError) as e:
+            logger.warning(f"[Satori] 消息存储失败: {e}")
+        except Exception as e:
+            logger.error(f"[Satori] 消息存储异常: {e}", exc_info=True)
+
+    @filter.event_message_type(filter.EventMessageType.GROUP_MESSAGE)
     @filter.platform_adapter_type(filter.PlatformAdapterType.TELEGRAM)
     async def intercept_telegram_messages(self, event: AstrMessageEvent):
-        """
-        拦截 Telegram 群消息并存储到数据库
-
-        委托给 MessageProcessingService 处理
-        """
+        """拦截 Telegram 群消息并存储到数据库"""
+        if not self.bot_manager.is_plugin_enabled(
+            event.get_platform_id(), PLUGIN_NAME, group_id=event.get_group_id()
+        ):
+            return
         try:
             stored = await self.message_processing_service.process_message(event)
             if stored and self.auto_scheduler:
@@ -373,8 +494,13 @@ class GroupDailyAnalysis(Star):
         | filter.PlatformAdapterType.QQOFFICIAL_WEBHOOK
     )
     async def intercept_qq_official_messages(self, event: AstrMessageEvent):
-        """缓存 QQ 官方机器人群消息；频道消息不在本插件适配范围内。"""
-        raw_message = getattr(getattr(event, "message_obj", None), "raw_message", None)
+        """缓存 QQ 官方机器人群消息"""
+        if not self.bot_manager.is_plugin_enabled(
+            event.get_platform_id(), PLUGIN_NAME, group_id=event.get_group_id()
+        ):
+            return
+        msg_obj = event.message_obj
+        raw_message = msg_obj.raw_message if msg_obj else None
         if isinstance(raw_message, dict):
             author = raw_message.get("author") or {}
             group_openid = str(raw_message.get("group_openid", "") or "").strip()
@@ -419,16 +545,12 @@ class GroupDailyAnalysis(Star):
     async def get_telegram_seen_group_ids(
         self, platform_id: str | None = None
     ) -> list[str]:
-        """读取 Telegram 已见群/话题列表（给调度器回退使用）。"""
         return await self.platform_group_registry.get_all_group_ids(platform_id)
 
     async def get_seen_group_ids(self, platform_id: str | None = None) -> list[str]:
-        """读取任意事件驱动平台已经见过的群组。"""
         return await self.platform_group_registry.get_all_group_ids(platform_id)
 
     def _get_group_id_from_event(self, event: AstrMessageEvent) -> str | None:
-        """从消息事件中安全获取群组 ID"""
-        # 保留此辅助方法，因为在其他 command 中仍被频繁使用
         try:
             group_id = event.get_group_id()
             return group_id if group_id else None
@@ -436,23 +558,226 @@ class GroupDailyAnalysis(Star):
             return None
 
     def _get_platform_id_from_event(self, event: AstrMessageEvent) -> str:
-        """从消息事件中获取平台唯一 ID"""
-        # 保留此辅助方法，因为在其他 command 中仍被频繁使用
         try:
             return event.get_platform_id()
         except Exception:
-            # 后备方案：从元数据获取
-            if (
-                hasattr(event, "platform_meta")
-                and event.platform_meta
-                and hasattr(event.platform_meta, "id")
-            ):
-                return event.platform_meta.id
+            if event.platform_meta and hasattr(event.platform_meta, "id"):
+                return str(event.platform_meta.id)
             return "default"
 
-    # ================================================================
-    # 图片报告上传到群文件 / 群相册（仅 QQ 平台 image 格式）
-    # ================================================================
+    # ==================== 指令注册与分发 ====================
+
+    @filter.command("群分析", alias={"group_analysis"})
+    @filter.permission_type(PermissionType.ADMIN)
+    async def analyze_group_daily(
+        self, event: AstrMessageEvent, days: int | None = None
+    ) -> AsyncGenerator[MessageEventResult]:
+        """分析群聊日常活动（跨平台支持）"""
+        async for result in self.analysis_command_handler.handle_daily_analysis(
+            event, days
+        ):
+            yield result
+
+    @filter.command("群漫画", alias={"group_comic", "daily_comic"})
+    @filter.permission_type(PermissionType.ADMIN)
+    async def generate_group_comic(
+        self, event: AstrMessageEvent, days: int | None = None
+    ) -> AsyncGenerator[MessageEventResult]:
+        """生成群聊趣味漫画（跨平台支持）"""
+        async for result in self.comic_command_handler.handle_group_comic(event, days):
+            yield result
+
+    @filter.command("设置格式", alias={"set_format"})
+    @filter.permission_type(PermissionType.ADMIN)
+    async def set_output_format(
+        self, event: AstrMessageEvent, format_input: str = ""
+    ) -> AsyncGenerator[MessageEventResult]:
+        """设置分析报告输出格式（跨平台支持）"""
+        async for result in self.settings_command_handler.handle_set_output_format(
+            event, format_input
+        ):
+            yield result
+
+    @filter.command("设置模板", alias={"set_template"})
+    @filter.permission_type(PermissionType.ADMIN)
+    async def set_report_template(
+        self, event: AstrMessageEvent, template_input: str = ""
+    ) -> AsyncGenerator[MessageEventResult]:
+        """设置分析报告模板（跨平台支持）"""
+        async for result in self.settings_command_handler.handle_set_report_template(
+            event, template_input
+        ):
+            yield result
+
+    @filter.command("查看模板", alias={"view_templates"})
+    @filter.permission_type(PermissionType.ADMIN)
+    async def view_templates(
+        self, event: AstrMessageEvent
+    ) -> AsyncGenerator[MessageEventResult]:
+        """查看所有可用的报告模板及预览图（跨平台支持）"""
+        platform_id = str(self._get_platform_id_from_event(event) or "")
+        async for result in self.settings_command_handler.handle_view_templates(
+            event, platform_id
+        ):
+            yield result
+
+    @filter.command("分析设置", alias={"analysis_settings"})
+    @filter.permission_type(PermissionType.ADMIN)
+    async def analysis_settings(
+        self, event: AstrMessageEvent, action: str = "status"
+    ) -> AsyncGenerator[MessageEventResult]:
+        """管理分析设置（跨平台支持）"""
+        group_id = str(self._get_group_id_from_event(event) or "")
+        platform_id = str(self._get_platform_id_from_event(event) or "")
+        async for result in self.settings_command_handler.handle_analysis_settings(
+            event, action, str(group_id), platform_id
+        ):
+            yield result
+
+    @filter.command("增量状态", alias={"incremental_status"})
+    @filter.permission_type(PermissionType.ADMIN)
+    async def incremental_status(
+        self, event: AstrMessageEvent
+    ) -> AsyncGenerator[MessageEventResult]:
+        """查看当前增量分析状态（滑动窗口）"""
+        group_id = str(self._get_group_id_from_event(event) or "")
+        async for result in self.settings_command_handler.handle_incremental_status(
+            event, str(group_id)
+        ):
+            yield result
+
+    async def _refresh_incremental_target_states(self) -> None:
+        """在插件内修改名单后立即同步增量状态。"""
+        await self.settings_command_handler._refresh_incremental_target_states()
+
+    # ==================== LLM Tool 函数调用注册 ====================
+
+    @filter.llm_tool("group_daily_analysis_get_report")
+    async def get_daily_report(
+        self,
+        event: AstrMessageEvent,
+        report_section: str = "全部",
+        date_range: str = "",
+        group: str = "",
+    ) -> str:
+        """查询指定群聊的历史日常分析报告、话题总结与金句统计归档。
+
+        【触发准则 (Trigger Rule)】
+        - 仅当用户明确询问群聊总结、群日报、历史讨论话题、群友称号画像、群金句、发言活跃度等已有分析记录时调用。
+        - 【重要交互原则】在群聊环境中查询时，大模型切勿反问用户群号，直接留空 group 参数发起查询！
+        - 【负向禁令】严禁用于普通闲聊、询问当前即时消息、实时天气或要求重新生成/更新报告的操作；若用户要求重新分析请调用 trigger 工具。
+
+        【参数规范 (Arguments)】:
+        Args:
+            report_section (string): 需要检索的报告模块，必须严格为以下枚举项或组合：'全部'（默认）、'话题'、'用户称号'、'金句'、'聊天质量分析'。多选使用逗号分隔，例如 '话题,金句'。
+            date_range (string): 报告查询日期。格式规范：留空或 '最新'（获取最新一份）；单日 'YYYY-MM-DD'（如 '2026-10-02'）；相对日期如 '今天'、'昨天'；范围 'YYYY-MM-DD~YYYY-MM-DD'（如 '2026-10-01~2026-10-03'，最大跨度30天）。
+            group (string): 目标群聊标识。默认留空（群聊场景下务必留空，系统将自动定位当前群）。仅在私聊或明确要求跨群查询时，填写数字群号（如 '680787260'）或群名称关键字（如 '开发交流群'）。
+
+        【调用示范 (Few-Shot)】:
+        - 群友在群里：“今天群里聊了些啥？” -> report_section="全部", date_range="", group=""
+        - 群友在群里：“看看昨天的群金句和精彩语录” -> report_section="金句", date_range="昨天", group=""
+        - 群友在群里：“前天群里有人聊买车吗？” -> report_section="话题", date_range="前天", group=""
+        - 群友在群里：“国庆前三天群里讨论了什么话题？” -> report_section="话题", date_range="2026-10-01~2026-10-03", group=""
+        - 用户在私聊：“帮我看看开发交流群昨天的日报” -> report_section="全部", date_range="昨天", group="开发交流群"
+        - 用户在私聊：“查一下群 680787260 最新报告” -> report_section="全部", date_range="", group="680787260"
+        """
+        # 1. 目标群聊智能解析
+        current_event_group_id = (
+            str(event.get_group_id())
+            if hasattr(event, "get_group_id") and event.get_group_id()
+            else None
+        )
+        target_group_id, matched_name, candidates = (
+            self.report_query_service.resolve_target_group(
+                group_input=group,
+                current_event_group_id=current_event_group_id,
+            )
+        )
+
+        if candidates:
+            cand_lines = [
+                f"{i}. {c.get('group_name', '未知')} ({c.get('group_id')})"
+                for i, c in enumerate(candidates, 1)
+            ]
+            return (
+                f"检测到多个名称匹配 '{group}' 的群聊，请指明具体群号或准确名称重试：\n"
+                + "\n".join(cand_lines)
+            )
+
+        if not target_group_id:
+            if not group and not current_event_group_id:
+                return (
+                    "[提示] 当前处于私聊会话中，请在提问时指明目标群聊名称或群号"
+                    "（例如：“帮我看看开发交流群昨天的日报”）。"
+                )
+            return f"未能定位到群聊 '{group}'。建议直接提供纯数字群号重新查询。"
+
+        # 2. 群权限白名单校验
+        if not self.config_manager.is_group_allowed(target_group_id):
+            return f"群聊 {matched_name or target_group_id} 未在群分析启用名单中，暂无分析数据。"
+
+        # 3. 日期范围解析
+        start_date, end_date, err = self.report_query_service.parse_date_range(
+            date_range
+        )
+        if err:
+            return f"[参数错误] {err}"
+
+        # 4. 执行多维检索
+        return await self.report_query_service.query_reports(
+            group_id=target_group_id,
+            start_date=start_date,
+            end_date=end_date,
+            report_section=report_section,
+        )
+
+    @filter.llm_tool("group_daily_analysis_trigger")
+    async def trigger_daily_analysis(
+        self,
+        event: AstrMessageEvent,
+        analysis_sections: str = "全部",
+        days: int = 1,
+        group: str = "",
+        render_to_chat: bool = True,
+    ) -> str:
+        """按需触发群聊聊天记录分析流水线（默认在分析完成后自动渲染长图并发送至群聊）。
+
+        【触发准则 (Trigger Rule)】
+        - 仅当管理员明确要求“重新分析”、“更新日报”、“提取最新群聊金句/话题”等主动执行后台计算的意图时调用。
+        - 【重要交互原则】普通查询历史事实请严格调用 get_report 工具，严禁随意触发本工具！在群聊中触发时 group 必须留空。
+        - 【交互提示】本工具在后台异步执行，默认（render_to_chat=True）会在计算完成后自动将精美长图发送到群里。受理成功后请明确告知用户分析已启动、长图稍后会自动发群，切勿虚构假分析结果。若用户明确要求“静默更新/后台计算不发群”，可将 render_to_chat 设为 False。
+        - 【负向禁令】严禁用于闲聊、单纯询问已有数据；仅管理员具备触发权限。
+
+        【参数规范 (Arguments)】:
+        Args:
+            analysis_sections (string): 本次需要执行的分析模块：'全部'（默认）、'话题'、'用户称号'、'金句'、'聊天质量分析'。多选逗号分隔。
+            days (number): 分析回溯天数，默认 1（当天或最近24小时），最大允许 7。
+            group (string): 目标群聊标识。默认留空（自动定位当前群聊）。私聊中可填数字群号或群名称。
+            render_to_chat (boolean): 是否在分析完成后自动渲染并向群聊发送长图报告。默认为 True。仅当用户明确要求静默入库时设为 False。
+
+        【调用示范 (Few-Shot)】:
+        - 管理员在群里：“重新分析一下今天的群聊” -> analysis_sections="全部", days=1, group="", render_to_chat=True
+        - 管理员在群里：“帮我提取一下今天群里的金句” -> analysis_sections="金句", days=1, group="", render_to_chat=True
+        - 管理员在群里：“静默更新一下日报数据库，不要发图” -> analysis_sections="全部", days=1, group="", render_to_chat=False
+        - 管理员在私聊：“更新一下开发交流群的日报” -> analysis_sections="全部", days=1, group="开发交流群", render_to_chat=True
+        """
+        return await self.analysis_trigger_service.trigger_analysis(
+            event=event,
+            analysis_sections=analysis_sections,
+            days=days,
+            group=group,
+            render_to_chat=render_to_chat,
+        )
+
+    # ==================== 兼容性私有方法代理转发 ====================
+
+    async def _send_analysis_report(
+        self, event: AstrMessageEvent, result: dict[str, object]
+    ) -> AsyncGenerator[MessageEventResult]:
+        async for res in self.analysis_command_handler.send_analysis_report(
+            event, result
+        ):
+            yield res
 
     async def _try_upload_image(
         self,
@@ -460,1116 +785,71 @@ class GroupDailyAnalysis(Star):
         image_url: str,
         platform_id: str | None,
         is_comic: bool = False,
-    ):
-        """
-        尝试将图片报告上传到群文件和/或群相册（静默处理，失败仅日志提示）。
-        """
-        import base64
-        import re
-        import tempfile
-        from datetime import datetime
-
+    ) -> None:
         if is_comic:
-            enable_file = False  # 我们通常不把漫画作为文件上传，或者可以复用 enable_group_file_upload
-            enable_album = self.config_manager.get_enable_comic_album_upload()
+            await self.comic_command_handler._try_upload_image(
+                group_id, image_url, platform_id, is_comic=True
+            )
         else:
-            enable_file = self.config_manager.get_enable_group_file_upload()
-            enable_album = self.config_manager.get_enable_group_album_upload()
-
-        if not enable_file and not enable_album:
-            return
-
-        adapter = self.bot_manager.get_adapter(platform_id)
-        if not adapter:
-            return
-        if enable_file and not hasattr(adapter, "upload_group_file_to_folder"):
-            logger.warning(f"群 {group_id} 的适配器不支持群文件上传。")
-            enable_file = False
-        if enable_album and not hasattr(adapter, "upload_group_album"):
-            logger.warning(f"群 {group_id} 的适配器不支持群相册上传。")
-            enable_album = False
-        if not enable_file and not enable_album:
-            return
-
-        # 1. 记录文件名的公共部分。漫画真实格式必须在读取图片字节后决定，
-        # 不能依据已经删除的全局输出格式，也不能盲信外部后端返回的文件后缀。
-        now = datetime.now()
-        timestamp = now.strftime("%H%M")
-        date_str = now.strftime("%Y-%m-%d")
-        filename_stem = f"群分析报告_{group_id}_{date_str}_{timestamp}"
-        try:
-            # 尝试通过适配器获取群名称，使文件名更具辨识度
-            group_info = await adapter.get_group_info(group_id)
-            if group_info and group_info.group_name:
-                # 过滤非法文件名字符：\ / : * ? " < > |
-                safe_name = re.sub(r'[\\/:*?"<>|]', "", group_info.group_name).strip()
-                if safe_name:
-                    filename_stem = f"群分析报告_{safe_name}_{date_str}_{timestamp}"
-        except Exception:
-            pass
-
-        # 2. 将内容准备为文件或数据
-        image_file = None
-        created_temp = False
-        MAX_PAYLOAD_SIZE = 20 * 1024 * 1024  # 20MB 限制
-
-        try:
-            data = None
-            if image_url.startswith("base64://"):
-                base64_str = image_url[len("base64://") :]
-                if len(base64_str) * 3 / 4 > MAX_PAYLOAD_SIZE:
-                    logger.warning("图片上传失败：Base64 负载过大")
-                    return
-                data = base64.b64decode(base64_str)
-            elif image_url.startswith("data:"):
-                parts = image_url.split(",", 1)
-                if len(parts) == 2:
-                    if len(parts[1]) * 3 / 4 > MAX_PAYLOAD_SIZE:
-                        logger.warning("图片上传失败：Data URI 负载过大")
-                        return
-                    data = base64.b64decode(parts[1])
-            elif os.path.isfile(image_url):
-                image_file = os.path.abspath(image_url)
-
-            if is_comic:
-                # 缓存文件通常已有正确后缀，但上传入口也允许接收 Base64/Data URI。
-                # 对本地文件读取少量头部字节即可，不需要把大图完整载入内存。
-                image_header = data
-                if image_header is None and image_file:
-                    with open(image_file, "rb") as image_stream:
-                        image_header = image_stream.read(32)
-                ext = self._detect_image_ext(image_header or b"")
-            else:
-                ext = (
-                    ".jpg"
-                    if (".jpg" in image_url.lower() or ".jpeg" in image_url.lower())
-                    else ".png"
-                )
-            nice_filename = f"{filename_stem}{ext}"
-
-            if data and not image_file:
-                # 使用 tempfile 生成唯一后缀，防止并发冲突
-                fd, image_file = tempfile.mkstemp(suffix=ext, prefix="group_report_")
-                try:
-                    with os.fdopen(fd, "wb") as f:
-                        f.write(data)
-                    created_temp = True
-                except Exception:
-                    os.close(fd)
-                    raise
-
-            if not image_file:
-                return
-
-            # 3. 执行上传：群文件
-            if enable_file:
-                try:
-                    folder_name = self.config_manager.get_group_file_folder()
-                    folder_id = None
-                    if folder_name:
-                        folder_id = await adapter.find_or_create_folder(  # type: ignore[attr-defined]
-                            group_id, folder_name
-                        )
-                    await adapter.upload_group_file_to_folder(  # type: ignore[attr-defined]
-                        group_id=group_id,
-                        file_path=image_file,
-                        folder_id=folder_id,
-                        filename=nice_filename,  # 显式传递漂亮的文件名
-                    )
-                except Exception as e:
-                    logger.warning(f"群文件上传失败 (群 {group_id}): {e}")
-
-            if enable_album:
-                try:
-                    if is_comic:
-                        album_name = self.config_manager.get_comic_album_name()
-                        # 漫画相册与报告相册共用同一个 strict_mode 配置，
-                        # 若日后需要独立控制，可为漫画单独添加配置项。
-                        strict_mode = self.config_manager.get_group_album_strict_mode()
-                    else:
-                        album_name = self.config_manager.get_group_album_name()
-                        strict_mode = self.config_manager.get_group_album_strict_mode()
-
-                    upload_label = "漫画相册" if is_comic else "群相册"
-                    # 严格模式下，名称为空时提前拦截，不再依赖适配器判断
-                    if strict_mode and not album_name:
-                        logger.info(
-                            f"{upload_label}严格模式开启：未设置目标相册名称，停止上传以防止操作群 {group_id} 的默认相册。"
-                        )
-                    elif hasattr(adapter, "upload_group_album"):
-                        # 查找和兜底逻辑统一由适配器处理：
-                        #   - strict_mode=True + 找不到相册 → 适配器会拒绝上传
-                        #   - strict_mode=False + 找不到相册 → 适配器会回退到默认相册
-                        await adapter.upload_group_album(  # type: ignore[attr-defined]
-                            group_id,
-                            image_file,
-                            album_id=None,
-                            album_name=album_name,
-                            strict_mode=strict_mode,
-                        )
-                    else:
-                        logger.warning(f"群 {group_id} 的适配器不支持群相册上传。")
-                except Exception as e:
-                    logger.warning(f"群相册上传失败 (群 {group_id}): {e}")
-        except Exception as e:
-            logger.warning(f"图片上传处理异常: {e}")
-        finally:
-            if created_temp and image_file and os.path.exists(image_file):
-                try:
-                    os.remove(image_file)
-                except OSError:
-                    pass
-
-    @filter.command("群分析", alias={"group_analysis"})
-    @filter.permission_type(PermissionType.ADMIN)
-    async def analyze_group_daily(
-        self, event: AstrMessageEvent, days: int | None = None
-    ):
-        """
-        分析群聊日常活动（跨平台支持）
-        用法: /群分析 [天数]
-        """
-        if self._terminating:
-            return
-
-        current_task = asyncio.current_task()
-        if current_task:
-            self._background_tasks.add(current_task)
-
-        try:
-            event.should_call_llm(True)  # 阻止默认 LLM 解析
-            group_id = self._get_group_id_from_event(event)
-            platform_id = self._get_platform_id_from_event(event)
-
-            if not group_id:
-                yield event.plain_result("❌ 请在群聊中使用此命令")
-                return
-
-            # 更新bot实例
-            self.bot_manager.update_from_event(event)
-
-            # 优先使用 UMO 进行权限检查 (兼容白名单 UMO 格式)
-            check_target = getattr(event, "unified_msg_origin", None)
-            if not check_target:
-                check_target = f"{platform_id}:GroupMessage:{group_id}"
-
-            if not self.config_manager.is_group_allowed(check_target):
-                # Fallback checks (simple ID) are handled inside is_group_allowed logic if list item has no colon
-                # But if list item HAS colon, we need precise match.
-                # If prompt fails, try simple ID as fallback for permissive cases?
-                # No, config_manager.is_group_allowed already handles simple ID matching if whitelist item is simple ID.
-                yield event.plain_result("❌ 此群未启用日常分析功能")
-                return
-
-            # 获取群名以生成语义化的 TraceID
-            group_name = ""
-            try:
-                adapter = self.bot_manager.get_adapter(platform_id)
-                if adapter:
-                    info = await adapter.get_group_info(group_id)
-                    if info and info.group_name:
-                        group_name = info.group_name
-            except Exception:
-                pass
-
-            # 设置 TraceID (语义化格式: manual_群名_HHmm)
-            trace_id = TraceContext.generate(
-                prefix="manual", group_name=group_name or group_id
-            )
-            TraceContext.set(trace_id)
-
-            # 表情回应 或 文本提示（二选一，由配置开关控制）
-            adapter = self.bot_manager.get_adapter(platform_id)
-            orig_msg_id = getattr(event.message_obj, "message_id", None)
-            adapter_platform_name = (
-                (adapter.get_platform_name() if adapter else "").strip().lower()
-            )
-            # QQ 官方机器人 API v2 不支持本插件使用的表情回应接口，
-            # 因此始终沿用原有的文字进度提示，避免触发无效的 reaction 请求。
-            use_text_reply = (
-                adapter_platform_name in {"qq_official", "qq_official_webhook"}
-                or self.config_manager.get_enable_analysis_reply()
+            await self.analysis_command_handler._try_upload_image(
+                group_id, image_url, platform_id, is_comic=False
             )
 
-            if use_text_reply:
-                yield event.plain_result("🔍 正在启动分析引擎，正在拉取最近消息...")
-            elif adapter and orig_msg_id:
-                await adapter.set_reaction(
-                    event.get_group_id(), orig_msg_id, "analysis_started"
-                )
+    def _save_report_to_history(
+        self, image_url: str, group_id: str, trace_id: str | None = None
+    ) -> None:
+        self.analysis_command_handler._save_report_to_history(
+            image_url, group_id, trace_id=trace_id
+        )
 
-            # 调用 DDD 应用级服务
-            result = await self.analysis_service.execute_daily_analysis(
-                group_id=group_id, platform_id=platform_id, manual=True, days=days
-            )
-
-            if not result.get("success"):
-                reason = result.get("reason")
-                if reason == "no_messages":
-                    yield event.plain_result("❌ 未找到足够的群聊记录")
-                elif reason == "muted":
-                    logger.warning(
-                        f"群 {group_id} 开启了全群禁言或对 Bot 禁言，跳过回复以防抛出发送异常"
-                    )
-                else:
-                    yield event.plain_result("❌ 分析失败，原因未知")
-                return
-
-            if not use_text_reply and adapter and orig_msg_id:
-                await adapter.set_reaction(
-                    event.get_group_id(), orig_msg_id, "analysis_done"
-                )
-
-            async for res in self._send_analysis_report(event, result):
-                yield res
-
-        except DuplicateGroupTaskError:
-            yield event.plain_result("📊 该群的分析任务正在执行中，请稍后再试哦~")
-        except asyncio.CancelledError:
-            logger.info("群分析任务被取消 (插件重载或卸载)")
-        except Exception as e:
-            logger.error(f"群分析失败: {e}", exc_info=True)
-            yield event.plain_result(
-                f"❌ 分析失败: {str(e)}。请检查网络连接和LLM配置，或联系管理员"
-            )
-        finally:
-            if current_task:
-                self._background_tasks.discard(current_task)
-
-    @filter.command("群漫画", alias={"group_comic", "daily_comic"})
-    @filter.permission_type(PermissionType.ADMIN)
-    async def generate_group_comic(
-        self, event: AstrMessageEvent, days: int | None = None
-    ):
-        """
-        生成群聊趣味漫画（跨平台支持）
-        用法: /群漫画 [天数]
-        """
-        if self._terminating:
-            return
-
-        current_task = asyncio.current_task()
-        if current_task:
-            self._background_tasks.add(current_task)
-
-        try:
-            event.should_call_llm(True)
-            group_id = self._get_group_id_from_event(event)
-            platform_id = self._get_platform_id_from_event(event)
-
-            if not group_id:
-                yield event.plain_result("❌ 请在群聊中使用此命令")
-                return
-
-            self.bot_manager.update_from_event(event)
-
-            check_target = getattr(event, "unified_msg_origin", None)
-            if not check_target:
-                check_target = f"{platform_id}:GroupMessage:{group_id}"
-
-            if not self.config_manager.get_enable_daily_comic():
-                yield event.plain_result("❌ 漫画生成功能未启用")
-                return
-
-            if not self.config_manager.is_comic_group_allowed(check_target):
-                yield event.plain_result("❌ 此群未启用漫画生成功能")
-                return
-
-            task_key = f"{platform_id or 'default'}:{group_id}"
-            existing_task = self._comic_group_tasks.get(task_key)
-            if existing_task and not existing_task.done():
-                yield event.plain_result("🎨 该群已有漫画任务正在执行，请稍后再试哦~")
-                return
-
-            TraceContext.set(TraceContext.generate(prefix="comic", group_name=group_id))
-            yield event.plain_result("🎨 正在提取群聊话题并生成漫画...")
-
-            result = await self.analysis_service.execute_comic_topic_analysis(
-                group_id=group_id, platform_id=platform_id, days=days
-            )
-            if not result.get("success"):
-                reason = result.get("reason")
-                if reason == "no_messages":
-                    yield event.plain_result("❌ 未找到可用于生成漫画的群聊记录")
-                elif reason == "no_topics":
-                    yield event.plain_result("❌ 未提取到可用于生成漫画的话题")
-                elif reason == "muted":
-                    logger.warning(
-                        "群 %s 开启了禁言，跳过手动漫画回复",
-                        group_id,
-                    )
-                else:
-                    yield event.plain_result("❌ 漫画话题提取失败，原因未知")
-                return
-
-            status = self._try_trigger_comic_generation(
-                group_id,
-                platform_id,
-                {"topics": result.get("topics", [])},
-                require_auto_enabled=False,
-            )
-            if status == "started":
-                yield event.plain_result("✅ 漫画生成任务已启动，完成后会发送到群里")
-            elif status == "duplicate":
-                yield event.plain_result("🎨 该群已有漫画任务正在执行，请稍后再试哦~")
-            elif status == "blocked":
-                yield event.plain_result("❌ 此群未启用漫画生成功能")
-            elif status == "no_topics":
-                yield event.plain_result("❌ 未提取到可用于生成漫画的话题")
-            else:
-                yield event.plain_result("⚠️ 漫画生成任务未启动，请查看插件日志")
-
-        except DuplicateGroupTaskError:
-            yield event.plain_result("🎨 该群的漫画话题提取任务正在执行，请稍后再试哦~")
-        except asyncio.CancelledError:
-            logger.info("手动漫画任务被取消（插件正在关闭或重载）")
-        except Exception as e:
-            logger.error("手动漫画生成失败: %s", e, exc_info=True)
-            yield event.plain_result(
-                f"❌ 漫画生成失败: {str(e)}。请检查消息获取、LLM 和绘图配置"
-            )
-        finally:
-            if current_task:
-                self._background_tasks.discard(current_task)
-
-    async def _send_analysis_report(
-        self, event: AstrMessageEvent, result: dict
-    ) -> AsyncGenerator:
-        """处理分析结果的渲染和发送"""
-        if self._terminating or not self.config_manager:
-            logger.warning("插件正在关闭，停止发送报告")
-            return
-
-        group_id = result["group_id"]
-        platform_id = result["platform_id"]
-        analysis_result = result["analysis_result"]
-        adapter = result["adapter"]
-        self._try_trigger_comic_generation(group_id, platform_id, analysis_result)
-        output_format = self.config_manager.get_output_format()[0]
-        is_qq_official = adapter.get_platform_name() in {
-            "qq_official",
-            "qq_official_webhook",
-        }
-
-        # 定义获取回调
-        async def avatar_url_getter(user_id: str) -> str | None:
-            return await adapter.get_user_avatar_url(user_id)
-
-        async def nickname_getter(user_id: str) -> str | None:
-            try:
-                member = await adapter.get_member_info(group_id, user_id)
-                if member:
-                    return member.card or member.nickname
-            except Exception:
-                pass
-            return None
-
-        if output_format == "image":
-            image_url, html_content = await self.report_generator.generate_image_report(
-                analysis_result,
-                group_id,
-                self.html_render,
-                avatar_url_getter=avatar_url_getter,
-                nickname_getter=nickname_getter,
-                avatar_cache_namespace=platform_id,
-                allow_alphanumeric_user_ids=is_qq_official,
-            )
-
-            if image_url:
-                caption = (
-                    TraceContext.make_report_caption()
-                    if self.config_manager.get_show_report_caption()
-                    else ""
-                )
-                sent = await adapter.send_image(group_id, image_url, caption=caption)
-                if sent:
-                    await self._try_upload_image(group_id, image_url, platform_id)
-                    return  # 成功发送
-
-            # 如果图片生成或发送失败，直接回退到文本
-            logger.warning(f"图片报告发送失败，正在发送文本回退报告。群: {group_id}")
-            await self._send_text_reports(
-                group_id, analysis_result, is_qq_official, adapter
-            )
-            return
-
-        elif output_format == "html":
-            html_path, json_path = await self.report_generator.generate_html_report(
-                analysis_result,
-                group_id,
-                avatar_url_getter=avatar_url_getter,
-                nickname_getter=nickname_getter,
-                avatar_cache_namespace=platform_id,
-                allow_alphanumeric_user_ids=is_qq_official,
-            )
-            if html_path:
-                is_only_url = self.config_manager.get_html_only_url()
-                base_url = self.config_manager.get_html_base_url()
-
-                should_send_file = True
-
-                if is_only_url:
-                    if base_url and base_url.strip():
-                        # 获取配置中的输出目录
-                        html_output_dir = self.config_manager.get_html_output_dir()
-
-                        # 若用户配置为空，使用默认目录
-                        if not html_output_dir:
-                            html_output_dir = os.path.join(
-                                StarTools.get_data_dir(PLUGIN_NAME),
-                                "self_hosted_html_reports",
-                            )
-
-                        # 计算相对路径并转换为URL
-                        rel_path = os.path.relpath(html_path, html_output_dir)
-                        url_path = rel_path.replace(os.sep, "/")
-                        encoded_url_path = quote(url_path.lstrip("/"), safe="/")
-                        report_url = f"{base_url.rstrip('/')}/{encoded_url_path}"
-
-                        yield event.plain_result(
-                            f"📊 今日群聊分析报告已生成：\n{report_url}"
-                        )
-                        should_send_file = False  # 拦截成功，不再发文件
-                    else:
-                        logger.warning(
-                            f"手动触发群 {group_id} 开启了仅发送外链，但未配置 html_base_url，回退至发送文件。"
-                        )
-
-                if should_send_file:
-                    caption = self.report_generator.build_html_caption(html_path)
-
-                    # 发送 HTML 文件
-                    sender = getattr(self, "message_sender", None)
-                    if sender:
-                        sent = await sender.send_file(
-                            group_id,
-                            html_path,
-                            caption=caption,
-                            platform_id=platform_id,
-                        )
-                    else:
-                        sent = await adapter.send_file(group_id, html_path)
-                        if sent and caption:
-                            await adapter.send_text(group_id, caption)
-
-                    if not sent:
-                        yield event.chain_result(
-                            [File(name=Path(html_path).name, file=html_path)]
-                        )
-                        if caption:
-                            yield event.plain_result(caption)
-            else:
-                yield event.plain_result("⚠️ HTML 生成失败。")
-
-        else:
-            await self._send_text_reports(
-                group_id, analysis_result, is_qq_official, adapter
-            )
+    async def _send_text_reports(
+        self,
+        group_id: str,
+        analysis_result: AnalysisResultPayload,
+        is_qq_official: bool,
+        adapter: PlatformAdapterProtocol,
+    ) -> None:
+        await self.analysis_command_handler._send_text_reports(
+            group_id, analysis_result, is_qq_official, adapter
+        )
 
     def _try_trigger_comic_generation(
         self,
         group_id: str,
         platform_id: str | None,
-        analysis_result: dict,
+        analysis_result: AnalysisResultPayload,
         *,
         require_auto_enabled: bool = True,
+        trace: TraceContext | None = None,
     ) -> str:
-        if self._terminating:
-            return "terminating"
-        if not self.config_manager.get_enable_daily_comic():
-            return "disabled"
-        auto_comic_enabled = getattr(
-            self.config_manager, "get_enable_auto_daily_comic", None
+        return self.comic_command_handler.try_trigger_comic_generation(
+            group_id,
+            platform_id,
+            analysis_result,
+            require_auto_enabled=require_auto_enabled,
+            trace=trace,
         )
-        if (
-            require_auto_enabled
-            and callable(auto_comic_enabled)
-            and not auto_comic_enabled()
-        ):
-            return "auto_disabled"
-
-        umo = f"{platform_id}:GroupMessage:{group_id}" if platform_id else group_id
-        comic_allowed = getattr(self.config_manager, "is_comic_group_allowed", None)
-        inherit_allowed = True if require_auto_enabled else None
-        if callable(comic_allowed) and not comic_allowed(umo, inherit_allowed):
-            logger.info(
-                "群 %s 未通过漫画名单判定，跳过漫画生成。platform=%s",
-                group_id,
-                platform_id or "default",
-            )
-            return "blocked"
-
-        topics = analysis_result.get("topics", [])
-        statistics = analysis_result.get("statistics")
-        if not topics and statistics:
-            topics = getattr(statistics, "topics", [])
-
-        comic_topics = []
-        for topic in topics if isinstance(topics, list) else []:
-            title = (
-                topic.get("topic", "")
-                if isinstance(topic, dict)
-                else getattr(topic, "topic", "")
-            )
-            detail = (
-                topic.get("detail", "")
-                if isinstance(topic, dict)
-                else getattr(topic, "detail", "")
-            )
-            if str(title).strip():
-                comic_topics.append(
-                    {"topic": str(title).strip(), "detail": str(detail).strip()}
-                )
-        if not comic_topics:
-            logger.warning(f"群 {group_id} 没有有效话题，跳过漫画生成。")
-            return "no_topics"
-
-        task_key = f"{platform_id or 'default'}:{group_id}"
-        existing_task = self._comic_group_tasks.get(task_key)
-        if existing_task and not existing_task.done():
-            logger.info(f"群 {group_id} 已有漫画任务等待或执行，跳过重复任务。")
-            return "duplicate"
-
-        task = asyncio.create_task(
-            self._trigger_comic_generation(comic_topics, group_id, platform_id, umo)
-        )
-        self._comic_group_tasks[task_key] = task
-        self._background_tasks.add(task)
-        task.add_done_callback(self._background_tasks.discard)
-        task.add_done_callback(
-            lambda completed_task: (
-                self._comic_group_tasks.pop(task_key, None)
-                if self._comic_group_tasks.get(task_key) is completed_task
-                else None
-            )
-        )
-        return "started"
-
-    @staticmethod
-    def _detect_image_ext(data: bytes) -> str:
-        """从图片字节嗅探扩展名，无法识别时回退 .png。"""
-        if data.startswith(b"\x89PNG\r\n\x1a\n"):
-            return ".png"
-        if data.startswith(b"\xff\xd8\xff"):
-            return ".jpg"
-        if len(data) >= 12 and data[:4] == b"RIFF" and data[8:12] == b"WEBP":
-            return ".webp"
-        if data.startswith((b"GIF87a", b"GIF89a")):
-            return ".gif"
-        if (
-            len(data) >= 12
-            and data[4:8] == b"ftyp"
-            and data[8:12] in {b"avif", b"avis"}
-        ):
-            return ".avif"
-        return ".png"
 
     async def _trigger_comic_generation(
         self,
-        topics: list[dict],
+        topics: list[dict[str, object]],
         group_id: str,
         platform_id: str | None,
         umo: str,
-    ):
-        """后台生成并上传漫画，通过信号量控制并发"""
-        async with self._comic_semaphore:
-            if self._terminating:
-                return
-            try:
-                comic_bytes, fallback_url = await self.comic_service.generate_comic(
-                    topics, group_id, umo
-                )
-                if comic_bytes:
-                    logger.info(f"群 {group_id} 漫画生成成功，准备发送和上传相册...")
-                    import time
-
-                    ext = self._detect_image_ext(comic_bytes)
-
-                    comic_dir = StarTools.get_data_dir(PLUGIN_NAME) / "comic_cache"
-                    comic_dir.mkdir(parents=True, exist_ok=True)
-                    comic_file_path = str(
-                        comic_dir / f"comic_{group_id}_{int(time.time())}{ext}"
-                    )
-
-                    with open(comic_file_path, "wb") as f:
-                        f.write(comic_bytes)
-
-                    try:
-                        if self._terminating:
-                            return
-
-                        # 发送图片到群聊
-                        adapter = self.bot_manager.get_adapter(platform_id)
-                        if adapter and hasattr(adapter, "send_image"):
-                            await adapter.send_image(
-                                group_id,
-                                comic_file_path,
-                                caption="✨ 今日群聊趣味漫画已生成！",
-                            )
-
-                        # 上传到相册/群文件
-                        await self._try_upload_image(
-                            group_id, comic_file_path, platform_id, is_comic=True
-                        )
-                    finally:
-                        # 发送和上传完成后清理本地缓存文件，防止长期积累占用磁盘
-                        try:
-                            os.remove(comic_file_path)
-                        except OSError:
-                            pass
-                elif fallback_url:
-                    # 图片 API 返回了 URL 但下载失败，把链接发到群里作为兜底
-                    logger.warning(
-                        f"群 {group_id} 漫画下载失败，发送 fallback URL 到群中: {fallback_url}"
-                    )
-                    adapter = self.bot_manager.get_adapter(platform_id)
-                    if adapter and hasattr(adapter, "send_text"):
-                        await adapter.send_text(
-                            group_id,
-                            f"✨ 今日群聊趣味漫画已生成，但图片下载失败，请点击链接查看：\n{fallback_url}",
-                        )
-            except Exception as e:
-                logger.error(
-                    f"群 {group_id} 生成/上传漫画时发生错误: {e}", exc_info=True
-                )
-
-    async def _generate_text_reports(
-        self, analysis_result: dict, use_qq_official_markdown: bool
-    ) -> tuple[str, str | None]:
-        """Generate text or QQ-official-markdown reports."""
-        if use_qq_official_markdown:
-            return await self.report_generator.generate_qq_official_markdown_report(
-                analysis_result, self.html_render
-            )
-        return self.report_generator.generate_text_report(analysis_result), None
-
-    async def _send_text_reports(
-        self,
-        group_id: str,
-        analysis_result: dict,
-        use_qq_official_markdown: bool,
-        adapter,
-    ) -> bool:
-        """Send text reports via platform adapter."""
-        tr, fr = await self._generate_text_reports(
-            analysis_result, use_qq_official_markdown
-        )
-        if use_qq_official_markdown:
-            return await adapter.send_text_report(group_id, tr, fallback_content=fr)
-        return await adapter.send_text_report(group_id, tr)
-
-    @filter.command("设置格式", alias={"set_format"})
-    @filter.permission_type(PermissionType.ADMIN)
-    async def set_output_format(self, event: AstrMessageEvent, format_input: str = ""):
-        """
-        设置分析报告输出格式（跨平台支持）
-        用法: /设置格式 [格式名称或序号] 或 image,html 等逗号分隔的组合
-        """
-        # 命令由插件处理，禁用默认 LLM 回退。
-        event.should_call_llm(True)
-
-        available_formats = ["image", "text", "html"]
-        format_display_names = {
-            "image": "图片格式 (默认)",
-            "text": "文本格式",
-            "html": "交互式 HTML 网页",
-        }
-
-        if not format_input:
-            current = ", ".join(self.config_manager.get_output_format())
-            format_list_str = "\n".join(
-                [
-                    f"【{i}】{f} - {format_display_names[f]}"
-                    for i, f in enumerate(available_formats, start=1)
-                ]
-            )
-            yield event.plain_result(f"""📊 当前输出格式: {current}
-
-可用格式:
-{format_list_str}
-
-用法: /设置格式 [名称或序号] 如 /设置格式 image,html""")
-            return
-
-        target_format = None
-        # 尝试由序号选择
-        if format_input.isdigit():
-            idx = int(format_input) - 1
-            if 0 <= idx < len(available_formats):
-                target_format = available_formats[idx]
-
-        # 尝试按名称选择
-        if not target_format:
-            input_lower = format_input.lower()
-            if input_lower in available_formats:
-                target_format = input_lower
-
-        # 支持逗号分隔的多个格式
-        if not target_format:
-            parts = [f.strip() for f in format_input.replace("，", ",").split(",")]
-            if all(p in available_formats for p in parts) and len(parts) > 1:
-                try:
-                    self.config_manager.set_output_format(parts)
-                    yield event.plain_result(f"✅ 输出格式已设置为: {', '.join(parts)}")
-                except Exception as e:
-                    yield event.plain_result(f"❌ 设置失败: {e}")
-                return
-
-        if not target_format:
-            yield event.plain_result(
-                f"❌ 无效的格式类型 '{format_input}'。可用: {', '.join(available_formats)} 或序号 1-{len(available_formats)}"
-            )
-            return
-
-        try:
-            self.config_manager.set_output_format(target_format)  # type: ignore[arg-type]
-            yield event.plain_result(f"✅ 输出格式已设置为: {target_format}")
-        except Exception as e:
-            yield event.plain_result(f"❌ 设置失败: {e}")
-
-    @filter.command("设置模板", alias={"set_template"})
-    @filter.permission_type(PermissionType.ADMIN)
-    async def set_report_template(
-        self, event: AstrMessageEvent, template_input: str = ""
-    ):
-        """
-        设置分析报告模板（跨平台支持）
-        用法: /设置模板 [模板名称或序号]
-        """
-        # 命令由插件处理，禁用默认 LLM 回退。
-        event.should_call_llm(True)
-
-        available_templates = (
-            await self.template_command_service.list_available_templates()
+        trace: TraceContext | None = None,
+    ) -> None:
+        await self.comic_command_handler._trigger_comic_generation(
+            topics, group_id, platform_id, umo, trace=trace
         )
 
-        if not template_input:
-            current_template = self.config_manager.get_report_template()
-            template_list_str = "\n".join(
-                [f"【{i}】{t}" for i, t in enumerate(available_templates, start=1)]
-            )
-            yield event.plain_result(f"""🎨 当前报告模板: {current_template}
+    @property
+    def _comic_group_tasks(self) -> dict[str, asyncio.Task[object]]:
+        return self.comic_command_handler._comic_group_tasks
 
-可用模板:
-{template_list_str}
+    @_comic_group_tasks.setter
+    def _comic_group_tasks(self, val: dict[str, asyncio.Task[object]]) -> None:
+        self.comic_command_handler._comic_group_tasks = val
 
-用法: /设置模板 [模板名称或序号]
-💡 使用 /查看模板 查看预览图""")
-            return
-
-        template_name, parse_error = self.template_command_service.parse_template_input(
-            template_input, available_templates
-        )
-        if parse_error:
-            yield event.plain_result(parse_error)
-            return
-
-        if not template_name:
-            yield event.plain_result(f"❌ 无法解析模板输入: {template_input}")
-            return
-
-        if not await self.template_command_service.template_exists(template_name):
-            yield event.plain_result(f"❌ 模板 '{template_name}' 不存在")
-            return
-
-        self.config_manager.set_report_template(template_name)
-        yield event.plain_result(f"✅ 报告模板已设置为: {template_name}")
-
-    @filter.command("查看模板", alias={"view_templates"})
-    @filter.permission_type(PermissionType.ADMIN)
-    async def view_templates(self, event: AstrMessageEvent):
-        """
-        查看所有可用的报告模板及预览图（跨平台支持）
-        用法: /查看模板
-        """
-        # 命令由插件处理，禁用默认 LLM 回退。
-        event.should_call_llm(True)
-
-        available_templates = (
-            await self.template_command_service.list_available_templates()
-        )
-
-        if not available_templates:
-            yield event.plain_result("❌ 未找到任何可用的报告模板")
-            return
-
-        platform_id = self._get_platform_id_from_event(event)
-        await self.template_preview_router.ensure_handlers_registered(self.context)
-        (
-            handled,
-            handler_results,
-        ) = await self.template_preview_router.handle_view_templates(
-            event=event,
-            platform_id=platform_id,
-            available_templates=available_templates,
-        )
-        if handled:
-            for result in handler_results:
-                yield result
-            return
-
-        current_template = self.config_manager.get_report_template()
-        bot_id = event.get_self_id()
-        preview_nodes = self.template_command_service.build_template_preview_nodes(
-            available_templates=available_templates,
-            current_template=current_template,
-            bot_id=bot_id,
-        )
-        yield event.chain_result([preview_nodes])
-
-    @filter.command("分析设置", alias={"analysis_settings"})
-    @filter.permission_type(PermissionType.ADMIN)
-    async def analysis_settings(self, event: AstrMessageEvent, action: str = "status"):
-        """
-        管理分析设置（跨平台支持）
-        用法: /分析设置 [enable|disable|status|reload|test]
-        - enable: 启用当前群的分析功能
-        - disable: 禁用当前群的分析功能
-        - status: 查看当前状态
-        - reload: 重新加载配置并重启定时任务
-        - test: 测试自动分析功能
-        - filter_bot: 切换是否在分析中包含机器人自己的消息
-        - incremental_debug: 切换增量分析立即报告模式（调试用）
-        """
-        group_id = self._get_group_id_from_event(event)
-
-        if not group_id:
-            yield event.plain_result("❌ 请在群聊中使用此命令")
-            return
-
-        if action == "enable":
-            async for result in self._handle_settings_enable(event, group_id):
-                yield result
-            return
-        elif action == "disable":
-            async for result in self._handle_settings_disable(event, group_id):
-                yield result
-            return
-
-        elif action == "reload":
-            self.auto_scheduler.schedule_jobs(self.context)
-            await self._refresh_incremental_target_states()
-            yield event.plain_result("✅ 已重新加载配置并重启定时任务")
-            return
-
-        elif action == "test":
-            check_target = getattr(event, "unified_msg_origin", None)
-            if not check_target:
-                check_target = (
-                    f"{self._get_platform_id_from_event(event)}:GroupMessage:{group_id}"
-                )
-
-            if not self.config_manager.is_group_allowed(check_target):
-                yield event.plain_result("❌ 请先启用当前群的分析功能")
-                return
-
-            yield event.plain_result("🧪 开始测试自动分析功能...")
-
-            # 更新bot实例（用于测试）
-            self.bot_manager.update_from_event(event)
-
-            try:
-                result = await self.auto_scheduler._perform_auto_analysis_for_group(
-                    group_id
-                )
-                if isinstance(result, dict) and result.get("success"):
-                    yield event.plain_result("✅ 自动分析及报告发送成功，请查看群消息")
-                else:
-                    reason = (
-                        result.get("reason", "unknown")
-                        if isinstance(result, dict)
-                        else "invalid_result"
-                    )
-                    yield event.plain_result(f"❌ 自动分析或报告发送失败: {reason}")
-            except DuplicateGroupTaskError:
-                yield event.plain_result("📊 该群的分析任务正在执行中，请稍后再试哦~")
-            except Exception as e:
-                yield event.plain_result(f"❌ 自动分析测试失败: {str(e)}")
-            return
-
-        elif action == "incremental_debug":
-            current_state = self.config_manager.get_incremental_report_immediately()
-            new_state = not current_state
-            self.config_manager.set_incremental_report_immediately(new_state)
-            status_text = "已启用" if new_state else "已禁用"
-            yield event.plain_result(f"✅ 增量分析立即报告模式: {status_text}")
-            return
-
-        elif action == "filter_bot":
-            current = self.config_manager.get_filter_bot_messages()
-            new_state = not current
-            self.config_manager.set_filter_bot_messages(new_state)
-            status_text = "已启用" if new_state else "已禁用"
-            yield event.plain_result(f"✅ 过滤机器人消息: {status_text}")
-            return
-
-        else:  # status
-            check_target = getattr(event, "unified_msg_origin", None)
-            if not check_target:
-                check_target = (
-                    f"{self._get_platform_id_from_event(event)}:GroupMessage:{group_id}"
-                )
-
-            is_allowed = self.config_manager.is_group_allowed(check_target)
-            status = "已启用" if is_allowed else "未启用"
-            mode = self.config_manager.get_group_list_mode()
-
-            auto_status = (
-                "已启用" if self.config_manager.is_auto_analysis_enabled() else "未启用"
-            )
-            auto_time = self.config_manager.get_auto_analysis_time()
-
-            output_format = self.config_manager.get_output_format()[0]
-            min_threshold = self.config_manager.get_min_messages_threshold()
-
-            # 增量分析状态
-            incremental_enabled = self.config_manager.get_incremental_enabled()
-            incremental_status_text = "未启用"
-            if incremental_enabled:
-                batch_messages = self.config_manager.get_incremental_min_messages()
-                incremental_status_text = f"已启用 (每 {batch_messages} 条消息触发)"
-
-        debug_report = self.config_manager.get_incremental_report_immediately()
-        debug_status = "✅ 开启" if debug_report else "❌ 关闭"
-        filter_bot = self.config_manager.get_filter_bot_messages()
-        filter_bot_status = "✅ 开启" if filter_bot else "❌ 关闭"
-
-        yield event.plain_result(f"""📊 当前群分析功能状态:
-• 群分析功能: {status} (模式: {mode})
-• 自动分析: {auto_status} ({auto_time})
-        • 增量分析: {incremental_status_text}
-        • 调试模式: {debug_status} (增量立即报告)
-        • 过滤机器人: {filter_bot_status}
-        • 输出格式: {output_format}
-• 最小消息数: {min_threshold}
-
-💡 可用命令: enable, disable, status, reload, test, filter_bot, incremental_debug
-💡 支持的输出格式: image, text (图片包含活跃度可视化)
-💡 其他命令: /设置格式, /增量状态""")
-
-    @filter.command("增量状态", alias={"incremental_status"})
-    @filter.permission_type(PermissionType.ADMIN)
-    async def incremental_status(self, event: AstrMessageEvent):
-        """查看当前增量分析状态（滑动窗口）"""
-        group_id = self._get_group_id_from_event(event)
-        if not group_id:
-            yield event.plain_result("❌ 请在群聊中使用此命令")
-            return
-
-        if not self.config_manager.get_incremental_enabled():
-            yield event.plain_result("ℹ️ 增量分析模式未启用，请在插件配置中开启")
-            return
-
-        import time as time_mod
-
-        # 计算滑动窗口范围
-        analysis_days = self.config_manager.get_analysis_days()
-        window_end = time_mod.time()
-        window_start = window_end - (analysis_days * 24 * 3600)
-
-        # 查询窗口内的批次
-        batches = await self.incremental_store.query_batches(
-            group_id, window_start, window_end
-        )
-
-        if not batches:
-            from datetime import datetime
-
-            start_str = datetime.fromtimestamp(window_start).strftime("%m-%d %H:%M")
-            end_str = datetime.fromtimestamp(window_end).strftime("%m-%d %H:%M")
-            yield event.plain_result(
-                f"📊 滑动窗口 ({start_str} ~ {end_str}) 内尚无增量分析数据"
-            )
-            return
-
-        # 合并批次获取聚合视图
-        state = self.incremental_merge_service.merge_batches(
-            batches, window_start, window_end
-        )
-        summary = state.get_summary()
-
-        yield event.plain_result(
-            f"📊 增量分析状态 (窗口: {summary['window']})\n"
-            f"• 分析次数: {summary['total_analyses']}\n"
-            f"• 累计消息: {summary['total_messages']}\n"
-            f"• 话题数: {summary['topics_count']}\n"
-            f"• 金句数: {summary['quotes_count']}\n"
-            f"• 参与者: {summary['participants']}\n"
-            f"• 高峰时段: {summary['peak_hours']}"
-        )
-
-    async def _handle_settings_enable(self, event: AstrMessageEvent, group_id: str):
-        """协助逻辑：处理启用设置的分支逻辑"""
-        mode = self.config_manager.get_group_list_mode()
-        target_id = event.unified_msg_origin or group_id
-
-        if mode == "whitelist":
-            glist = self.config_manager.get_group_list()
-            if not self.config_manager.is_group_allowed(target_id):
-                glist.append(target_id)
-                self.config_manager.set_group_list(glist)
-                self.auto_scheduler.schedule_jobs(self.context)
-                await self._refresh_incremental_target_states()
-                yield event.plain_result(f"✅ 已将当前群加入白名单\nID: {target_id}")
-            else:
-                yield event.plain_result("ℹ️ 当前群已在白名单中")
-        elif mode == "blacklist":
-            glist = self.config_manager.get_group_list()
-            removed = False
-            if target_id in glist:
-                glist.remove(target_id)
-                removed = True
-            if group_id in glist:
-                glist.remove(group_id)
-                removed = True
-
-            if removed:
-                self.config_manager.set_group_list(glist)
-                self.auto_scheduler.schedule_jobs(self.context)
-                await self._refresh_incremental_target_states()
-                yield event.plain_result("✅ 已将当前群从黑名单移除")
-            else:
-                yield event.plain_result("ℹ️ 当前群不在黑名单中")
-        else:
-            yield event.plain_result("ℹ️ 当前为无限制模式，所有群聊默认启用")
-
-    async def _handle_settings_disable(self, event: AstrMessageEvent, group_id: str):
-        """协助逻辑：处理禁用设置的分支逻辑"""
-        mode = self.config_manager.get_group_list_mode()
-        target_id = event.unified_msg_origin or group_id
-
-        if mode == "whitelist":
-            glist = self.config_manager.get_group_list()
-            removed = False
-            if target_id in glist:
-                glist.remove(target_id)
-                removed = True
-            if group_id in glist:
-                glist.remove(group_id)
-                removed = True
-
-            if removed:
-                self.config_manager.set_group_list(glist)
-                self.auto_scheduler.schedule_jobs(self.context)
-                await self._refresh_incremental_target_states()
-                yield event.plain_result("✅ 已将当前群从白名单移除")
-            else:
-                yield event.plain_result("ℹ️ 当前群不在白名单中")
-        elif mode == "blacklist":
-            glist = self.config_manager.get_group_list()
-            if self.config_manager.is_group_allowed(target_id):
-                glist.append(target_id)
-                self.config_manager.set_group_list(glist)
-                self.auto_scheduler.schedule_jobs(self.context)
-                await self._refresh_incremental_target_states()
-                yield event.plain_result(f"✅ 已将当前群加入黑名单\nID: {target_id}")
-            else:
-                yield event.plain_result("ℹ️ 当前群已在黑名单中")
-        else:
-            yield event.plain_result("ℹ️ 当前为无限制模式，如需禁用请切换到黑名单模式")
-
-    async def _refresh_incremental_target_states(self) -> None:
-        """在插件内修改名单后立即同步增量状态。"""
-        incremental_trigger = self.auto_scheduler.incremental_trigger
-        if incremental_trigger:
-            await incremental_trigger.refresh_target_states()
+    @staticmethod
+    def _detect_image_ext(data: bytes) -> str:
+        return ComicCommandHandler.detect_image_ext(data)
