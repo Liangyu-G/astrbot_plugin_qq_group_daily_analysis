@@ -7,7 +7,7 @@ from astrbot.api.provider import LLMResponse
 from src.application.services.analysis_application_service import (
     AnalysisApplicationService,
 )
-from src.domain.value_objects import TokenUsage
+from src.domain.value_objects import GroupStatistics, TokenUsage
 from src.domain.value_objects.unified_message import (
     MessageContent,
     MessageContentType,
@@ -15,6 +15,7 @@ from src.domain.value_objects.unified_message import (
 )
 from src.infrastructure.analysis.utils import llm_utils
 from src.infrastructure.analysis.utils.llm_utils import call_provider_with_retry
+from src.domain.value_objects.task_event import TaskEvent
 from src.shared.trace_context import TraceContext
 from src.utils.resilience import GlobalRateLimiter
 
@@ -94,6 +95,11 @@ def test_llm_slot_exposes_stage_metadata_to_trace_context():
 def test_daily_analysis_stage_distinguishes_manual_and_scheduled():
     """普通全量分析观测应区分手动命令和定时调度来源。"""
     stages = []
+    saved_checkpoints: list[dict[str, object]] = []
+
+    class FakeCheckpointStore:
+        def save_checkpoint(self, **kwargs: object) -> None:
+            saved_checkpoints.append(kwargs)
 
     class FakeConfig:
         def get_llm_max_concurrent(self):
@@ -131,6 +137,13 @@ def test_daily_analysis_stage_distinguishes_manual_and_scheduled():
 
     class FakeAdapter:
         platform_id = "onebot-main"
+        bot_self_ids = []
+
+        def get_platform_name(self):
+            return "onebot"
+
+        async def is_group_muted(self, group_id):
+            return False
 
         async def fetch_messages(self, **kwargs):
             return [
@@ -153,7 +166,14 @@ def test_daily_analysis_stage_distinguishes_manual_and_scheduled():
 
     class FakeStatisticsService:
         def calculate_group_statistics(self, messages):
-            return SimpleNamespace()
+            return GroupStatistics(
+                message_count=len(messages),
+                total_characters=sum(len(message.text_content) for message in messages),
+                participant_count=1,
+                most_active_period="",
+                golden_quotes=[],
+                emoji_count=0,
+            )
 
         def _convert_to_legacy_dict(self, messages):
             return [{"message": [{"type": "text", "data": {"text": "测试消息"}}]}]
@@ -185,12 +205,16 @@ def test_daily_analysis_stage_distinguishes_manual_and_scheduled():
 
     service = AnalysisApplicationService(
         config_manager=FakeConfig(),
-        bot_manager=SimpleNamespace(get_adapter=lambda platform_id: FakeAdapter()),
+        bot_manager=SimpleNamespace(
+            get_adapter=lambda platform_id: FakeAdapter(),
+            get_adapter_platform_id=lambda adapter: adapter.platform_id,
+        ),
         history_manager=FakeHistoryManager(),
         report_generator=None,
         llm_analyzer=FakeAnalyzer(),
         statistics_service=FakeStatisticsService(),
         analysis_domain_service=FakeDomainService(),
+        checkpoint_store=FakeCheckpointStore(),
     )
 
     @asynccontextmanager
@@ -201,15 +225,33 @@ def test_daily_analysis_stage_distinguishes_manual_and_scheduled():
     service._llm_slot = capture_llm_slot
 
     async def scenario():
-        manual_result = await service.execute_daily_analysis(
-            "group-1", "onebot-main", manual=True
-        )
-        scheduled_result = await service.execute_daily_analysis(
-            "group-1", "onebot-main", manual=False
-        )
-        assert manual_result["success"] is True
-        assert scheduled_result["success"] is True
-        assert stages == ["full_manual", "full_scheduled"]
+        with TraceContext(trace_id="daily-pipeline-stages") as trace:
+            manual_result = await service.execute_daily_analysis(
+                "group-1", "onebot-main", manual=True
+            )
+            scheduled_result = await service.execute_daily_analysis(
+                "group-1", "onebot-main", manual=False
+            )
+            assert manual_result["success"] is True
+            assert scheduled_result["success"] is True
+            assert stages == ["full_manual", "full_scheduled"]
+            expected_stages = [
+                "FETCH_MESSAGES",
+                "CLEAN_MESSAGES",
+                "STATS_ANALYSIS",
+                "LLM_ANALYSIS",
+                "SAVE_SUMMARY",
+            ]
+            assert [span["stage_name"] for span in trace._spans] == (
+                expected_stages * 2
+            )
+
+        assert [item["stage_name"] for item in saved_checkpoints] == [
+            "CLEAN_MESSAGES",
+            "LLM_ANALYSIS",
+            "CLEAN_MESSAGES",
+            "LLM_ANALYSIS",
+        ]
 
     asyncio.run(scenario())
 
@@ -355,6 +397,13 @@ def test_daily_analysis_aborts_when_all_enabled_llm_tasks_fail():
 
     class FakeAdapter:
         platform_id = "onebot-main"
+        bot_self_ids = []
+
+        def get_platform_name(self):
+            return "onebot"
+
+        async def is_group_muted(self, group_id):
+            return False
 
         async def fetch_messages(self, **kwargs):
             return [
@@ -377,7 +426,14 @@ def test_daily_analysis_aborts_when_all_enabled_llm_tasks_fail():
 
     class FakeStatisticsService:
         def calculate_group_statistics(self, messages):
-            return SimpleNamespace()
+            return GroupStatistics(
+                message_count=len(messages),
+                total_characters=sum(len(message.text_content) for message in messages),
+                participant_count=1,
+                most_active_period="",
+                golden_quotes=[],
+                emoji_count=0,
+            )
 
         def _convert_to_legacy_dict(self, messages):
             return [{"message": [{"type": "text", "data": {"text": "测试消息"}}]}]
@@ -400,7 +456,10 @@ def test_daily_analysis_aborts_when_all_enabled_llm_tasks_fail():
 
     service = AnalysisApplicationService(
         config_manager=FakeConfig(),
-        bot_manager=SimpleNamespace(get_adapter=lambda platform_id: FakeAdapter()),
+        bot_manager=SimpleNamespace(
+            get_adapter=lambda platform_id: FakeAdapter(),
+            get_adapter_platform_id=lambda adapter: adapter.platform_id,
+        ),
         history_manager=FakeHistoryManager(),
         report_generator=None,
         llm_analyzer=FakeAnalyzer(),
@@ -463,6 +522,13 @@ def test_daily_analysis_warns_when_partial_llm_tasks_fail():
 
     class FakeAdapter:
         platform_id = "onebot-main"
+        bot_self_ids = []
+
+        def get_platform_name(self):
+            return "onebot"
+
+        async def is_group_muted(self, group_id):
+            return False
 
         async def fetch_messages(self, **kwargs):
             return [
@@ -485,7 +551,14 @@ def test_daily_analysis_warns_when_partial_llm_tasks_fail():
 
     class FakeStatisticsService:
         def calculate_group_statistics(self, messages):
-            return SimpleNamespace()
+            return GroupStatistics(
+                message_count=len(messages),
+                total_characters=sum(len(message.text_content) for message in messages),
+                participant_count=1,
+                most_active_period="",
+                golden_quotes=[],
+                emoji_count=0,
+            )
 
         def _convert_to_legacy_dict(self, messages):
             return [{"message": [{"type": "text", "data": {"text": "测试消息"}}]}]
@@ -518,7 +591,10 @@ def test_daily_analysis_warns_when_partial_llm_tasks_fail():
 
     service = AnalysisApplicationService(
         config_manager=FakeConfig(),
-        bot_manager=SimpleNamespace(get_adapter=lambda platform_id: FakeAdapter()),
+        bot_manager=SimpleNamespace(
+            get_adapter=lambda platform_id: FakeAdapter(),
+            get_adapter_platform_id=lambda adapter: adapter.platform_id,
+        ),
         history_manager=FakeHistoryManager(),
         report_generator=None,
         llm_analyzer=FakeAnalyzer(),
@@ -537,7 +613,7 @@ def test_daily_analysis_warns_when_partial_llm_tasks_fail():
                 s for s in trace._spans if s["stage_name"] == "LLM_ANALYSIS"
             )
             assert llm_span["status"] == "warning"
-            trace.finish()
+            trace.finish(event=TaskEvent.SUCCEED)
             assert trace.status == "warning"
 
     asyncio.run(scenario())
@@ -582,6 +658,13 @@ def test_daily_analysis_succeeds_when_all_llm_disabled():
 
     class FakeAdapter:
         platform_id = "onebot-main"
+        bot_self_ids = []
+
+        def get_platform_name(self):
+            return "onebot"
+
+        async def is_group_muted(self, group_id):
+            return False
 
         async def fetch_messages(self, **kwargs):
             return [
@@ -604,7 +687,14 @@ def test_daily_analysis_succeeds_when_all_llm_disabled():
 
     class FakeStatisticsService:
         def calculate_group_statistics(self, messages):
-            return SimpleNamespace()
+            return GroupStatistics(
+                message_count=len(messages),
+                total_characters=sum(len(message.text_content) for message in messages),
+                participant_count=1,
+                most_active_period="",
+                golden_quotes=[],
+                emoji_count=0,
+            )
 
         def _convert_to_legacy_dict(self, messages):
             return [{"message": [{"type": "text", "data": {"text": "测试消息"}}]}]
@@ -626,7 +716,10 @@ def test_daily_analysis_succeeds_when_all_llm_disabled():
 
     service = AnalysisApplicationService(
         config_manager=FakeConfig(),
-        bot_manager=SimpleNamespace(get_adapter=lambda platform_id: FakeAdapter()),
+        bot_manager=SimpleNamespace(
+            get_adapter=lambda platform_id: FakeAdapter(),
+            get_adapter_platform_id=lambda adapter: adapter.platform_id,
+        ),
         history_manager=FakeHistoryManager(),
         report_generator=None,
         llm_analyzer=FakeAnalyzer(),
@@ -640,7 +733,7 @@ def test_daily_analysis_succeeds_when_all_llm_disabled():
                 "group-1", "onebot-main", manual=True
             )
             assert result["success"] is True
-            trace.finish()
+            trace.finish(event=TaskEvent.SUCCEED)
             assert trace.status == "succeeded"
 
     asyncio.run(scenario())
