@@ -13,7 +13,7 @@ describe("应用全局冒烟与集成测试 (App Smoke & Integration Test)", () 
     render(<App />);
 
     // 验证顶部标题栏
-    expect(screen.getByText(/QQ群日常分析控制台/i)).toBeInTheDocument();
+    expect(screen.getByText(/群分析插件控制台/i)).toBeInTheDocument();
 
     // 验证核心导航 Tab 标签
     expect(screen.getByText(/运行总览/i)).toBeInTheDocument();
