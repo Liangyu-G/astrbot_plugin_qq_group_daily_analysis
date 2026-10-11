@@ -1,5 +1,11 @@
 # 更新日志 (CHANGELOG)
 
+## [v5.7.9] - 修复清空定时分析时间后仍执行自动分析 (#259)，强化历史报告前端时序排序；加固分析任务生命周期与并发收尾 (#258)
+---
+
+<details>
+<summary>📋 点击查看历史更新日志</summary>
+
 ## [v5.7.8] - 新增圣母在上 (Maria / 山百合会) 古典日报模板、省察窗双角色互动彩蛋与专属分析人格指南
 
 <a href="https://cdn.jsdmirror.com/gh/SXP-Simon/astrbot_plugin_qq_group_daily_analysis@main/assets/maria-demo.jpg"><img src="https://cdn.jsdmirror.com/gh/SXP-Simon/astrbot_plugin_qq_group_daily_analysis@main/assets/maria-demo.jpg" alt="圣母在上 (Maria · 山百合会) 报告示例" height="520"></a>
@@ -83,11 +89,6 @@
     *   **复合键命名空间防撞**：升级去重键生成规则为 `{platform_id}:{group_id}:{event_message_id}`，消除 Telegram 递增整数 ID 与其它平台 UUID/哈希之间的跨群或跨平台撞键误杀风险。
     *   **真实原生 Message ID 统一下沉**：在所有平台入库历史记录的 `content` 中统一固化原生 `message_id`，下游适配器（Telegram、QQ 官方等）出库转换时优先读取真实事件 ID，自动向下兼容旧版历史数据；修复了 Telegram 增量分析游标对齐和贴表情回应（`set_message_reaction` 强依赖真实消息 ID）的历史潜在缺陷。
     *   **SQLite WAL 本地持久化去重仓储（重启记忆恢复）**：引入轻量级 `EventDeduplicationStore`（基于 SQLite WAL 模式），重启时自动预热最近 4096 条已处理去重键，彻底解决以往 Bot 重启后内存 LRU 清空、导致积压 Webhook 瞬间重放重复入库的失忆痛点；支持保留期自动清理过期记录。
-
----
-
-<details>
-<summary>📋 点击查看历史更新日志</summary>
 
 ## [v5.7.2] - DeepSeek 女仆娘主题、同群多 Bot Profile 隔离与模型内容安全风控拦截识别
 
