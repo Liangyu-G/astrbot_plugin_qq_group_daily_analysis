@@ -30,7 +30,10 @@ class IllegalStateTransitionError(ValueError):
 
 
 class TaskStateMachine:
-    """以唯一白名单校验任务状态转移。"""
+    """使用唯一白名单校验任务生命周期事件。
+
+    新 Trace 直接以 ``RUNNING`` 状态创建，``PENDING`` 当前没有合法转移；终态仅允许白名单中明确列出的同结果事件重放。
+    """
 
     VALID_TRANSITIONS: ClassVar[Mapping[tuple[TaskStatus, TaskEvent], TaskStatus]] = (
         MappingProxyType(
@@ -42,7 +45,7 @@ class TaskStateMachine:
                 (TaskStatus.RUNNING, TaskEvent.CANCEL): TaskStatus.ABORTED,
                 (TaskStatus.RUNNING, TaskEvent.ABORT): TaskStatus.ABORTED,
                 (TaskStatus.RUNNING, TaskEvent.SKIP): TaskStatus.SKIPPED,
-                # 同一终态结果的事件重放是无副作用的幂等自环。
+                # 相同终态结果的事件重放是无副作用的幂等自环。
                 (TaskStatus.COMPLETED, TaskEvent.SUCCEED): TaskStatus.COMPLETED,
                 (TaskStatus.SUCCEEDED, TaskEvent.SUCCEED): TaskStatus.SUCCEEDED,
                 (TaskStatus.WARNING, TaskEvent.WARN): TaskStatus.WARNING,
