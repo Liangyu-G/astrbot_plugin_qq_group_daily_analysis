@@ -1,8 +1,9 @@
 """任务生命周期服务与持久化并发保护测试。"""
 
-from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
 from threading import Barrier, Lock, get_ident
+from unittest.mock import Mock
 
 import pytest
 
@@ -34,7 +35,7 @@ def test_trace_finish_is_event_only_and_terminal_state_is_immutable(lifecycle):
     trace = TraceContext.set("terminal-trace")
 
     with pytest.raises(AttributeError):
-        setattr(trace, "status", TaskStatus.SUCCEEDED.value)
+        trace.status = TaskStatus.SUCCEEDED.value
 
     trace.finish(event=TaskEvent.SUCCEED)
 
@@ -121,6 +122,26 @@ def test_trace_context_surfaces_conflicting_concurrent_terminal_event(lifecycle)
 
     assert trace.status == TaskStatus.ABORTED.value
     assert store.get_trace("conflicting-trace")["status"] == TaskStatus.ABORTED.value
+
+
+def test_trace_finish_does_not_swallow_unrelated_runtime_error(lifecycle, monkeypatch):
+    store, service = lifecycle
+    trace = TraceContext.set("unrelated-runtime-error-trace")
+    service.transition(trace.trace_id, TaskEvent.SUCCEED)
+
+    monkeypatch.setattr(
+        service,
+        "transition",
+        Mock(side_effect=RuntimeError("unexpected persistence failure")),
+    )
+
+    with pytest.raises(RuntimeError, match="unexpected persistence failure"):
+        trace.finish(event=TaskEvent.SUCCEED)
+
+    assert trace.status == TaskStatus.RUNNING.value
+    persisted = store.get_trace(trace.trace_id)
+    assert persisted is not None
+    assert persisted["status"] == TaskStatus.SUCCEEDED.value
 
 
 def test_repository_rejects_transition_event_not_in_domain_matrix(lifecycle):
@@ -256,9 +277,7 @@ def test_only_one_concurrent_transition_from_same_status_wins(lifecycle):
             return None
 
     with ThreadPoolExecutor(max_workers=2) as executor:
-        outcomes = list(
-            executor.map(transition, [TaskEvent.SUCCEED, TaskEvent.FAIL])
-        )
+        outcomes = list(executor.map(transition, [TaskEvent.SUCCEED, TaskEvent.FAIL]))
 
     assert sum(outcome is not None for outcome in outcomes) == 1
     persisted = store.get_trace("racing-trace")

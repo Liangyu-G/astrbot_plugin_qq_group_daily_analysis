@@ -113,6 +113,24 @@ pnpm dev
      uv run pytest tests/
      ```
 
+#### 2.1.1 任务生命周期状态机
+
+任务状态表达持久化结果，`TaskEvent` 表达调用方请求的生命周期事件。新增转移必须更新领域白名单 `src/domain/services/task_state_machine.py`，并补充状态机与持久化并发测试；调用方不能直接写入目标状态。
+
+| 当前状态 | 事件 | 目标状态 | 说明 |
+|---|---|---|---|
+| `RUNNING` | `SUCCEED` | `SUCCEEDED` | 正常完成 |
+| `RUNNING` | `WARN` | `WARNING` | 带有可恢复问题或警告完成 |
+| `RUNNING` | `FAIL` / `TIMEOUT` | `FAILED` | 执行失败或超时 |
+| `RUNNING` | `CANCEL` / `ABORT` | `ABORTED` | 主动取消或异常回收 |
+| `RUNNING` | `SKIP` | `SKIPPED` | 跳过任务 |
+
+- 新 Trace 由 `TraceContext` 直接以 `RUNNING` 创建；目前 `PENDING` 是保留状态，状态机不允许从中转移。
+- `SUCCEEDED`、`WARNING`、`FAILED`、`ABORTED`、`SKIPPED` 均为终态。只有白名单中明确列出的相同结果事件重放可以幂等通过，其他事件必须拒绝。
+- `COMPLETED` 与 `CANCELLED` 是兼容旧记录的终态，新流程分别使用 `SUCCEEDED` 与 `ABORTED`。
+- 正常生命周期更新通过 `TaskLifecycleService` 发出事件，由 SQLite 仓储按预期旧状态执行 CAS；快照保存不得覆盖已有生命周期状态。生命周期服务未装配时，`TraceContext.finish()` 保留兼容仓储路径，该路径仍须执行相同白名单校验和 CAS。
+- `TraceSQLiteStore.reconcile_crashed_traces_on_startup()` 是受限的批量崩溃回收入口：只能将仍为 `RUNNING` 的历史记录收敛到 `ABORTED`，并按旧状态及可用的 `boot_id` 条件更新。当前启动恢复编排使用 `CrashRecoveryService` 和 `TaskLifecycleService`；普通业务流程不得使用直接 SQL 更新状态。
+
 ---
 
 ### 2.2 WebUI 前端开发规范 (FSD + Atomic + MVVM)

@@ -475,7 +475,8 @@ class TraceContext:
 
         Raises:
             ValueError: 当前 Trace 状态不允许该事件。
-            RuntimeError: 数据库中的任务状态已被其他操作并发改变。
+            ConcurrentTaskTransitionError: 其他操作提交了冲突的任务状态。
+            RuntimeError: 生命周期持久化发生其他运行时错误。
         """
         # 延迟导入，避免 shared 与 domain.services 包初始化时形成循环依赖。
         from ..domain.services.task_state_machine import TaskStateMachine
@@ -545,6 +546,10 @@ class TraceContext:
         )
 
         if _global_task_lifecycle_service is not None:
+            from ..application.services.task_lifecycle_service import (
+                ConcurrentTaskTransitionError,
+            )
+
             try:
                 target_status = _global_task_lifecycle_service.transition(
                     self.trace_id,
@@ -556,7 +561,7 @@ class TraceContext:
                     error_message=error_message,
                     stack_trace=stack_trace,
                 )
-            except RuntimeError:
+            except ConcurrentTaskTransitionError:
                 latest = (
                     _global_trace_store.get_trace(self.trace_id)
                     if _global_trace_store is not None
