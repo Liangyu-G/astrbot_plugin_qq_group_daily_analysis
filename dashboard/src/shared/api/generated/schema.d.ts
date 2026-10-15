@@ -4,6 +4,23 @@
  */
 
 export interface paths {
+    "/config/test-template-cdn": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** 从插件服务器通过 HEAD 检查 GitHub 和 npm 资源链接 */
+        post: operations["testTemplateCdn"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/tasks/active": {
         parameters: {
             query?: never;
@@ -263,6 +280,26 @@ export interface paths {
 export type webhooks = Record<string, never>;
 export interface components {
     schemas: {
+        TemplateCdnProbeRequest: {
+            base_url: string;
+        };
+        TemplateCdnCheck: {
+            id: string;
+            label: string;
+            description: string;
+            /** @enum {string} */
+            kind: "gh" | "npm";
+            url: string;
+            success: boolean;
+            status_code: number | null;
+            elapsed_ms: number;
+            error: string | null;
+        };
+        TemplateCdnProbe: {
+            base_url: string;
+            usable: boolean;
+            checks: components["schemas"]["TemplateCdnCheck"][];
+        };
         ActiveTask: {
             task_id: string;
             group_id: string;
@@ -586,6 +623,47 @@ export interface components {
 }
 export type $defs = Record<string, never>;
 export interface operations {
+    testTemplateCdn: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["TemplateCdnProbeRequest"];
+            };
+        };
+        responses: {
+            /** @description 仅返回 HEAD 可访问性检测结果，不下载正文；所有返回的 checks 均通过时 usable 才为 true */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        status: string;
+                        data: components["schemas"]["TemplateCdnProbe"];
+                    };
+                };
+            };
+            /** @description Invalid CDN root address */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Unexpected probe error */
+            500: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
     getActiveTasks: {
         parameters: {
             query?: never;
