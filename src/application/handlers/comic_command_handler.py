@@ -428,6 +428,15 @@ class ComicCommandHandler:
                 comic_bytes, fallback_url = await self.comic_service.generate_comic(
                     topics, group_id, umo
                 )
+                show_caption_fn = (
+                    getattr(self.config_manager, "get_show_report_caption", None)
+                    if self.config_manager
+                    else None
+                )
+                show_caption = show_caption_fn() if callable(show_caption_fn) else True
+                caption = (
+                    TraceContext.make_report_caption("comic") if show_caption else ""
+                )
                 if comic_bytes:
                     logger.info(f"群 {group_id} 漫画生成成功，准备发送和保存副本...")
                     ext = self.detect_image_ext(comic_bytes)
@@ -466,19 +475,6 @@ class ComicCommandHandler:
                         else None
                     )
                     if adapter:
-                        show_caption_fn = (
-                            getattr(
-                                self.config_manager, "get_show_report_caption", None
-                            )
-                            if self.config_manager
-                            else None
-                        )
-                        show_caption = (
-                            show_caption_fn() if callable(show_caption_fn) else True
-                        )
-                        caption = (
-                            TraceContext.make_report_caption() if show_caption else ""
-                        )
                         sent = await adapter.send_image(
                             group_id, str(comic_file_path), caption=caption
                         )
@@ -517,7 +513,9 @@ class ComicCommandHandler:
                 elif fallback_url:
                     adapter = self.bot_manager.get_adapter(platform_id)
                     if adapter:
-                        await adapter.send_image(group_id, fallback_url)
+                        await adapter.send_image(
+                            group_id, fallback_url, caption=caption
+                        )
                 else:
                     logger.warning(f"群 {group_id} 漫画生成未产生有效输出。")
             except Exception as e:
