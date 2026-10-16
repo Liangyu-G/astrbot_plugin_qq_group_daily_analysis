@@ -14,10 +14,13 @@ from collections.abc import Iterable
 from pathlib import Path
 from typing import TYPE_CHECKING
 
+from astrbot.api.star import StarTools
+
 from ....shared.constants import PLUGIN_NAME
 from ....utils.cdn_utils import normalize_cdn_base_url
 from ....utils.logger import logger
 from ...reporting.cdn_probe import probe_template_cdn
+from ...reporting.wordcloud_renderer import WordCloudRenderer
 from ..web_compat import WebApiResponse, error_response, json_response, request
 
 if TYPE_CHECKING:
@@ -65,11 +68,17 @@ class ConfigRoutes:
         report_dispatcher: ReportDispatcher | None = None,
         context: Context | None = None,
         auto_scheduler: AutoScheduler | None = None,
+        wordcloud_renderer: WordCloudRenderer | None = None,
+        resource_lock: asyncio.Lock | None = None,
     ) -> None:
         self.analysis_service = analysis_service
         self.report_dispatcher = report_dispatcher
         self.context = context
         self.auto_scheduler = auto_scheduler
+        self.wordcloud_renderer = wordcloud_renderer
+        self._wordcloud_resource_lock = (
+            resource_lock if resource_lock is not None else asyncio.Lock()
+        )
 
     async def api_get_config(self) -> WebApiResponse:
         """获取插件当前配置数据与完整 Schema 结构定义"""
@@ -167,6 +176,13 @@ class ConfigRoutes:
             if config_obj is None:
                 return error_response("配置管理器未初始化", status_code=500)
 
+            wordcloud: dict[str, object] | None = None
+            if "wordcloud" in new_config:
+                raw_wordcloud = new_config["wordcloud"]
+                if not isinstance(raw_wordcloud, dict):
+                    return error_response("词云配置必须是对象", status_code=400)
+                wordcloud = raw_wordcloud
+
             if "t2i_rendering" in new_config:
                 rendering_config = new_config["t2i_rendering"]
                 if not isinstance(rendering_config, dict):
@@ -219,92 +235,111 @@ class ConfigRoutes:
                             status_code=400,
                         )
 
-            plugin_root = Path(__file__).resolve().parents[4]
-
-            def _cleanse_reference_images(val: object, config_key: str = "") -> object:
-                """仅清洗漫画角色与参考图，其他动态配置保持原样。
-
-                Args:
-                    val: 待保存的配置节点。
-                    config_key: 当前节点的配置路径。
-
-                Returns:
-                    清洗后的配置节点。
-                """
-                if isinstance(val, list):
-                    if config_key not in (
-                        "daily_comic.comic_characters",
-                        "daily_comic.comic_characters.reference_images",
-                    ):
-                        return val
-                    cleaned = []
-                    for item in val:
-                        if isinstance(item, dict):
-                            cleaned_item = _cleanse_reference_images(item, config_key)
-                            if (
-                                config_key == "daily_comic.comic_characters"
-                                and isinstance(cleaned_item, dict)
-                                and (
-                                    "__template_key" not in cleaned_item
-                                    or not cleaned_item["__template_key"]
-                                )
-                            ):
-                                cleaned_item["__template_key"] = "character"
-                            cleaned.append(cleaned_item)
-                        elif isinstance(item, str) and config_key.endswith(
-                            ".reference_images"
-                        ):
-                            folder = _config_key_to_folder(
-                                "daily_comic.comic_characters.templates.character.reference_images"
-                            )
-                            if item.startswith("data:image/"):
-                                try:
-                                    _, b64 = item.split(",", 1)
-                                    file_bytes = base64.b64decode(b64)
-                                    ts = int(time.time() * 1000)
-                                    filename = f"{ts}_migrated_image.png"
-                                    for d in [
-                                        Path.cwd()
-                                        / "data"
-                                        / "plugin_data"
-                                        / PLUGIN_NAME
-                                        / "files"
-                                        / Path(folder),
-                                        plugin_root / "files" / Path(folder),
-                                    ]:
-                                        d.mkdir(parents=True, exist_ok=True)
-                                        (d / filename).write_bytes(file_bytes)
-                                    cleaned.append(f"files/{folder}/{filename}")
-                                except Exception:
-                                    pass
-                            elif item.startswith("files/"):
-                                expected_prefix = f"files/{folder}/"
-                                if item.startswith(expected_prefix):
-                                    cleaned.append(item.strip())
-                                else:
-                                    clean_name = Path(item).name
-                                    cleaned.append(f"files/{folder}/{clean_name}")
-                            elif item.strip():
-                                cleaned.append(item.strip())
-                        else:
-                            cleaned.append(item)
-                    return cleaned
-                if isinstance(val, dict):
-                    return {
-                        k: _cleanse_reference_images(
-                            v, f"{config_key}.{k}" if config_key else k
+            async with self._wordcloud_resource_lock:
+                if wordcloud is not None:
+                    if self.wordcloud_renderer is None:
+                        # 兼容旧装配入口，但仍使用正式目录进行资源校验。
+                        assert cfg_mgr is not None
+                        self.wordcloud_renderer = WordCloudRenderer(
+                            cfg_mgr, StarTools.get_data_dir(PLUGIN_NAME)
                         )
-                        for k, v in val.items()
-                    }
-                return val
+                    try:
+                        await asyncio.to_thread(
+                            self.wordcloud_renderer.validate_config_resources, wordcloud
+                        )
+                    except ValueError as exc:
+                        return error_response(str(exc), status_code=400)
 
-            cleansed = _cleanse_reference_images(save_dto["config"])
-            if isinstance(cleansed, dict):
-                for k, v in cleansed.items():
-                    config_obj[k] = v
+                plugin_root = Path(__file__).resolve().parents[4]
 
-            if cfg_mgr:
-                cfg_mgr.save_config()
+                def _cleanse_reference_images(
+                    val: object, config_key: str = ""
+                ) -> object:
+                    """仅清洗漫画角色与参考图，其他动态配置保持原样。
+
+                    Args:
+                        val: 待保存的配置节点。
+                        config_key: 当前节点的配置路径。
+
+                    Returns:
+                        清洗后的配置节点。
+                    """
+                    if isinstance(val, list):
+                        if config_key not in (
+                            "daily_comic.comic_characters",
+                            "daily_comic.comic_characters.reference_images",
+                        ):
+                            return val
+                        cleaned = []
+                        for item in val:
+                            if isinstance(item, dict):
+                                cleaned_item = _cleanse_reference_images(
+                                    item, config_key
+                                )
+                                if (
+                                    config_key == "daily_comic.comic_characters"
+                                    and isinstance(cleaned_item, dict)
+                                    and (
+                                        "__template_key" not in cleaned_item
+                                        or not cleaned_item["__template_key"]
+                                    )
+                                ):
+                                    cleaned_item["__template_key"] = "character"
+                                cleaned.append(cleaned_item)
+                            elif isinstance(item, str) and config_key.endswith(
+                                ".reference_images"
+                            ):
+                                folder = _config_key_to_folder(
+                                    "daily_comic.comic_characters.templates.character.reference_images"
+                                )
+                                if item.startswith("data:image/"):
+                                    try:
+                                        _, b64 = item.split(",", 1)
+                                        file_bytes = base64.b64decode(b64)
+                                        ts = int(time.time() * 1000)
+                                        filename = f"{ts}_migrated_image.png"
+                                        for d in [
+                                            Path.cwd()
+                                            / "data"
+                                            / "plugin_data"
+                                            / PLUGIN_NAME
+                                            / "files"
+                                            / Path(folder),
+                                            plugin_root / "files" / Path(folder),
+                                        ]:
+                                            d.mkdir(parents=True, exist_ok=True)
+                                            (d / filename).write_bytes(file_bytes)
+                                        cleaned.append(f"files/{folder}/{filename}")
+                                    except Exception:
+                                        pass
+                                elif item.startswith("files/"):
+                                    expected_prefix = f"files/{folder}/"
+                                    if item.startswith(expected_prefix):
+                                        cleaned.append(item.strip())
+                                    else:
+                                        clean_name = Path(item).name
+                                        cleaned.append(f"files/{folder}/{clean_name}")
+                                elif item.strip():
+                                    cleaned.append(item.strip())
+                            else:
+                                cleaned.append(item)
+                        return cleaned
+                    if isinstance(val, dict):
+                        return {
+                            k: _cleanse_reference_images(
+                                v, f"{config_key}.{k}" if config_key else k
+                            )
+                            for k, v in val.items()
+                        }
+                    return val
+
+                cleansed = _cleanse_reference_images(save_dto["config"])
+                if isinstance(cleansed, dict):
+                    for k, v in cleansed.items():
+                        config_obj[k] = v
+
+                if cfg_mgr:
+                    cfg_mgr.save_config()
 
             if self.auto_scheduler is not None and self.context is not None:
                 self.auto_scheduler.schedule_jobs(self.context)

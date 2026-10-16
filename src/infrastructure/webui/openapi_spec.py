@@ -22,6 +22,207 @@ def generate_openapi_spec() -> dict[str, Any]:
             "description": "REST API and data contract specification for AstrBot QQ Group Daily Analysis Dashboard",
         },
         "paths": {
+            "/wordcloud/templates": {
+                "get": {
+                    "summary": "列出支持词云的模板与已上传字体",
+                    "operationId": "getWordcloudTemplates",
+                    "responses": {
+                        "200": {
+                            "description": "data.templates 为 name/label/defaults 列表，可选 thumbnail 是已有缩略图的数据地址；data.fonts 为 id/label/uploaded 列表"
+                        }
+                    },
+                }
+            },
+            "/wordcloud/snapshots": {
+                "get": {
+                    "summary": "只读列出每个群最近一次已缓存词频，不重新拉取群消息",
+                    "operationId": "getWordcloudSnapshots",
+                    "responses": {
+                        "200": {
+                            "description": "data.snapshots 包含 id、umo、group_id、group_label、date_str、updated_at、message_count、word_count、start_timestamp、end_timestamp；时间戳均为 Unix 秒"
+                        },
+                        "503": {"description": "词云缓存尚未初始化"},
+                    },
+                }
+            },
+            "/wordcloud/preview": {
+                "post": {
+                    "summary": "使用未保存的词云外观草稿预览",
+                    "operationId": "previewWordcloud",
+                    "requestBody": {
+                        "required": True,
+                        "content": {
+                            "application/json": {
+                                "schema": {
+                                    "type": "object",
+                                    "properties": {
+                                        "mode": {
+                                            "type": "string",
+                                            "enum": ["html", "image"],
+                                        },
+                                        "umo": {
+                                            "type": "string",
+                                            "description": "可选完整群会话标识，用于框架渲染端点和群覆盖",
+                                        },
+                                        "source": {
+                                            "type": "string",
+                                            "enum": ["sample", "snapshot"],
+                                            "default": "sample",
+                                        },
+                                        "snapshot_id": {
+                                            "type": "string",
+                                            "description": "source=snapshot 时必填，来自缓存列表的版本标识",
+                                        },
+                                        "options": {
+                                            "type": "object",
+                                            "description": "与插件 wordcloud 配置相同的草稿字段，包括 word_spacing",
+                                        },
+                                    },
+                                    "required": ["options", "mode"],
+                                }
+                            }
+                        },
+                    },
+                    "responses": {
+                        "200": {
+                            "description": "data.html 为完整生产模板 HTML，或 data.image 为图片地址；data.metadata 含来源、群标识、日期、消息数、完整词数、eligible_word_count、display_word_count 和 notes；快照预览仅筛选已缓存词频，不重新分词或修改正式统计"
+                        },
+                        "400": {"description": "配置字段无效"},
+                        "404": {"description": "缓存已失效，请刷新列表重新选择"},
+                        "500": {"description": "字体、模板或 T2I 渲染失败"},
+                    },
+                }
+            },
+            "/wordcloud/fonts": {
+                "post": {
+                    "summary": "上传不超过20 MB的WOFF2、WOFF、TTF或OTF字体",
+                    "operationId": "uploadWordcloudFont",
+                    "requestBody": {
+                        "required": True,
+                        "content": {
+                            "multipart/form-data": {
+                                "schema": {
+                                    "type": "object",
+                                    "properties": {
+                                        "file": {"type": "string", "format": "binary"}
+                                    },
+                                    "required": ["file"],
+                                }
+                            }
+                        },
+                    },
+                    "responses": {
+                        "200": {
+                            "description": "data.id 是可保存到 wordcloud.font 的稳定标识，data.label 是文件名"
+                        },
+                        "400": {"description": "文件超限或格式无效"},
+                    },
+                }
+            },
+            "/wordcloud/fonts/preview": {
+                "post": {
+                    "summary": "读取自包含字体样张 HTML，等待字体加载后标记 ready",
+                    "operationId": "previewWordcloudFont",
+                    "requestBody": {
+                        "required": True,
+                        "content": {
+                            "application/json": {
+                                "schema": {
+                                    "type": "object",
+                                    "properties": {"font": {"type": "string"}},
+                                    "required": ["font"],
+                                }
+                            }
+                        },
+                    },
+                    "responses": {
+                        "200": {
+                            "description": "data.font 和 data.html；不保存配置或群统计"
+                        },
+                        "400": {"description": "字体标识或文件无效"},
+                    },
+                }
+            },
+            "/wordcloud/fonts/rename": {
+                "post": {
+                    "summary": "重命名上传字体的显示标签，保留配置引用标识",
+                    "operationId": "renameWordcloudFont",
+                    "requestBody": {
+                        "required": True,
+                        "content": {
+                            "application/json": {
+                                "schema": {
+                                    "type": "object",
+                                    "properties": {
+                                        "id": {"type": "string"},
+                                        "label": {
+                                            "type": "string",
+                                            "minLength": 1,
+                                            "maxLength": 120,
+                                        },
+                                    },
+                                    "required": ["id", "label"],
+                                }
+                            }
+                        },
+                    },
+                    "responses": {
+                        "200": {"description": "data 为 id/label/uploaded"},
+                        "400": {"description": "标识或名称无效"},
+                        "404": {"description": "字体不存在"},
+                    },
+                }
+            },
+            "/wordcloud/fonts/delete": {
+                "post": {
+                    "summary": "将未被全局或任意群引用的上传字体移入可恢复目录",
+                    "operationId": "deleteWordcloudFont",
+                    "requestBody": {
+                        "required": True,
+                        "content": {
+                            "application/json": {
+                                "schema": {
+                                    "type": "object",
+                                    "properties": {"id": {"type": "string"}},
+                                    "required": ["id"],
+                                }
+                            }
+                        },
+                    },
+                    "responses": {
+                        "200": {"description": "data 为 id/deleted，不修改任何配置"},
+                        "400": {"description": "字体标识无效"},
+                        "404": {"description": "字体不存在"},
+                        "409": {
+                            "description": "字体仍被设置引用，需修改并保存后再删除"
+                        },
+                    },
+                }
+            },
+            "/wordcloud/fonts/restore": {
+                "post": {
+                    "summary": "恢复最近删除的同标识字体，不覆盖已存在的字体",
+                    "operationId": "restoreWordcloudFont",
+                    "requestBody": {
+                        "required": True,
+                        "content": {
+                            "application/json": {
+                                "schema": {
+                                    "type": "object",
+                                    "properties": {"id": {"type": "string"}},
+                                    "required": ["id"],
+                                }
+                            }
+                        },
+                    },
+                    "responses": {
+                        "200": {"description": "data 为 id/label/uploaded"},
+                        "400": {"description": "字体标识无效"},
+                        "404": {"description": "未找到可恢复字体"},
+                        "409": {"description": "现有字体冲突或回收文件内容校验失败"},
+                    },
+                }
+            },
             "/config/test-template-cdn": {
                 "post": {
                     "summary": "从插件服务器通过 HEAD 检查 GitHub 和 npm 资源链接",
