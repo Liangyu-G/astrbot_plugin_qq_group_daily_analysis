@@ -1,6 +1,7 @@
 import { z } from "zod";
 import type { SchemaFieldItem, SchemaGroupItem } from "./types";
 import { renderingConfigLoadSchema, renderingSaveSchema } from "./renderingConfig";
+import { wordCloudOptionsSchema } from "../../wordcloud/model/types";
 
 const schemaField: z.ZodType<SchemaFieldItem> = z.lazy(() => z.object({
   type: z.string(),
@@ -38,4 +39,5 @@ export const pluginConfigResponseSchema = z.object({
 
 export const pluginConfigSaveSchema = pluginConfigSchema.extend({
   t2i_rendering: renderingSaveSchema.optional(),
+  wordcloud: wordCloudOptionsSchema.optional(),
 });

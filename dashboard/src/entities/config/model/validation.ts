@@ -1,6 +1,7 @@
 import { cdnBaseUrlSchema } from "./renderingConfig";
 import { z } from "zod";
 import { PluginSchema, SchemaFieldItem } from "./types";
+import { wordCloudOptionsSchema } from "../../wordcloud/model/types";
 
 export interface ConfigValidationError {
   groupKey: string;
@@ -26,9 +27,17 @@ const TIME_REGEX = /^([01]?\d|2[0-3]):[0-5]\d$/;
  */
 export function buildFieldZodSchema(
   fieldKey: string,
-  field: SchemaFieldItem
+  field: SchemaFieldItem,
+  groupKey?: string,
 ): z.ZodType {
   if (fieldKey === "t2i_cdn_base_url") return cdnBaseUrlSchema.optional();
+  // 宿主的静态下拉只列出内置项；控制台目录还包含上传字体和新增主题。
+  if (groupKey === "wordcloud" && fieldKey === "font") {
+    return z.string().regex(/^(?:wenkai|sans|serif|uploaded:[a-f0-9]{64}\.(?:woff2?|ttf|otf))$/, "请选择内置字体或已上传字体").optional();
+  }
+  if (groupKey === "wordcloud" && fieldKey === "template") {
+    return z.string().regex(/^[\p{L}\p{N}_-]+$/u, "请选择有效的词云模板").optional();
+  }
 
   // 1. 单选下拉选项校验（排除 list 多选类型以及可自定义的 report_template）
   if (
@@ -224,9 +233,10 @@ export function buildFieldZodSchema(
 export function validateSingleFieldWithZod(
   fieldKey: string,
   field: SchemaFieldItem,
-  value: unknown
+  value: unknown,
+  groupKey?: string,
 ): string | null {
-  const validator = buildFieldZodSchema(fieldKey, field);
+  const validator = buildFieldZodSchema(fieldKey, field, groupKey);
   const result = validator.safeParse(value);
   if (!result.success) {
     return result.error.issues[0]?.message || "填写内容不符合规范";
@@ -296,7 +306,7 @@ export function validateConfigWithZod(
         return;
       }
 
-      const errorMsg = validateSingleFieldWithZod(fieldKey, field, value);
+      const errorMsg = validateSingleFieldWithZod(fieldKey, field, value, groupKey);
       if (errorMsg) {
         errors.push({
           groupKey,
@@ -315,6 +325,41 @@ export function validateConfigWithZod(
         groupErrorCounts[groupKey] = (groupErrorCounts[groupKey] || 0) + 1;
       }
     });
+
+    if (groupKey === "wordcloud") {
+      const addError = (key: string, detail: string) => {
+        if (errorMap[groupKey]?.[key]) return;
+        const fieldLabel = groupItems[key]?.description || key;
+        errors.push({ groupKey, groupLabel, fieldKey: key, fieldLabel, message: detail, path: `${groupKey}.${key}`, domId: `cfg-field-${groupKey}-${key}` });
+        errorMap[groupKey] = { ...errorMap[groupKey], [key]: detail };
+        groupErrorCounts[groupKey] = (groupErrorCounts[groupKey] || 0) + 1;
+      };
+      const parsed = wordCloudOptionsSchema.safeParse(groupData);
+      if (!parsed.success) {
+        for (const issue of parsed.error.issues) addError(String(issue.path[0] || "template"), issue.message);
+      }
+      const overrides = groupData.group_overrides;
+      if (overrides !== undefined) {
+        if (!overrides || typeof overrides !== "object" || Array.isArray(overrides)) {
+          addError("group_overrides", "群级覆盖必须是配置对象");
+        } else {
+          for (const [umo, partial] of Object.entries(overrides)) {
+            if (!/^.+:GroupMessage:.+$/.test(umo) || !partial || typeof partial !== "object" || Array.isArray(partial)) {
+              addError("group_overrides", "请填写有效的群会话标识和覆盖配置");
+              break;
+            }
+            const effective = { ...groupData, ...partial };
+            const check = wordCloudOptionsSchema.safeParse(effective);
+            const fontError = validateSingleFieldWithZod("font", groupItems.font ?? { type: "string" }, effective.font, "wordcloud");
+            const templateError = validateSingleFieldWithZod("template", groupItems.template ?? { type: "string" }, effective.template, "wordcloud");
+            if (!check.success || fontError || templateError) {
+              addError("group_overrides", `${umo}：${!check.success ? check.error.issues[0].message : fontError || templateError}`);
+              break;
+            }
+          }
+        }
+      }
+    }
   });
 
   return {
