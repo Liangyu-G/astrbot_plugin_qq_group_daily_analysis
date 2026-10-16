@@ -1003,6 +1003,13 @@ class ConfigManager:
             )
         )
 
+    def get_wordcloud_album_name(self) -> str:
+        """获取词云目标相册名称，未单独设置时沿用图片报告相册。"""
+        name = str(
+            self._get_group("qq_group_upload").get("wordcloud_album_name", "") or ""
+        ).strip()
+        return name or self.get_group_album_name().strip()
+
     def get_group_album_strict_mode(self) -> bool:
         """获取群相册上传严格模式开关。"""
         return bool(
