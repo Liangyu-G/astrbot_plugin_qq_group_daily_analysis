@@ -67,6 +67,7 @@ export function useConfigViewModel(onConfigSaved?: () => void) {
   const [personas, setPersonas] = useState<AvailablePersona[]>([]);
   const [activeCategory, setActiveCategory] = useState<string>("basic");
   const [searchQuery, setSearchQuery] = useState("");
+  const [reloadConfirmationOpen, setReloadConfirmationOpen] = useState(false);
 
   // 校验错误状态：按 分组Key -> 字段Key -> 错误信息 存储
   const [errors, setErrors] = useState<Record<string, Record<string, string>>>({});
@@ -149,7 +150,7 @@ export function useConfigViewModel(onConfigSaved?: () => void) {
       }
 
       if (fieldSchema) {
-        const fieldError = validateSingleFieldWithZod(fieldKey, fieldSchema, value);
+        const fieldError = validateSingleFieldWithZod(fieldKey, fieldSchema, value, groupKey);
         setErrors((prevErrors) => {
           const nextErrors = { ...prevErrors };
           const groupErrors = { ...(nextErrors[groupKey] || {}) };
@@ -187,6 +188,52 @@ export function useConfigViewModel(onConfigSaved?: () => void) {
   const isDirty = useMemo(() => {
     return JSON.stringify(formData) !== JSON.stringify(originalConfig);
   }, [formData, originalConfig]);
+
+  const wordCloudDirty = JSON.stringify(formData.wordcloud ?? {}) !== JSON.stringify(originalConfig.wordcloud ?? {});
+
+  useEffect(() => {
+    if (!isDirty) return;
+    const warnBeforeUnload = (event: BeforeUnloadEvent) => {
+      event.preventDefault();
+      event.returnValue = "";
+    };
+    window.addEventListener("beforeunload", warnBeforeUnload);
+    return () => window.removeEventListener("beforeunload", warnBeforeUnload);
+  }, [isDirty]);
+
+  // 预设和群级覆盖一次更新整个补丁，避免中间状态触发额外预览。
+  const handleGroupPatch = (groupKey: string, patch: Record<string, unknown>) => {
+    if (!configLoaded || loading || saving) return;
+    setFormData((previous) => ({ ...previous, [groupKey]: { ...previous[groupKey], ...patch } }));
+  };
+
+  const restoreSavedWordCloud = () => {
+    if (!configLoaded || loading || saving) return;
+    setFormData((previous) => {
+      const next = { ...previous };
+      if (originalConfig.wordcloud) next.wordcloud = JSON.parse(JSON.stringify(originalConfig.wordcloud));
+      else delete next.wordcloud;
+      return next;
+    });
+  };
+
+  // 词云的关联范围、动态目录及群级继承需要以整组草稿进行校验。
+  useEffect(() => {
+    if (!schema.wordcloud) return;
+    const validation = validateConfigWithZod({ wordcloud: formData.wordcloud ?? {} }, { wordcloud: schema.wordcloud });
+    setErrors((previous) => {
+      const next = { ...previous };
+      if (validation.errorMap.wordcloud) next.wordcloud = validation.errorMap.wordcloud;
+      else delete next.wordcloud;
+      return next;
+    });
+    setGroupErrorCounts((previous) => {
+      const next = { ...previous };
+      if (validation.groupErrorCounts.wordcloud) next.wordcloud = validation.groupErrorCounts.wordcloud;
+      else delete next.wordcloud;
+      return next;
+    });
+  }, [formData.wordcloud, schema.wordcloud]);
 
   const handleSave = async () => {
     if (!configLoaded || loading || saving) {
@@ -329,6 +376,8 @@ export function useConfigViewModel(onConfigSaved?: () => void) {
     configLoaded,
     saving,
     isDirty,
+    wordCloudDirty,
+    reloadConfirmationOpen,
     schema,
     formData,
     providers,
@@ -343,7 +392,18 @@ export function useConfigViewModel(onConfigSaved?: () => void) {
     setSearchQuery,
     setActiveCategory,
     handleFieldChange,
+    handleGroupPatch,
+    restoreSavedWordCloud,
     handleSave,
-    handleReload: () => loadConfig(true),
+    handleReload: () => {
+      if (loading || saving) return;
+      if (isDirty) setReloadConfirmationOpen(true);
+      else void loadConfig(true);
+    },
+    cancelReload: () => setReloadConfirmationOpen(false),
+    confirmReload: () => {
+      setReloadConfirmationOpen(false);
+      return loadConfig(true);
+    },
   };
 }
