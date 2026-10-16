@@ -130,7 +130,7 @@ class WordCloudDeliveryService:
             adapter = self.message_sender.bot_manager.get_adapter(platform_id)
             if not isinstance(adapter, GroupAlbumSupportProtocol):
                 return
-            album_name = self.config_manager.get_group_album_name().strip()
+            album_name = self.config_manager.get_wordcloud_album_name()
             strict_mode = self.config_manager.get_group_album_strict_mode()
             album_id = None
             if album_name:
