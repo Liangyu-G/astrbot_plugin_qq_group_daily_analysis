@@ -17,6 +17,9 @@ from ...utils.logger import logger
 if TYPE_CHECKING:
     from collections.abc import Awaitable, Callable
 
+    from ...application.services.wordcloud_delivery_service import (
+        WordCloudDeliveryService,
+    )
     from ...domain.repositories.platform_adapter_repository import (
         GroupAlbumSupportProtocol,
         GroupFileSupportProtocol,
@@ -47,6 +50,7 @@ class ReportDispatcher:
         self.config_manager = config_manager
         self.report_generator = report_generator
         self.message_sender = message_sender
+        self.wordcloud_delivery: WordCloudDeliveryService | None = None
         self._html_render_func: Callable[..., Awaitable[str | bytes | None]] | None = (
             None
         )
@@ -116,6 +120,14 @@ class ReportDispatcher:
             logger.info(
                 f"[{trace_id}] 群 {group_id} 的报告分发完成，至少一种格式发送成功"
             )
+            if self.wordcloud_delivery:
+                adapter = self.message_sender.bot_manager.get_adapter(platform_id)
+                resolved_platform = platform_id or (
+                    adapter.platform_id if adapter else ""
+                )
+                await self.wordcloud_delivery.send_with_report(
+                    analysis_result.get("wordcloud"), group_id, resolved_platform
+                )
         else:
             logger.error(f"[{trace_id}] 群 {group_id} 的报告分发失败，未发送任何报告")
         return sent_any
