@@ -238,6 +238,14 @@ class IConfigProvider(Protocol):
         """获取目标群相册名称"""
         ...
 
+    def get_enable_wordcloud_album_upload(self) -> bool:
+        """获取是否启用词云群相册上传。"""
+        ...
+
+    def get_wordcloud_album_name(self) -> str:
+        """获取词云目标相册名称，未单独设置时沿用图片报告相册。"""
+        ...
+
     def get_group_album_strict_mode(self) -> bool:
         """获取群相册上传严格模式开关"""
         ...
