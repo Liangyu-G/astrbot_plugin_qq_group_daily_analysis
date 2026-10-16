@@ -14,6 +14,7 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from astrbot.api.star import StarTools
 
+from ...domain.value_objects.wordcloud import WordCloudOptions
 from ...shared.constants import (
     DEFAULT_ATRI_ASSETS_CDN_URL,
     DEFAULT_CDN_HOST,
@@ -58,6 +59,47 @@ class ConfigManager:
     def _protect_upgrade_data(self) -> None:
         """在插件升级且配置结构发生变更时备份旧配置（委托 ConfigMigrator）。"""
         self._migrator.protect_upgrade_data()
+
+    def get_wordcloud_options(self, umo: str = "") -> WordCloudOptions:
+        """按模板默认、全局配置、完整会话覆盖的顺序解析词云设置。
+
+        Args:
+            umo: 平台标识、会话类型和群号组成的完整会话标识。
+
+        Returns:
+            已验证的词云设置。
+
+        Raises:
+            ValueError: 配置内容或模板标识无效。
+        """
+        from pathlib import Path
+
+        group = self.config.get("wordcloud", {})
+        if not isinstance(group, dict):
+            raise ValueError("词云配置必须是对象")
+        overrides = group.get("group_overrides", {})
+        if not isinstance(overrides, dict):
+            raise ValueError("词云群级覆盖必须是以完整会话标识为键的对象")
+        override = overrides.get(umo, {}) if umo else {}
+        if not isinstance(override, dict):
+            raise ValueError("词云群级覆盖内容必须是对象")
+        explicit = {**group, **override}
+        template_name = WordCloudOptions.from_mapping(
+            {"template": explicit.get("template", "ATRI")}
+        ).template
+        template_dir = Path(__file__).parents[1] / "reporting/templates" / template_name
+        if not template_dir.is_dir():
+            template_dir = (
+                self.get_custom_report_template_dir(template_name) or template_dir
+            )
+        defaults_file = template_dir / "wordcloud_defaults.json"
+        defaults: dict[str, object] = {}
+        if defaults_file.is_file():
+            raw = json.loads(defaults_file.read_text(encoding="utf-8"))
+            if not isinstance(raw, dict):
+                raise ValueError("词云模板默认设置必须是对象")
+            defaults = raw
+        return WordCloudOptions.from_mapping({**defaults, **explicit})
 
     @staticmethod
     def _get_plugin_root() -> Path:
@@ -952,6 +994,14 @@ class ConfigManager:
     def get_group_album_name(self) -> str:
         """获取目标群相册名称，空字符串表示默认相册"""
         return self._get_group("qq_group_upload").get("group_album_name", "")
+
+    def get_enable_wordcloud_album_upload(self) -> bool:
+        """获取词云图片成功发送后是否额外上传群相册。"""
+        return bool(
+            self._get_group("qq_group_upload").get(
+                "enable_wordcloud_album_upload", False
+            )
+        )
 
     def get_group_album_strict_mode(self) -> bool:
         """获取群相册上传严格模式开关。"""
