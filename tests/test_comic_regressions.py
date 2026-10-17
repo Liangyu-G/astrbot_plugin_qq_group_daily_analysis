@@ -12,6 +12,11 @@ from typing import Any
 from unittest.mock import AsyncMock, Mock
 from zoneinfo import ZoneInfoNotFoundError
 
+from src.domain.value_objects.comic_template_rotation import (
+    ComicGenerationSnapshot,
+    ComicTemplateSelection,
+)
+from src.infrastructure.config.comic_template_rotation import ComicTemplateRotationStore
 from src.infrastructure.reporting.generators import ReportGenerator
 from src.infrastructure.reporting.templates import HTMLTemplates
 
@@ -150,7 +155,7 @@ def load_main_method(name: str):
             return await target_func(plugin, *args, **kwargs)
 
         return async_wrapper
-    elif inspect.isasyncgenfunction(target_func):
+    if inspect.isasyncgenfunction(target_func):
 
         @functools.wraps(target_func)
         async def async_gen_wrapper(plugin, *args, **kwargs):
@@ -159,14 +164,13 @@ def load_main_method(name: str):
                 yield item
 
         return async_gen_wrapper
-    else:
 
-        @functools.wraps(target_func)
-        def sync_wrapper(plugin, *args, **kwargs):
-            _ensure_plugin_handlers(plugin)
-            return target_func(plugin, *args, **kwargs)
+    @functools.wraps(target_func)
+    def sync_wrapper(plugin, *args, **kwargs):
+        _ensure_plugin_handlers(plugin)
+        return target_func(plugin, *args, **kwargs)
 
-        return sync_wrapper
+    return sync_wrapper
 
 
 def load_comic_service_method(name: str):
@@ -211,11 +215,13 @@ def load_comic_service_method(name: str):
     )
     from collections.abc import Sequence
     from contextlib import nullcontext
+
     from src.domain.value_objects import ComicStoryboard, SummaryTopic
     from src.shared.trace_context import TraceContext
 
     namespace = {
         "Path": Path,
+        "asyncio": asyncio,
         "mimetypes": mimetypes,
         "logger": Mock(),
         "Any": Any,
@@ -340,6 +346,7 @@ def load_config_manager_class(plugin_data_dir: Path):
             "src.infrastructure.config.config_migrator",
             fromlist=["ConfigMigrator"],
         ).ConfigMigrator,
+        "ComicTemplateRotationStore": ComicTemplateRotationStore,
     }
     exec(compile(isolated_module, str(config_path), "exec"), namespace)
     return namespace["ConfigManagerHarness"]
@@ -507,15 +514,21 @@ def test_comic_generation_passes_character_storyboard_prompt():
     """漫画生成应把选中角色的专属模板传给分镜分析器。"""
     generate_comic = load_comic_service_method("generate_comic")
     topics = [{"topic": "话题", "detail": "详情"}]
-    character = {"name": "角色甲", "storyboard_prompt": "角色模板"}
     llm_analyzer = SimpleNamespace(
         analyze_comic_storyboards=AsyncMock(return_value=([], object()))
     )
     config_manager = SimpleNamespace(
         get_enable_daily_comic=Mock(return_value=True),
-        get_selected_comic_character=Mock(return_value=character),
-        get_comic_character_persona_id=Mock(return_value="persona-a"),
-        get_comic_character_storyboard_prompt=Mock(return_value="角色模板"),
+        get_comic_generation_snapshot=Mock(
+            return_value=ComicGenerationSnapshot(
+                "角色甲",
+                "persona-a",
+                (),
+                ComicTemplateSelection(
+                    "character", "角色甲专属提示词", "fixed", "global", "角色模板", True
+                ),
+            )
+        ),
     )
     service = SimpleNamespace(
         config_manager=config_manager,
@@ -1099,6 +1112,17 @@ def _comic_config_manager(**overrides):
         "get_drawing_output_exception_retry_keywords": Mock(return_value=[]),
     }
     defaults.update(overrides)
+    defaults.setdefault(
+        "get_comic_generation_snapshot",
+        Mock(
+            return_value=ComicGenerationSnapshot(
+                "默认配置",
+                "",
+                tuple(defaults["get_drawing_reference_images"]()),
+                ComicTemplateSelection("classic", "原版漫画", "fixed", "global", ""),
+            )
+        ),
+    )
     return SimpleNamespace(**defaults)
 
 
@@ -1542,7 +1566,7 @@ def test_comic_storyboard_assembler_combines_scene_and_panels():
         ensure_ascii=False,
     )
 
-    success, result, error = analyzer.parse_structured_response(llm_output)
+    success, result, _error = analyzer.parse_structured_response(llm_output)
     assert success is True
     assert result is not None
     assert len(result) == 1
