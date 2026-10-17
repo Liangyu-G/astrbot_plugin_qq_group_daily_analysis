@@ -1,6 +1,6 @@
 # 漫画场景分析提示词模板
 
-插件内置原版漫画及本文三种新增风格，可在全局默认提示词中直接选择，也可作为角色专属提示词独立使用。
+插件内置十四种漫画风格，可在全局默认提示词中直接选择，也可作为角色专属提示词独立使用。内置提示词目录、配置下拉选项与 WebUI 共用同一套标识。
 
 ## 模板目录
 
@@ -10,14 +10,24 @@
 | 01 | SCP 异常调查档案风 | 旧档案纸、监控证物、照片拼贴与保密印章 |
 | 02 | 黑色电影侦探风 | 暗调街景、侦探角色、复古手绘气泡与案件标题条 |
 | 03 | 像素 RPG 每日冒险日志 | Q 版像素角色、游戏对白窗口、黑金任务栏与冒险场景 |
+| 04 | 赛博朋克义体HUD日志 | 半透明青色全息对白框、霓虹义体界面与 SYS_LOG 系统日志 |
+| 05 | 复古昭和怪谈画报风 | 昭和四色网点画报、毛笔墨线对白与朱红标题签 |
+| 06 | 蒸汽朋克发明家手稿 | 钢笔淡彩、黄铜铆钉边框、羊皮纸对白与 PROJECT 铭牌 |
+| 07 | 炼金术士魔导植物志 | 水彩魔导手抄本、植物星轨边框、火漆印章与 FOLIO 丝带 |
+| 08 | 废土生存广播电台日志 | 废土电台金属框、荧光终端对白与 RADIO 压纹胶带 |
+| 09 | 浮世绘锦绘町人见闻录 | 浮世绘木版画、和纸流云对白与朱红短册标题 |
+| 10 | 美式黄金时代超英漫画 | 美式黄金时代本戴网点、黑墨线对白与 ISSUE 明黄叙事盒 |
+| 11 | 深海科考潜航器观测录 | 深海潜航器舷窗、冰青声呐对白与 SONAR 银灰金属标签 |
+| 12 | 怪盗团预告信剪报拼贴 | 红黑白怪盗波普剪报、锐角对白框与 TARGET 预告横幅 |
+| 13 | 手账剪贴簿拍立得日记 | 暖色手账方格纸、和纸胶带、便利贴对白与 MEMO 拍立得白边 |
 
 ## 使用方法
 
 1. 打开插件配置或插件 WebUI 的「提示词模板」→「默认漫画场景分析提示词」。
-2. 在「默认漫画提示词模板」中选择原版、SCP 档案风、侦探风、像素 RPG 或自定义，保存配置。通过 AstrBot 插件配置页修改后按宿主提示重载插件。
-3. 自定义模式使用下方文本框；选择内置模板不会覆盖自定义文本。WebUI 支持预览完整内置提示词，也可点「复制为自定义」继续修改，已有自定义文本时会先确认替换。
+2. 在「默认漫画提示词模板」中选择十四种内置风格之一或自定义，保存配置。通过 AstrBot 插件配置页修改后按宿主提示重载插件。
+3. 自定义模式使用下方文本框；选择内置模板不会覆盖自定义文本。WebUI 支持查看风格示例图和预览完整内置提示词，也可点「复制为自定义」继续修改，已有自定义文本时会先确认替换。
 
-全局配置字段为 `prompts.comic_analysis_prompts.comic_storyboard_template`，内置标识依次为 `classic`、`scp_dossier`、`noir_detective`、`pixel_rpg`，自定义标识为 `custom`。自定义正文保留在原字段 `comic_storyboard_prompt` 中。为兼容已保存的自定义内容，新增选项默认使用 `custom`；正文留空时回退到原版。
+全局配置字段为 `prompts.comic_analysis_prompts.comic_storyboard_template`，内置标识依次为 `classic`、`scp_dossier`、`noir_detective`、`pixel_rpg`、`cyberpunk_hud`、`showa_kidan`、`steampunk_blueprint`、`alchemist_botanical`、`wasteland_radio`、`ukiyo_e`、`golden_age_comic`、`deep_sea_log`、`phantom_thief`、`scrapbook_diary`，自定义标识为 `custom`。自定义正文保留在原字段 `comic_storyboard_prompt` 中。为兼容已保存的自定义内容，新增选项默认使用 `custom`；正文留空时回退到原版。
 
 角色方案中的「漫画场景分析提示词」留空时继承全局选择。升级时，与原版全文完全相同的旧默认文本会一次性备份并转换为留空继承；此后手动填写的任何非空提示词（包括原版全文）始终优先使用。若只想给某个角色单独指定风格，可以将内置预览或下方对应代码块的完整内容复制到该角色的提示词中，不要复制代码围栏。
 
@@ -30,7 +40,50 @@
 | `${topic_count}` | 本次输入的核心话题数量，也用于确定事件分格数量 |
 | `${chat_content}` | 本次输入的核心话题及详情 |
 
+## 自动切换漫画模板
+
+在「每日群漫画」的「漫画模板切换」中设置切换方式。默认保持「固定模板」，使用上方全局提示词设置，不改变升级前的行为。
+
+| 模式 | 选择规则 |
+| --- | --- |
+| 固定模板 | 始终使用全局选定的内置模板或自定义提示词 |
+| 每次顺序轮换 | 每个新生成任务按候选顺序前进一项，用完从头开始 |
+| 每日顺序轮换 | 首次生成使用候选第一项，此后按自然日差前进，当日保持相同；没有生成的日期也计入轮换 |
+| 每次随机 | 每个新生成任务独立随机抽取，可能连续出现相同模板 |
+| 每日随机 | 当日首次生成时随机抽取一次，全天保持相同，插件重启后仍保持 |
+| 随机不重复轮换 | 打乱候选列表后逐个使用，用完重新打乱；候选超过一个时避免跨轮连续重复 |
+
+候选列表默认包含十四种内置模板，可添加、移除并调整顺序。自定义提示词需要主动加入候选，并填写非空正文。切换范围默认「全局共享」，所有群共用同一份进度；选择「各群独立」后，每个平台会话的群分别记录进度。每日模式遵循服务器 `TZ` 环境变量指定的时区，未指定或无效时使用系统时区。
+
+这些设置保存在 `daily_comic` 中：
+
+```json
+{
+  "comic_template_mode": "sequential",
+  "comic_template_scope": "global",
+  "comic_template_candidates": ["classic", "pixel_rpg", "scp_dossier"]
+}
+```
+
+模式标识依次为 `fixed`、`sequential`、`daily_sequential`、`random`、`daily_random`、`shuffle`；范围为 `global` 或 `group`。候选值使用上述内置标识，或 `custom`。固定模式忽略候选列表，继续读取 `prompts.comic_analysis_prompts` 的全局选项。
+
+角色方案中非空的专属「漫画场景分析提示词」始终优先，不参与模板切换，也不消耗轮换进度。继承全局提示词的角色才使用当前切换规则。每次新任务开始时确定模板、人物与参考图；内部 LLM 重试、绘图重试和供应商降级沿用该任务的选择。失败的新任务仍占用一项，预览、保存配置和重发已有图片不推进进度。
+
+进度独立保存在插件数据目录中，重启后继续。临时切换为固定模板会暂停已保存的自动轮换进度；其他自动模式或候选顺序与已保存进度不一致时，下次生成重新开始。WebUI 的状态区读取已保存配置，查看状态不会推进进度，可用「重新开始轮换」清除所选范围的进度。每日顺序重置后以下次生成日期为第一天，状态中的下一项表示明日模板。
+
+## 示例图预览
+
+插件 WebUI 的模板选择区沿用报告模板的示例图预览方式：选择漫画风格后显示对应示例图，点击可查看大图。示例只展示画风、排版和文字组件，实际主角、话题、分格数、画幅与分辨率由当前角色方案和绘图供应商配置决定。
+
+十四种内置风格都提供示例图，随插件保存在 `assets/comic_previews/`；`src/shared/comic_prompt_templates.json` 通过 `preview` 字段记录白名单文件名。自定义模式没有预设示例图，界面显示相应说明。示例图只用于界面展示，不会自动加入绘图请求作为角色参考图。
+
+![原版漫画示例](../assets/comic_previews/classic.webp)
+
+蒸汽朋克手稿的标题标签为 `PROJECT #序号`，深海观测录的标题标签为 `SONAR #序号`。所有模板都要求分镜模型仅输出包含完整 `scene` 的 JSON 对象。
+
 ## 模板 01：SCP 异常调查档案风
+
+![SCP 异常调查档案风示例](../assets/comic_previews/scp_dossier.webp)
 
 视觉特征：旧档案纸、监控截图、拍立得证物照片、暗红保密印章与黄黑警戒胶带，搭配日系动画人物和简短中文调查记录。
 
@@ -86,6 +139,8 @@ scene 必须完整内联：整页风格、主角一致性、版式规划、Panel
 ```
 
 ## 模板 02：黑色电影侦探风
+
+![黑色电影侦探风示例](../assets/comic_previews/noir_detective.webp)
 
 视觉特征：日系角色插画融合黑色电影摄影，以低饱和灰黑、明暗反差、雨夜街景和侦探道具营造调查氛围，每格配暖象牙色手绘气泡和牛皮纸案件标题条。气泡通过墨线、轻微边缘网点与情绪轮廓增加复古漫画质感。
 
@@ -160,6 +215,8 @@ scene 必须完整内联整页视觉、主角外貌与造型、分格布局、Pa
 
 ## 模板 03：像素 RPG 每日冒险日志
 
+![像素 RPG 每日冒险日志示例](../assets/comic_previews/pixel_rpg.webp)
+
 视觉特征：16-bit 日式 RPG 像素插画，把群聊话题转化为一项项日常支线任务。Q 版角色、黑底浅色描边的游戏对白框、黑金任务标题栏和富有层次的像素场景构成统一界面。
 
 ### 参考图风格拆解
@@ -230,4 +287,506 @@ ${chat_content}
 只输出一个合法 JSON 对象，只包含字符串字段 scene。
 scene 必须完整内联整页像素美术、主角外貌、分格布局，以及 Panel 1 至 Panel ${topic_count} 的全部场景、动作、对白窗口、精确中文对白、任务标题、必要道具短标签、每格 Background Context 和最终质量约束。
 不要把分格放进独立的 panels 数组，不输出 Markdown 代码围栏、额外解释或省略号。正确转义 JSON 字符串中的引号与换行。
+```
+
+## 模板 04：赛博朋克义体HUD日志
+
+视觉特征：高对比度暗调霓虹场景融合第一人称义体视觉界面（HUD），半透明青色/品红全息对话框、微弱扫描线与底部黑底发光系统日志条，将群聊事件包装为夜之城佣兵的义体记录数据。
+
+概要：半透明青色全息对白框、霓虹义体界面与 SYS_LOG 系统日志。
+
+![赛博朋克义体HUD日志示例](../assets/comic_previews/cyberpunk_hud.webp)
+
+### 完整提示词
+
+```text
+你是一位擅长赛博朋克视觉叙事与日系科幻插画的漫画分镜师。请将下面的群聊核心话题改编为一张“赛博朋克义体HUD日志”风格的多格叙事漫画，输出供绘图模型使用的完整英文提示词。
+
+【叙事任务】
+共有 ${topic_count} 个话题。每个话题对应一个独立义体记录分格，按输入顺序完整设计 Panel 1 至 Panel ${topic_count}，不遗漏、不合并、不重复，不编造额外话题填满网格。
+以当前人格角色作为贯穿全篇的核心观测者，将群聊中的日常讨论、技术排障、吐槽或互动转化为未来都市中的数据采集、网络潜行或街头见闻。保留原话题的关键事实、对象、因果和结论；赛博朋克是视觉包装，不要把普通聊天强行改写成血腥枪战或黑客攻防战。
+
+【整页视觉】
+采用 cyberpunk anime illustration、tactical cybernetic HUD overlay、neon noir lighting、high-contrast dark palette、subtle holographic UI elements 的视觉语言。
+整体以深空黑、暗石板蓝为主色调，利用青色、品红和酸性黄的霓虹反光勾勒人物轮廓与关键道具。人物采用精细日系赛博动画画风，线条锐利，光影层次分明，面部与眼神保持清晰明亮，不被霓虹炫光吞没。背景涵盖全息操作台、霓虹雨夜街角、服务器机房或改装工坊，随话题灵活切换。
+
+【整页排版】
+直接以切角矩形（chamfered rectangle）分格铺满画面，分格之间用深黑色金属质感沟槽分隔，阅读顺序从左到右、从上到下。
+严格绘制 ${topic_count} 个事件分格，根据画幅安排每行一至三格，不设占据大面积的顶部封面或无意义状态栏。
+每格内部包含三个清晰层级：上方留白处的半透明全息对白框、中部的人物动作与核心道具、底部的窄幅黑底系统日志栏。UI 线条保持纤细克制，所有边框、气泡和标题不得跨格或遮挡人脸、手部与核心道具。
+
+【角色一致性与赛博造型】
+每个分格均出现同一位核心角色，沿用当前漫画角色方案的人格语气。若有角色参考图，严格锁定其发型、发色、瞳色、脸型和标志性配饰；在此基础上可增加一件高领机能风外套或耳部小型发光通讯器，若角色方案限制换装则维持原装，仅靠环境与全息屏幕表现科技感。
+无参考图时采用人格设定的外貌并保持全篇高度统一。其他群友仅在必要时以简化配角或全息通讯头像形式出现，不推断真实长相，不画成主角的克隆人。
+
+【每格的场景与动作】
+每格突出一个核心交互动作与对应道具，如手指划过半透明全息屏、用精密工具调试发光芯片、端着合成饮品观察终端数据或对故障设备露出无奈表情。交替采用半身近景、侧面特写与带前景全息屏的越肩视角，避免每格重复呆板的正面站姿。若讨论涉及 AI 绘图崩坏或代码报错，将其呈现在被观察的全息投影窗口内，主角自身人体结构必须完全正确。
+
+【全息对白与系统日志】
+每格上方必须有一个全息对白框，内含一句不超过 16 个汉字、符合角色性格的吐槽或记录。对白框采用深暗蓝近黑底色（保证高对比度）、纤细的发光青色切角边框与指向角色的短折线引线，内部使用清晰方正的亮白色中文粗体字，笔画完整无乱码，绝不添加导致文字模糊的强烈发光或重度故障错位。
+每格底部放置一条窄幅黑底系统日志条，配酸性黄细边框与左侧黄色标签 `SYS_LOG #序号:`，后接不超过 10 个汉字的亮白色中文短标题，从 `SYS_LOG #1` 连续编号至最后一格。
+在英文 scene 中逐字指定需要渲染的文字，例如：a dark translucent chamfered HUD speech box with a thin glowing cyan border and a short pointer, containing crisp white Chinese text "角色短吐槽"; a sleek black bottom status strip with an acid-yellow border showing "SYS_LOG #1:" in yellow followed by exact Chinese text "事件短标题" in white。不得将中文翻译成英文，背景全息屏仅用抽象几何图形或波形图表示，不渲染密集英文小字。
+
+【给绘图模型的上下文】
+每个分格附上英文 Background Context 说明话题前因后果，并在其后明确声明：Background Context is for visual understanding only. Do not print it in the image. Render only the explicitly quoted HUD dialogue, system log captions, and short prop labels.
+
+【质量约束】
+确保人物五官、手指与科技道具结构精准，文字与深色底框对比强烈。避免整页被刺眼霓虹雾气糊成一片、避免故障特效（glitch）切割人脸或文字、避免多余肢体、跨格粘连、编号错乱以及复古纸张或羊皮纸材质混入。
+
+【群聊核心话题】
+${chat_content}
+
+【输出要求】
+只输出一个合法 JSON 对象，且只包含一个字符串字段 scene。
+scene 必须完整内联整页风格、主角外貌一致性、分格布局、Panel 1 至 Panel ${topic_count} 的全部画面、全息框样式、精确中文文字、各格 Background Context 以及最终质量约束。不输出 Markdown 代码围栏或额外解释，正确转义引号与换行。
+```
+
+## 模板 05：复古昭和怪谈画报风
+
+视觉特征：20 世纪中叶日本昭和时代复古少年画报与怪奇剧画质感，泛黄粗糙新闻纸底、青红黄四色印刷（CMYK）轻微套印偏移、浓郁大块墨黑阴影、复古竖排感印章标题签与手写毛笔感对白框。
+
+概要：昭和四色网点画报、毛笔墨线对白与朱红标题签。
+
+![复古昭和怪谈画报风示例](../assets/comic_previews/showa_kidan.webp)
+
+### 完整提示词
+
+```text
+你是一位精通日本昭和时代复古少年画报与剧画视觉设计的漫画分镜师。请将下面的群聊核心话题改编为一张“复古昭和怪谈画报风”的多格漫画，输出供绘图模型使用的完整英文提示词。
+
+【叙事任务】
+共有 ${topic_count} 个话题。每个话题对应一个独立画报分格，按输入顺序完整设计 Panel 1 至 Panel ${topic_count}，不遗漏、不合并、不重复。
+以当前人格角色作为画报主角，用昭和怪谈画报“大惊小怪、充满戏剧张力与冷幽默反差”的叙事方式，去呈现群聊里的日常话题、技术折腾或群友互动。保留原话题的核心事实与因果；怪谈画报只是复古戏剧化包装，不要把日常话题真画成恐怖血腥猎奇画面。
+
+【整页视觉】
+采用 vintage Showa-era manga magazine page、retro gekiga halftone printing、aged yellowish newsprint texture、limited CMYK ink palette (crimson red, Prussian blue, ochre yellow, deep sumi ink black)、dramatic speed lines 的视觉语言。
+整页呈现旧印刷画报质感，带有清晰的半调彩色网点（halftone dots）和浓重的毛笔墨线。人物在保持日系美观五官的基础上，加入复古漫画特有的戏剧化高光与排线阴影（cross-hatching），面部依然保持干净清晰。
+
+【整页排版】
+直接以粗黑手绘墨线分隔的矩形分格排布整页，不设置占据大量面积的封面大标题。严格生成 ${topic_count} 个分格，按从左到右、从上到下的顺序排列，每行一至三格。
+每格包含：上方或侧边的复古毛笔墨线对白气泡、中部的戏剧化人物动作与场景道具、以及底部一角模拟昭和画报贴纸的朱红双线边框标题签。所有文字框均不得遮挡角色五官与关键道具。
+
+【角色一致性】
+每个分格均出现同一位核心角色，沿用当前角色方案的人格语气与外貌特征（发色、瞳色、发型、服装与配饰）。若有角色参考图则严格锁定其外观特征，仅将渲染笔触转化为复古画报网点与墨线风格，绝不用风格参考图中的旧漫画人物替换主角。角色身体比例自然，表情可在笃定、震惊、沉思与吐槽之间呈现夸张有趣的剧画反差。
+
+【每格的场景与动作】
+把日常或现代科技话题放进极具戏剧张力的构图中：比如把调试代码画成如同拆解神秘机关般额头冒汗，把群友闲聊画成在旧茶馆或木质书桌前拍案惊奇。现代电脑、手机等道具保留其功能特征，但用复古粗墨线与彩色网点绘制。交替使用戏剧化近景特写、仰视中景与带集中线（focus lines）的反应镜头，避免单调重复。
+
+【复古对白与画报标题签】
+每格必须有一个复古对白气泡，内含一句不超过 16 个汉字、带昭和画报感或角色特色的吐槽。气泡采用泛黄米白底色、粗细变化的浓黑毛笔墨线轮廓，内部使用清晰醒目的黑色复古印刷粗体中文，笔画粗壮完整，背景不加网点以确保极高可读性。
+每格底部固定设置一枚白底、朱红色双层矩形边框的昭和画报标题签，左侧以朱红色印章底白字或红字写 `第1话:`（按顺序编号至最后一格），后接黑色粗体中文短标题（不超过 10 个汉字）。
+在英文 scene 中逐字指定渲染文字，例如：a vintage speech balloon with warm aged-paper fill and thick brush-ink outline, containing bold black Chinese text "角色短吐槽"; a rectangular Showa magazine caption tag at the bottom with a double crimson border, showing "第1话: 事件短标题" in bold black and red print。切勿将中文翻译为英文。
+
+【给绘图模型的上下文】
+每格附上英文 Background Context 说明事件原委，并明确声明：Background Context is for visual understanding only. Do not print it in the image. Render only the explicitly quoted dialogue, episode tags, and short prop labels.
+
+【质量约束】
+保持昭和网点印刷风味的同时，确保人脸五官端正美观、手部结构正确、中文笔画清晰锐利。避免恐怖扭曲五官、避免重度套色错位导致文字重影无法辨认、避免现代扁平网页UI或赛博霓虹光效混入。
+
+【群聊核心话题】
+${chat_content}
+
+【输出要求】
+只输出一个合法 JSON 对象，只包含字符串字段 scene。
+scene 必须完整内联整页风格、主角设定、分格布局、Panel 1 至 Panel ${topic_count} 的全部画面、精确中文对白与标题签、各格 Background Context 和最终质量约束。不输出 Markdown 代码围栏或额外解释，正确转义引号与换行。
+```
+
+## 模板 06：蒸汽朋克发明家手稿
+
+视觉特征：维多利亚时代发明家的工作台蓝图与牛皮纸手稿拼贴，黄铜齿轮与铆钉画框、精密的钢笔排线与水彩淡彩人物、蓝图网格背景，搭配铆钉黄铜铭牌标题与羊皮纸批注框。
+
+概要：钢笔淡彩、黄铜铆钉边框、羊皮纸对白与 PROJECT 铭牌。
+
+![蒸汽朋克发明家手稿示例](../assets/comic_previews/steampunk_blueprint.webp)
+
+### 完整提示词
+
+```text
+你是一位擅长蒸汽朋克机械美学与日系钢笔淡彩插画的漫画分镜师。请将下面的群聊核心话题改编为一张“蒸汽朋克发明家手稿”风格的多格叙事漫画，输出供绘图模型使用的完整英文提示词。
+
+【叙事任务】
+共有 ${topic_count} 个话题。每个话题对应一个独立手稿分格，按输入顺序完整设计 Panel 1 至 Panel ${topic_count}，不遗漏、不合并、不重复。
+以当前人格角色作为大发明家/工坊主，将群聊中的话题讨论、软件排障、日常趣事转化为工坊内的机械调试、图纸推演或发明实验。保留原话题的关键事实、对象和因果；蒸汽朋克是视觉转译手法，不要遗漏真实的聊天核心结论。
+
+【整页视觉】
+采用 steampunk inventor's workbench journal、mixed-media parchment and cyanotype blueprint collage、fine dip-pen ink linework with warm watercolor washes、brass bezel frames、vintage mechanical drafting 的视觉语言。
+画面基底为温润的旧羊皮纸与局部深蓝色工程蓝图网格。色彩以暖棕、琥珀金、黄铜色、普鲁士蓝和象牙白为主。人物采用精致的日系钢笔线稿结合通透的水彩上色，五官灵动立体，受暖色煤气灯或工坊天光照明。
+
+【整页排版】
+直接以镶嵌细黄铜边框（四角带微型铆钉）的矩形分格排布整页，阅读顺序从左到右、从上到下，严格生成 ${topic_count} 个分格，每行一至三格。
+每格包含：上方的浅色羊皮纸手写感对白框、中部的人物与发明工坊场景、底部镶嵌在边框上的拉丝黄铜铭牌。装饰性的小齿轮、发条或白色蓝图尺寸线仅能作为背景或边角轻微点缀，严禁遮挡人物脸部、手部与文字区域。
+
+【角色一致性与发明家造型】
+每个分格均出现同一位核心角色，沿用当前角色方案的人格语气与核心外貌。若有角色参考图则严格锁定其外观；可在不破坏原角色辨识度的前提下，在额头或领口点缀一副复古黄铜护目镜，若角色方案限制换装则维持原貌。其他参与者在必要时以工坊助手或画像形式出场，不推断真实长相。
+
+【每格的场景与动作】
+将现代话题巧妙映射为复古机械或工坊场景：例如探讨代码或服务器时，表现角色用扳手或听诊器检查带有玻璃真空管与差分机齿轮的黄铜终端；探讨日常吃喝或娱乐时，表现角色操作精巧的自动发条装置或翻阅厚重图鉴。交替使用工作台近景、半身观察与图纸推演视角，道具细节丰富且人物动作自然多变。
+
+【羊皮纸对白与黄铜铭牌】
+每格上方设有一个浅米黄色羊皮纸对白框，边缘带细微的深棕墨水描边与指向角色的短尾，内含一句不超过 16 个汉字、符合角色语气的吐槽或实验记录，使用深黑棕色清晰印刷手写体中文，笔画工整高对比。
+每格底部固定一块扁平的拉丝黄铜铭牌（brushed brass nameplate with corner rivets），上面用深黑蚀刻粗体字清晰印制 `PROJECT #序号: 事件短标题`（中文不超过 10 个汉字，从 `PROJECT #1` 连续编号）。
+在英文 scene 中逐字指定需要渲染的中文，例如：a light cream parchment speech scroll box with fine dark-brown ink borders, containing crisp dark Chinese text "角色短吐槽"; a flat brushed-brass nameplate at the bottom with corner rivets, engraved with high-contrast black text "PROJECT #1: 事件短标题"。不要把中文翻译成英文，蓝图背景上的工程符号仅用几何线条示意，不印大段英文。
+
+【给绘图模型的上下文】
+每格附上英文 Background Context 说明话题背景，并明确声明：Background Context is for visual understanding only. Do not print it in the image. Render only the explicitly quoted parchment dialogue, brass nameplate captions, and short prop labels.
+
+【质量约束】
+保证日系人物脸部与手部结构干净利落，黄铜与纸张质感真实但不肮脏，文字与底板对比度极高。避免杂乱的齿轮堆满人脸、避免画面过暗、避免文字被金属反光冲淡、避免现代塑料感或赛博霓虹混入。
+
+【群聊核心话题】
+${chat_content}
+
+【输出要求】
+只输出一个合法 JSON 对象，只包含字符串字段 scene。
+scene 必须完整内联整页风格、主角外貌、分格布局、Panel 1 至 Panel ${topic_count} 的全部场景、对白框、黄铜铭牌、精确中文文字、各格 Background Context 和最终质量约束。不输出 Markdown 代码围栏或额外解释，正确转义引号与换行。
+```
+
+## 模板 07：炼金术士魔导植物志
+
+视觉特征：欧洲中世纪泥金装饰手抄本与日系奇幻绘本结合，暖白羊皮纸底、植物藤蔓与星象几何细边框、柔和透明水彩与棕黑墨线，搭配火漆印章与飘带式章节条。
+
+概要：水彩魔导手抄本、植物星轨边框、火漆印章与 FOLIO 丝带。
+
+![炼金术士魔导植物志示例](../assets/comic_previews/alchemist_botanical.webp)
+
+### 完整提示词
+
+```text
+你是一位擅长奇幻泥金手抄本装饰艺术与日系水彩绘本的漫画分镜师。请将下面的群聊核心话题改编为一张“炼金术士魔导植物志”风格的多格叙事插画，输出供绘图模型使用的完整英文提示词。
+
+【叙事任务】
+共有 ${topic_count} 个话题。每个话题对应一个独立手抄本图鉴分格，按输入顺序完整设计 Panel 1 至 Panel ${topic_count}，不遗漏、不合并、不重复。
+以当前人格角色作为记录万物现象的炼金术士/学者，将群聊中的日常话题、技术研究或群友趣事表现为魔导书中的现象观测、配方研制或奇物鉴定。保留原话题的关键事实与逻辑因果；奇幻炼金术是视觉隐喻包装，不篡改事件原本的结果。
+
+【整页视觉】
+采用 illuminated alchemy grimoire page、botanical and astrological manuscript aesthetic、delicate fountain-pen ink linework、soft watercolor anime illustration、warm vellum paper texture、subtle gold leaf accents 的视觉语言。
+整页呈现干净温润的暖白羊皮纸质感。色调采用温和的鼠尾草绿、深群青、茜草红、暖褐与微量的暗金色点缀。人物使用极其细腻的日系奇幻绘本画风，棕黑色柔和线稿配合通透水彩明暗，五官清澈柔和。
+
+【整页排版】
+直接以带有纤细植物藤蔓与几何星轨窄边框（botanical & geometric thin borders）的矩形分格排布整页，阅读顺序从左到右、从上到下，严格生成 ${topic_count} 个分格，每行一至三格。
+每格包含：上方的羽管笔描边浅色对白框、中部的人物与观测场景、底部的水平展开羊皮纸丝带标题条（旁缀一枚小巧的暗红火漆印章，不挡字）。藤蔓与星象装饰严格限制在分格边框线上，不得向内蔓延遮挡人物与文字。
+
+【角色一致性】
+每个分格均出现同一位核心角色，沿用当前角色方案的人格语气与外貌特征。若有角色参考图则严格锁定其外貌与配色；无参考图则按人格描述维持全篇一致。角色神态自然优雅或带着学者的冷幽默吐槽感，不将其他群友画成主角的复制品。
+
+【每格的场景与动作】
+将现代话题转化为充满想象力的炼金工坊或自然观测场景：比如把调试程序或参数表现为调整装有发光以太的水晶蒸馏瓶与星盘；把整理文档表现为翻阅漂浮的魔导书页；把日常闲聊表现为在温室中观察奇异植物或品茶。即使出现屏幕或现代物件，也用木质与水晶镶嵌的魔导器外观呈现，保持全篇美学统一。
+
+【手抄本对白与丝带标题】
+每格上方设有一个圆角柔和的象牙白对白框，配深棕细墨线边框与短尾巴，内含一句不超过 16 个汉字、符合角色性格的观测吐槽，采用清晰端庄的深黑棕色印刷宋体/楷体风格中文，字迹清晰易读。
+每格底部设有一条水平展开的浅米色丝带横幅（horizontal ribbon banner），左端缀有一枚微型暗红火漆印章装饰，丝带中央用深黑色粗体字清晰书写 `FOLIO #序号: 事件短标题`（中文不超过 10 个汉字，从 `FOLIO #1` 连续编号）。
+在英文 scene 中逐字指定渲染文字，例如：a clean ivory speech bubble with a fine sepia ink border, containing crisp dark-brown Chinese text "角色短吐槽"; a flat horizontal parchment ribbon banner at the bottom with a tiny red wax seal on the left edge, displaying clear black text "FOLIO #1: 事件短标题"。不要把中文译为英文，背景书页不渲染密集的拉丁文或伪文字乱码。
+
+【给绘图模型的上下文】
+每格附上英文 Background Context 说明话题详情，并明确声明：Background Context is for visual understanding only. Do not print it in the image. Render only the explicitly quoted dialogue, ribbon captions, and short prop labels.
+
+【质量约束】
+确保水彩画面干净通透、人物五官与手部结构精致准确、中文字体与浅色丝带/气泡底色对比鲜明。避免边框藤蔓过度繁复喧宾夺主、避免纸张污渍覆盖人脸或文字、避免暗黑哥特恐怖风或现代电子UI混入。
+
+【群聊核心话题】
+${chat_content}
+
+【输出要求】
+只输出一个合法 JSON 对象，只包含字符串字段 scene。
+scene 必须完整内联整页风格、主角外貌、分格布局、Panel 1 至 Panel ${topic_count} 的全部场景、对白框、丝带标题、精确中文文字、各格 Background Context 和最终质量约束。不输出 Markdown 代码围栏或额外解释，正确转义引号与换行。
+```
+
+## 模板 08：废土生存广播电台日志
+
+视觉特征：后启示录废土拾荒者风格，铆钉铁锈金属面板、单色荧光绿/琥珀色 CRT 终端窗口、黄黑辐射警示条纹与压纹胶带（Dymo tape）标签，融合硬派粗粝背景与鲜明可爱的日系角色反差。
+
+概要：废土电台金属框、荧光终端对白与 RADIO 压纹胶带。
+
+![废土生存广播电台日志示例](../assets/comic_previews/wasteland_radio.webp)
+
+### 完整提示词
+
+```text
+你是一位擅长废土机能美学与日系反差萌插画的漫画分镜师。请将下面的群聊核心话题改编为一张“废土生存广播电台日志”风格的多格叙事漫画，输出供绘图模型使用的完整英文提示词。
+
+【叙事任务】
+共有 ${topic_count} 个话题。每个话题对应一个独立电台广播分格，按输入顺序完整设计 Panel 1 至 Panel ${topic_count}，不遗漏、不合并、不重复。
+以当前人格角色作为废土避难所的广播员/技术员，将群聊中的日常动态、技术排障、资源分享或闲聊吐槽转化为生存电台播报、旧世界科技维修或物资清点。保留原话题的关键事实与因果；废土风是视觉幽默包装，不要把普通聊天编造成悲惨的末日死亡故事。
+
+【整页视觉】
+采用 post-apocalyptic wasteland bunker aesthetic、weathered steel panel layout、retro monochrome phosphor CRT terminal、clean expressive anime character art、rust and olive-drab palette with amber and terminal-green accents 的视觉语言。
+画面框架呈现饱经风霜的避难所金属控制台质感，带有轻微铁锈、划痕与螺栓细节；而格内的人物则保持干净、鲜明、线条利落的日系动画画风，受暖色钨丝灯泡与绿色终端屏幕光照亮，确保人物面部明亮讨喜。
+
+【整页排版】
+直接以带圆角金属框（bolted metal viewport frames）的分格排布整页，阅读顺序从左到右、从上到下，严格生成 ${topic_count} 个分格，每行一至三格。
+每格包含：上方的复古单色终端对白框、中部的人物与避难所/废土场景、底部贴在金属框上的压纹塑料胶带（embossed label tape）标题条。黄黑警戒线或铁锈仅限于外框边缘，绝不遮挡人物、手部与文字。
+
+【角色一致性】
+每个分格均出现同一位核心角色，沿用当前角色方案的人格语气与外貌设定。若有角色参考图则严格锁定其脸型、发型、发色、瞳色与服装；可在耳畔搭配一副复古头戴式电台耳机或桌前放一支金属麦克风，若角色方案限制则维持原样。其他群友仅在必要时以电台通讯扬声器、旧照片或简明配角出现。
+
+【每格的场景与动作】
+结合具体话题设计动作：如讨论软件或硬件问题时，表现角色拍打冒烟的复古显像管电脑或旋动电台旋钮；讨论日常美食或生活时，表现角色研究奇特的罐头物资或在种植箱前观察；讨论消息八卦时，表现角色对着广播麦克风绘声绘色地播报。交替使用近景、半身与桌面特写，避免重复站姿。
+
+【终端对白窗与压纹胶带标题】
+每格上方设有一个深墨绿近黑色的矩形终端对白窗，带细微的荧光绿单层直线边框与短折线指针，内含一句不超过 16 个汉字、符合角色语气的电台吐槽，采用高对比度的亮荧光绿（或亮琥珀黄）等宽粗体中文，笔画清晰无发光糊化。
+每格底部贴有一条暗红色或深黑色的复古压纹塑料胶带（embossed Dymo label strip），上面呈现清晰的纯白凸起粗体字 `RADIO #序号: 事件短标题`（中文不超过 10 个汉字，从 `RADIO #1` 连续编号）。
+在英文 scene 中逐字指定渲染文字，例如：a dark olive-black terminal dialogue box with a thin glowing green border, containing crisp bright-green Chinese text "角色短吐槽"; a matte crimson embossed plastic label strip at the bottom showing raised white bold text "RADIO #1: 事件短标题"。不要把中文翻译为英文。
+
+【给绘图模型的上下文】
+每格附上英文 Background Context 说明话题背景，并明确声明：Background Context is for visual understanding only. Do not print it in the image. Render only the explicitly quoted terminal dialogue, embossed tape captions, and short prop labels.
+
+【质量约束】
+确保人物干净清晰、五官手部结构正确、终端文字与胶带白字清晰锐利。避免重度扫描线或屏幕眩光使文字难以辨认、避免画面被泥污或暗影吞没、避免血腥恐怖元素或SCP机密印章混入。
+
+【群聊核心话题】
+${chat_content}
+
+【输出要求】
+只输出一个合法 JSON 对象，只包含字符串字段 scene。
+scene 必须完整内联整页风格、主角外貌、分格布局、Panel 1 至 Panel ${topic_count} 的全部场景、终端对白框、压纹胶带标题、精确中文文字、各格 Background Context 和最终质量约束。不输出 Markdown 代码围栏或额外解释，正确转义引号与换行。
+```
+
+## 模板 09：浮世绘锦绘町人见闻录
+
+视觉特征：江户时代浮世绘木版画（Ukiyo-e）融合现代日系动漫角色，奉书纸（和纸）木纹肌理、普鲁士蓝（ベロ藍）与朱红及矿物绿配色、韵律感毛笔勾线，搭配和风祥云对白框与红底黑框短册标题牌。
+
+概要：浮世绘木版画、和纸流云对白与朱红短册标题。
+
+![浮世绘锦绘町人见闻录示例](../assets/comic_previews/ukiyo_e.webp)
+
+### 完整提示词
+
+```text
+你是一位精通日本浮世绘木版画美学与日系动漫插画的漫画分镜师。请将下面的群聊核心话题改编为一张“浮世绘锦绘町人见闻录”风格的多格叙事漫画，输出供绘图模型使用的完整英文提示词。
+
+【叙事任务】
+共有 ${topic_count} 个话题。每个话题对应一个独立浮世绘分格，按输入顺序完整设计 Panel 1 至 Panel ${topic_count}，不遗漏、不合并、不重复。
+以当前人格角色作为画卷主角，用浮世绘“浮世百态、风趣诙谐”的视角描绘群聊中的日常话题、技术排障或群友趣事。保留原话题的关键事实、对象与因果；浮世绘是美学风格包装，现代科技话题可用“和洋折衷”或木版画笔触直接绘制现代器物来制造幽默反差。
+
+【整页视觉】
+采用 Edo-period Ukiyo-e woodblock print aesthetic、anime character art with expressive calligraphy brush linework、washi paper texture、bokashi color gradation、Prussian blue, vermilion red, mineral green, and ochre palette 的视觉语言。
+整页具有温润的奉书和纸质感与细腻的木版画色彩平涂渐变。人物保留日系动漫的可爱/帅气五官比例，但用富有顿挫韵律的毛笔墨线勾勒轮廓，面部白皙干净，神态生动传神。
+
+【整页排版】
+直接以墨黑与朱红双层细线（double ink-and-vermilion border）分隔的矩形分格排布整页，阅读顺序从左到右、从上到下，严格生成 ${topic_count} 个分格，每行一至三格。
+每格包含：上方的和风流云轮廓对白框、中部的人物与场景、底部的传统长条形短册（tanzaku）标题签。装饰性的波浪纹或松竹云纹仅作背景衬托，不得遮挡人脸、手部与文字。
+
+【角色一致性】
+每个分格均出现同一位核心角色，沿用当前角色方案的人格语气与外貌特征（发型、发色、瞳色、标志性配饰）。若有角色参考图则严格锁定其外貌；可在原服装外轻轻披一件和风羽织，或完全保留原服装仅用浮世绘笔触表现（若角色方案限制换装则维持原装）。不将其他群友画成主角的复制品。
+
+【每格的场景与动作】
+利用浮世绘极具表现力的构图与手势（如经典的歪头思考、展扇惊叹、伏案疾书）来演绎话题：比如在木质矮桌前用毛笔或算盘研究发光的现代笔记本电脑；在葛饰北斋风格的装饰性浪花或屏风前吐槽软件故障。交替使用大胆的半身特写（大首绘风格）与室内外中景，避免重复姿势。
+
+【流云对白框与短册标题】
+每格上方设有一个边缘呈柔和流云弧度的米白和纸对白框，墨线描边清晰，内含一句不超过 16 个汉字、符合角色语气的吐槽，采用醒目工整的浓黑毛笔楷书/粗体印刷中文，切勿使用难以辨认的狂草。
+每格底部水平放置一枚白底、朱红宽边框的传统短册标牌（tanzaku caption strip），左侧带一枚小型朱文印章装饰，框内用浓黑粗体字书写 `第1景: 事件短标题`（中文不超过 10 个汉字，从 `第1景` 连续编号）。
+在英文 scene 中逐字指定渲染文字，例如：a soft cloud-shaped washi speech balloon with a clean sumi-ink outline, containing bold black Chinese text "角色短吐槽"; a horizontal white tanzaku caption strip with a vermilion border at the bottom, showing crisp black text "第1景: 事件短标题"。不要把中文翻译成英文。
+
+【给绘图模型的上下文】
+每格附上英文 Background Context 说明话题前因后果，并明确声明：Background Context is for visual understanding only. Do not print it in the image. Render only the explicitly quoted dialogue, tanzaku captions, and short prop labels.
+
+【质量约束】
+确保日系角色五官端正、手部动作自然、木版画色彩典雅且中文对比度极高。避免狂草乱码、避免把人脸画成夸张扭曲的传统歌舞伎脸谱、避免霓虹光效或现代网页扁平卡片混入。
+
+【群聊核心话题】
+${chat_content}
+
+【输出要求】
+只输出一个合法 JSON 对象，只包含字符串字段 scene。
+scene 必须完整内联整页风格、主角外貌、分格布局、Panel 1 至 Panel ${topic_count} 的全部场景、流云对白框、短册标题、精确中文文字、各格 Background Context 和最终质量约束。不输出 Markdown 代码围栏或额外解释，正确转义引号与换行。
+```
+
+## 模板 10：美式黄金时代超英漫画
+
+视觉特征：20 世纪中叶美式复古彩色漫画（Golden/Silver Age Comic Book），鲜明的四色本戴网点（Ben-Day dots）、粗犷有力的黑墨线阴影、高饱和红黄蓝撞色，搭配明黄色叙事说明盒（Caption Box）与美式漫画对白气泡。
+
+概要：美式黄金时代本戴网点、黑墨线对白与 ISSUE 明黄叙事盒。
+
+![美式黄金时代超英漫画示例](../assets/comic_previews/golden_age_comic.webp)
+
+### 完整提示词
+
+```text
+你是一位擅长美式黄金时代波普漫画（Golden Age Pop Art Comic）与日系角色融合设计的分镜师。请将下面的群聊核心话题改编为一张“美式黄金时代超英漫画”风格的多格漫画，输出供绘图模型使用的完整英文提示词。
+
+【叙事任务】
+共有 ${topic_count} 个话题。每个话题对应一个独立漫画分格，按输入顺序完整设计 Panel 1 至 Panel ${topic_count}，不遗漏、不合并、不重复。
+以当前人格角色作为漫画主角，用美式复古漫画那种“充满活力、戏剧感十足、仿佛每件日常小事都是重大危机或伟大发现”的幽默腔调来演绎群聊话题。保留原话题的真实事实与因果；超英/波普漫画只是视觉包装，不编造虚假打斗。
+
+【整页视觉】
+采用 vintage American Golden Age comic book page、pop art Ben-Day dots halftone shading、bold black ink outlines with heavy spot blacks、vibrant primary color palette (crimson, canary yellow, royal blue)、expressive anime-pop fusion character art 的视觉语言。
+整页呈现复古四色印刷漫画书页质感，背景和色彩过渡广泛运用清晰可见的本戴圆点网纹（Ben-Day dots）。人物保持日系角色的精致五官与原有发型服装，但采用粗犷自信的黑墨线勾勒与戏剧化块面阴影，色彩明快饱满。
+
+【整页排版】
+直接以粗黑边框和白色内边距（white gutters）分隔的矩形分格排布整页，阅读顺序从左到右、从上到下，严格生成 ${topic_count} 个分格，每行一至三格。
+每格包含：上方的经典白底黑边美式对白气泡、中部充满张力的人物与场景、以及紧贴分格底部或顶角的一枚经典明黄色矩形叙事方盒（yellow narrator caption box）。所有文字框均不得遮挡人物五官与关键道具。
+
+【角色一致性】
+每个分格均出现同一位核心角色，沿用当前角色方案的人格语气与外貌特征。若有角色参考图则严格锁定其外貌与配色，绝不把日系主角画成欧美肌肉壮汉，也不强制换上紧身衣（除非原设定如此）。通过自信叉腰、扶额惊叹、指点屏幕等富有张力的肢体语言展现美式漫画感。
+
+【每格的场景与动作】
+用充满戏剧性的美式分镜表现日常与技术话题：例如排查 Bug 时，背景配上红黄放射线，角色如拆弹专家般凝视终端；讨论日常趣事时，采用夸张的近景表情与波普色彩背景。尽量通过气泡形状和角色动作本身传递张力，不额外添加大号英文拟声词（如 POW/BAM），把空间留给核心道具与中文对白。
+
+【波普对白气泡与明黄叙事盒】
+每格必须有一个純白底色、粗黑墨线描边的对白气泡（普通吐槽用圆润椭圆，震惊或强调时可用克制的短锯齿爆发框），内含一句不超过 16 个汉字、符合角色语气的吐槽，使用粗壮醒目的纯黑漫画黑体中文，内部无网点干扰。
+每格底部固定设置一个明黄色填充（solid canary yellow fill）、粗黑单线边框的矩形叙事方盒，内部用纯黑粗体字清晰书写 `ISSUE #序号: 事件短标题`（中文不超过 10 个汉字，从 `ISSUE #1` 连续编号）。
+在英文 scene 中逐字指定渲染文字，例如：a classic white comic speech balloon with a bold black ink outline, containing crisp bold black Chinese text "角色短吐槽"; a rectangular canary-yellow narrator caption box with a black border at the bottom, displaying bold black text "ISSUE #1: 事件短标题"。不要把中文翻译成英文。
+
+【给绘图模型的上下文】
+每格附上英文 Background Context 说明话题背景，并明确声明：Background Context is for visual understanding only. Do not print it in the image. Render only the explicitly quoted speech balloons, yellow caption boxes, and short prop labels.
+
+【质量约束】
+确保本戴网点质感鲜明但不污染文字底色，人物五官保持日系美感，手部与道具结构正确，中文清晰锐利。避免把角色画成美式写实硬汉脸、避免无关英文拟声词遮挡画面、避免灰暗压抑色调。
+
+【群聊核心话题】
+${chat_content}
+
+【输出要求】
+只输出一个合法 JSON 对象，只包含字符串字段 scene。
+scene 必须完整内联整页风格、主角外貌、分格布局、Panel 1 至 Panel ${topic_count} 的全部场景、对白气泡、明黄叙事盒、精确中文文字、各格 Background Context 和最终质量约束。不输出 Markdown 代码围栏或额外解释，正确转义引号与换行。
+```
+
+## 模板 11：深海科考潜航器观测录
+
+视觉特征：深海科研潜航器（Bathysphere / Deep-sea ROV）观测日志，幽邃的深海普鲁士蓝与生物发光青绿（Bioluminescent Cyan/Teal）色调、耐压金属舷窗边框、声呐刻度网线与防水打孔金属标签。
+
+概要：深海潜航器舷窗、冰青声呐对白与 SONAR 银灰金属标签。
+
+![深海科考潜航器观测录示例](../assets/comic_previews/deep_sea_log.webp)
+
+### 完整提示词
+
+```text
+你是一位擅长深海科幻探险氛围与精细日系动画插画的漫画分镜师。请将下面的群聊核心话题改编为一张“深海科考潜航器观测录”风格的多格叙事漫画，输出供绘图模型使用的完整英文提示词。
+
+【叙事任务】
+共有 ${topic_count} 个话题。每个话题对应一个独立深海观测分格，按输入顺序完整设计 Panel 1 至 Panel ${topic_count}，不遗漏、不合并、不重复。
+以当前人格角色作为深海科考船/潜航器的首席观测员，将群聊中的日常话题、技术深潜排障、数据分析或群友互动转化为深海巡航中的奇特发现、声呐信号解析或舱内日常。保留原话题的关键事实与因果；深海科考是视觉意境包装，不改变事件原本的事实结论。
+
+【整页视觉】
+采用 deep-sea research submersible observation log、abyssal bioluminescent aesthetic、midnight blue and glowing aquamarine palette with warm cabin instrument lighting、anime character illustration、pressurized viewport frames 的视觉语言。
+整体以深邃静谧的深海蓝、暗松石绿为主，舱内柔和的暖黄仪表光与水体透出的荧光青交相辉映，营造静谧、神秘而专注的科研氛围。人物采用细腻通透的日系动画画风，脸部与眼神受清晰光源照亮，决不隐没在黑暗中。
+
+【整页排版】
+直接以模拟深海耐压舷窗的圆角深灰金属框（pressurized metal viewport frames with subtle sonar tick marks）排布整页，阅读顺序从左到右、从上到下，严格生成 ${topic_count} 个分格，每行一至三格。
+每格包含：上方的深色声呐屏风格对白框、中部的人物与观测场景、底部的拉丝银灰防水金属标签牌。微小的水下光斑或声呐同心圆仅作背景气氛，不得遮挡人脸、手部与文字。
+
+【角色一致性】
+每个分格均出现同一位核心角色，沿用当前角色方案的人格语气与外貌设定。若有角色参考图则严格锁定其外貌与服装特征；无参考图则按人格描述维持全篇一致。角色神态可在专注观测、若有所思与轻松吐槽间自然切换。
+
+【每格的场景与动作】
+将群聊话题与深海观测环境自然融合：例如排查深层代码或系统故障时，表现角色在环绕着声呐波形屏的控制台前用精密仪器检修管线；讨论新鲜事物或群友动态时，表现角色透过厚实的玻璃舷窗用望远镜或记录板观察窗外漂浮的发光水母或深海信标；日常闲聊时，表现角色在潜航器休息区端着热饮看报告。交替采用舱内近景、舷窗侧面剪影高光与操作台半身景别。
+
+【声呐对白框与防水金属牌】
+每格上方设有一个深海暗蓝近黑底色、冰青色细圆角边框的对白框，带指向角色的短引线，内含一句不超过 16 个汉字、符合角色语气的观测吐槽，使用高对比度的纯白或亮冰青色清晰粗体中文。
+每格底部固定一块银灰色拉丝防水金属牌（brushed titanium waterproof tag），上面用深黑色粗体字清晰印制 `SONAR #序号: 事件短标题`（中文不超过 10 个汉字，从 `SONAR #1` 连续编号）。
+在英文 scene 中逐字指定渲染文字，例如：a deep navy-black rounded speech box with a thin glowing ice-blue border, containing crisp white Chinese text "角色短吐槽"; a brushed silver-gray metal tag at the bottom displaying high-contrast black bold text "SONAR #1: 事件短标题"。不要把中文译为英文。
+
+【给绘图模型的上下文】
+每格附上英文 Background Context 说明话题详情，并明确声明：Background Context is for visual understanding only. Do not print it in the image. Render only the explicitly quoted dialogue, metal tag captions, and short prop labels.
+
+【质量约束】
+保持幽静深海氛围的同时确保人物面部明亮清晰、手部与仪器结构准确、中文字体锐利高对比。避免水体波纹扭曲文字、避免画面过暗看不清主体、避免克苏鲁恶心触手恐怖元素或复古纸张材质混入。
+
+【群聊核心话题】
+${chat_content}
+
+【输出要求】
+只输出一个合法 JSON 对象，只包含字符串字段 scene。
+scene 必须完整内联整页风格、主角外貌、分格布局、Panel 1 至 Panel ${topic_count} 的全部场景、对白框、金属标签、精确中文文字、各格 Background Context 和最终质量约束。不输出 Markdown 代码围栏或额外解释，正确转义引号与换行。
+```
+
+## 模板 12：怪盗团预告信剪报拼贴
+
+视觉特征：都市怪盗爵士波普风（Inspired by Acid Jazz / Phantom Thief Pop Aesthetic），纯黑、猩红与纯白的极高对比撞色，斜切动态分格边框、撕裂报纸网点拼贴背景、利落的硬边阴影人物与黑白相间的预告信风格标题条。
+
+概要：红黑白怪盗波普剪报、锐角对白框与 TARGET 预告横幅。
+
+![怪盗团预告信剪报拼贴示例](../assets/comic_previews/phantom_thief.webp)
+
+### 完整提示词
+
+```text
+你是一位擅长都市怪盗波普视觉设计（Urban Phantom Thief Pop Art）与时尚日系动画分镜的漫画师。请将下面的群聊核心话题改编为一张“怪盗团预告信剪报拼贴”风格的多格叙事漫画，输出供绘图模型使用的完整英文提示词。
+
+【叙事任务】
+共有 ${topic_count} 个话题。每个话题对应一个独立预告行动分格，按输入顺序完整设计 Panel 1 至 Panel ${topic_count}，不遗漏、不合并、不重复。
+以当前人格角色作为华丽自信的都市怪盗/幕后策划者，将群聊中的日常话题、技术攻坚、吐槽或互动表现为锁定的行动目标、华丽的现场勘查或幕后沙盘推演。保留原话题的真实事实与因果；怪盗风是时尚波普包装，不要把群友画成反派罪犯。
+
+【整页视觉】
+采用 stylish phantom thief pop-art comic、stark crimson red, jet black, and pure white color scheme、sharp cel-shaded anime illustration with bold graphic shadows、halftone newsprint collage accents、dynamic angular panel borders 的视觉语言。
+全页以极具冲击力的猩红、纯黑与纯白构成主视觉，人物保留原有发色与瞳色作为画面中的珍贵亮色。采用线条锐利、阴影硬朗的高水准日系时尚赛璐璐画风，人物姿态潇洒自信，面部光线干净利落。
+
+【整页排版】
+直接以带有纯白内框与纯黑外框的锐利矩形/微斜切角分格排布整页，分格间隙露出深红与黑色几何底纹，阅读顺序从左到右、从上到下，严格生成 ${topic_count} 个分格，每行一至三格。
+每格包含：上方的黑底白边多边形动态对白框、中部潇洒的人物与场景、底部的红黑撞色剪报横幅标题。背景剪报纹理与星星几何点缀保持克制，绝不侵入人脸、手部与文字内部。
+
+【角色一致性与怪盗风范】
+每个分格均出现同一位核心角色，沿用当前角色方案的人格语气与外貌设定。若有角色参考图则严格锁定其外貌与配色；可在手中搭配一张红黑预告信卡片，或保持原服装用潇洒的站姿、推眼镜/扶下巴等动作展现怪盗气场。不将其他群友画成主角的复制品。
+
+【每格的场景与动作】
+用充满节奏感与时尚感的镜头表现话题：如解决技术难题时，表现角色在红黑全息沙盘或双屏电脑前帅气地敲下最后一击；讨论日常趣事时，表现角色在暗调咖啡馆吧台后晃动饮品或展示手中的线索卡。交替使用大幅度斜角近景特写、逆光半身剪影（面部留足受光）与桌面俯拍，避免呆板站桩。
+
+【动态对白框与预告信标题条】
+每格上方设有一个纯黑填充、粗白单线描边的锐角不规则四边形对白框（带短尖尾指向角色），内含一句不超过 16 个汉字、符合角色语气的犀利吐槽，采用纯白醒目的粗黑体中文，字迹端正高对比（切勿把单个汉字拆成歪斜乱转的勒索信碎块，以免模型渲染乱码）。
+每格底部固定一条猩红底色、带黑色斜切色块与白框装饰的横幅条，上面用纯白加粗黑边字体清晰显示 `TARGET #序号: 事件短标题`（中文不超过 10 个汉字，从 `TARGET #1` 连续编号）。
+在英文 scene 中逐字指定渲染文字，例如：a sharp angular black polygon speech box with a thick white border, containing crisp bold white Chinese text "角色短吐槽"; a bold crimson-and-black graphic banner strip at the bottom with white border accents, displaying high-contrast white bold text "TARGET #1: 事件短标题"。不要把中文译为英文。
+
+【给绘图模型的上下文】
+每格附上英文 Background Context 说明话题背景，并明确声明：Background Context is for visual understanding only. Do not print it in the image. Render only the explicitly quoted polygon speech boxes, target banner captions, and short prop labels.
+
+【质量约束】
+确保红黑波普撞色干净利落、人物五官帅气/可爱不崩坏、中文笔画整齐清晰。避免文字歪斜重叠导致乱码、避免纯黑阴影吞没五官、避免边框斜切角度过大导致画面裁切不全。
+
+【群聊核心话题】
+${chat_content}
+
+【输出要求】
+只输出一个合法 JSON 对象，只包含字符串字段 scene。
+scene 必须完整内联整页风格、主角外貌、分格布局、Panel 1 至 Panel ${topic_count} 的全部场景、多边形对白框、预告横幅、精确中文文字、各格 Background Context 和最终质量约束。不输出 Markdown 代码围栏或额外解释，正确转义引号与换行。
+```
+
+## 模板 13：手账剪贴簿拍立得日记
+
+视觉特征：温馨治愈的日系个人手账（Hobonichi / Bullet Journal）与拍立得照片拼贴，暖米色方格纸底、宽白边拍立得相纸分格、半透明彩色和纸胶带（Washi tape）、便利贴对白与马克笔手写感标题。
+
+概要：暖色手账方格纸、和纸胶带、便利贴对白与 MEMO 拍立得白边。
+
+![手账剪贴簿拍立得日记示例](../assets/comic_previews/scrapbook_diary.webp)
+
+### 完整提示词
+
+```text
+你是一位擅长日系手账拼贴设计（Scrapbook & Bullet Journal）与清新治愈系动漫插画的分镜师。请将下面的群聊核心话题改编为一张“手账剪贴簿拍立得日记”风格的多格叙事插画，输出供绘图模型使用的完整英文提示词。
+
+【叙事任务】
+共有 ${topic_count} 个话题。每个话题对应一张独立的拍立得照片分格，按输入顺序完整设计 Panel 1 至 Panel ${topic_count}，不遗漏、不合并、不重复。
+以当前人格角色作为手账主人，把群聊中的日常讨论、技术折腾、生活分享或群友互动记录为图文并茂的拍立得手账日记。保留原话题的关键事实、对象与因果；手账风是温馨的视觉载体，技术排障或严肃讨论同样可以用可爱生动的日常手账形式记录下来。
+
+【整页视觉】
+采用 cozy Japanese hobonichi planner spread、polaroid photo scrapbook collage、warm cream grid paper background、pastel washi tape and sticky notes、bright and clean slice-of-life anime illustration 的视觉语言。
+整页基底是一张平铺俯视的暖米色细方格手账纸（subtle dot/grid notebook paper）。色彩明亮温和，光影清爽通透。人物采用高完成度的日系日常番（Slice of Life）动画插画风格，线条柔和细腻，色彩饱满干净，表情生动丰富。
+
+【整页排版】
+直接将恰好 ${topic_count} 张拍立得相纸（polaroid frames with classic wide bottom white margins）整齐排列在手账方格纸上，不设大面积封面或空白页边。阅读顺序从左到右、从上到下，每行一至三格。相纸可带有极其轻微（不超过 2 度）的自然手工贴合角度，但必须保证所有画面与文字端正易读。
+每张拍立得顶部边缘贴有一小段半透明彩色和纸胶带（washi tape）作为固定装饰；照片上方区域贴有一张浅色便利贴作为对白框；拍立得底部的经典宽白边则直接作为该格的标题书写区。胶带与小贴纸仅出现在相框外缘，绝不遮挡人物五官、手部与文字。
+
+【角色一致性】
+每个拍立得画面中均出现同一位核心角色，沿用当前角色方案的人格语气与外貌特征（发型、发色、瞳色、服装与配饰）。若有角色参考图则严格锁定其外貌；无参考图则按人格设定维持全篇一致。通过生活化、自然松弛的肢体动作与表情变化展现不同话题，不把其他群友画成主角的复制品。
+
+【每格的场景与动作】
+每张拍立得捕捉一个生动的生活或工作瞬间：比如研究代码或排查故障时，表现角色趴在堆满参考书的书桌前对着笔记本电脑认真戳键盘；讨论美食、游戏或趣闻时，表现角色举着对应道具对镜头比耶、思考或无奈摊手。交替使用桌面半身近景、生活化特写与室内外中景，背景细节温馨自然。
+
+【便利贴对白与相纸白边标题】
+每格照片上方或角落留白处贴有一张浅暖黄色（或浅樱花粉）的平整便利贴（pastel sticky note），带指向角色的简笔画小箭头，内含一句不超过 16 个汉字、符合角色语气的日常吐槽，使用深炭黑色清晰圆体/手写印刷体中文，字迹干净工整。
+每张拍立得底部的宽白边（wide white polaroid bottom margin）上，用深黑色粗马克笔字体清晰书写 `MEMO #序号: 事件短标题`（中文不超过 10 个汉字，从 `MEMO #1` 连续编号），文字下方可衬一条极浅的暖色荧光笔横线（不降低文字对比度）。
+在英文 scene 中逐字指定渲染文字，例如：a flat pastel-yellow sticky note near the top with a tiny drawn arrow pointing to the character, containing crisp dark-charcoal Chinese text "角色短吐槽"; on the wide white bottom margin of the polaroid frame, clear black marker text reading "MEMO #1: 事件短标题"。不要把中文译为英文。
+
+【给绘图模型的上下文】
+每格附上英文 Background Context 说明话题详情，并明确声明：Background Context is for visual understanding only. Do not print it in the image. Render only the explicitly quoted sticky-note dialogue, polaroid margin captions, and short prop labels.
+
+【质量约束】
+确保画面明亮清晰、人物五官与手部结构端正、相纸白边与便利贴上的中文清晰高对比。避免照片过度倾斜重叠导致裁切、避免连笔草书乱码、避免阴暗恐怖色调或浓重污渍混入。
+
+【群聊核心话题】
+${chat_content}
+
+【输出要求】
+只输出一个合法 JSON 对象，只包含字符串字段 scene。
+scene 必须完整内联整页手账风格、主角外貌、拍立得分格布局、Panel 1 至 Panel ${topic_count} 的全部场景、便利贴对白、相纸白边标题、精确中文文字、各格 Background Context 和最终质量约束。不输出 Markdown 代码围栏或额外解释，正确转义引号与换行。
 ```

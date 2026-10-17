@@ -12,9 +12,61 @@ from src.infrastructure.analysis.analyzers.comic_analyzer import ComicStoryboard
 from src.infrastructure.config.config_manager import ConfigManager
 from src.infrastructure.config.config_migrator import ConfigMigrator
 from src.shared.comic_prompts import (
+    COMIC_PROMPT_PREVIEWS,
     COMIC_STORYBOARD_PROMPTS,
     DEFAULT_COMIC_STORYBOARD_PROMPT,
 )
+
+
+def test_catalog_contains_all_fourteen_builtin_styles_and_preview_whitelist():
+    """固定目录覆盖全部风格，预览仅允许同名的本地 WebP 文件。"""
+    expected_ids = [
+        "classic",
+        "scp_dossier",
+        "noir_detective",
+        "pixel_rpg",
+        "cyberpunk_hud",
+        "showa_kidan",
+        "steampunk_blueprint",
+        "alchemist_botanical",
+        "wasteland_radio",
+        "ukiyo_e",
+        "golden_age_comic",
+        "deep_sea_log",
+        "phantom_thief",
+        "scrapbook_diary",
+    ]
+    assert list(COMIC_STORYBOARD_PROMPTS) == expected_ids
+    expected_previews = {key: f"{key}.webp" for key in expected_ids}
+    assert expected_previews == COMIC_PROMPT_PREVIEWS
+
+
+@pytest.mark.parametrize("template", COMIC_STORYBOARD_PROMPTS)
+def test_builtin_prompt_keeps_runtime_placeholders_and_complete_scene_contract(
+    template,
+):
+    """新增模板保留运行时变量与完整场景约束，不携带导出伪引用。"""
+    prompt = COMIC_STORYBOARD_PROMPTS[template]
+    assert set(re.findall(r"\$\{([^}]+)\}", prompt)) == {
+        "topic_count",
+        "chat_content",
+    }
+    assert "Panel 1" in prompt
+    assert "Background Context" in prompt
+    assert "scene" in prompt
+    assert "JSON" in prompt
+    assert "[cite:" not in prompt
+    assert "Plaintext" not in prompt
+    assert prompt.endswith(("。", "\n"))
+
+
+def test_new_template_labels_follow_their_prompt_text():
+    """手稿和深海模板的标题约定以实际输出正文为准。"""
+    assert "PROJECT #1" in COMIC_STORYBOARD_PROMPTS["steampunk_blueprint"]
+    assert "BLUEPRINT #" not in COMIC_STORYBOARD_PROMPTS["steampunk_blueprint"]
+    assert "SONAR #1" in COMIC_STORYBOARD_PROMPTS["deep_sea_log"]
+    assert "DEPTH #" not in COMIC_STORYBOARD_PROMPTS["deep_sea_log"]
+    assert "便利贴对白、相纸白边标题" in COMIC_STORYBOARD_PROMPTS["scrapbook_diary"]
 
 
 @pytest.mark.parametrize("template", COMIC_STORYBOARD_PROMPTS)
@@ -226,11 +278,18 @@ def test_catalog_matches_schema_and_reviewed_document():
     root = Path(__file__).parents[1]
     schema = json.loads((root / "_conf_schema.json").read_text(encoding="utf-8"))
     fields = schema["prompts"]["items"]["comic_analysis_prompts"]["items"]
+    catalog = json.loads(
+        (root / "src/shared/comic_prompt_templates.json").read_text(encoding="utf-8")
+    )
     assert fields["comic_storyboard_template"]["options"] == [
         *COMIC_STORYBOARD_PROMPTS,
         "custom",
     ]
     assert fields["comic_storyboard_template"]["default"] == "custom"
+    assert fields["comic_storyboard_template"]["labels"] == [
+        *[entry["name"] for entry in catalog.values()],
+        "自定义",
+    ]
     assert (
         fields["comic_storyboard_prompt"]["default"] == DEFAULT_COMIC_STORYBOARD_PROMPT
     )
@@ -241,5 +300,6 @@ def test_catalog_matches_schema_and_reviewed_document():
     )
     assert prompts == [
         COMIC_STORYBOARD_PROMPTS[key]
-        for key in ("scp_dossier", "noir_detective", "pixel_rpg")
+        for key in COMIC_STORYBOARD_PROMPTS
+        if key != "classic"
     ]
