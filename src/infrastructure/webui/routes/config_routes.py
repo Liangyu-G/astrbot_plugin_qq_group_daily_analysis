@@ -11,6 +11,7 @@ import json
 import re
 import time
 from collections.abc import Iterable
+from copy import deepcopy
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -334,12 +335,17 @@ class ConfigRoutes:
                     return val
 
                 cleansed = _cleanse_reference_images(save_dto["config"])
-                if isinstance(cleansed, dict):
-                    for k, v in cleansed.items():
-                        config_obj[k] = v
-
-                if cfg_mgr:
-                    cfg_mgr.save_config()
+                previous_config = deepcopy(dict(config_obj))
+                try:
+                    if isinstance(cleansed, dict):
+                        config_obj.update(cleansed)
+                    if cfg_mgr:
+                        cfg_mgr.save_config()
+                except Exception:
+                    # 在保存锁内恢复，既保留配置对象引用，也移除本次新增的键。
+                    config_obj.clear()
+                    config_obj.update(previous_config)
+                    raise
 
             if self.auto_scheduler is not None and self.context is not None:
                 self.auto_scheduler.schedule_jobs(self.context)
@@ -349,11 +355,16 @@ class ConfigRoutes:
                     )
 
             logger.info("WebUI 配置中心已更新并保存插件配置。")
+            # 宿主 Page Bridge 会优先转发响应的 data，成功回执必须在解包后仍然存在。
             return json_response(
                 {
                     "status": "ok",
                     "message": "配置已成功保存并持久化生效",
-                    "data": dict(config_obj),
+                    "data": {
+                        "status": "ok",
+                        "message": "配置已成功保存并持久化生效",
+                        "config": dict(config_obj),
+                    },
                 }
             )
         except Exception as e:
