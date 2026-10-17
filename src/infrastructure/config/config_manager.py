@@ -959,6 +959,18 @@ class ConfigManager:
         self._ensure_group("basic")["show_report_caption"] = enabled
         self.config.save_config()
 
+    def get_enable_merged_forward(self) -> bool:
+        """获取是否合并转发报告、词云和漫画，非法配置按关闭处理。"""
+        value = self._get_group("basic").get("enable_merged_forward", False)
+        return value if type(value) is bool else False
+
+    def get_merged_forward_timeout(self) -> int:
+        """获取合并转发收集结果的等待秒数，非法配置回退为 600 秒。"""
+        value = self._get_group("basic").get("merged_forward_timeout", 600)
+        if type(value) is int and 10 <= value <= 3600:
+            return value
+        return 600
+
     def get_profile_display_mode(self) -> str:
         """获取人格标签展示模式。"""
         mode = str(self._get_group("basic").get("profile_display_mode", "mbti")).lower()
