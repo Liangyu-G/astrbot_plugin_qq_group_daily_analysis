@@ -32,6 +32,9 @@ from .src.application.services.analysis_application_service import (
 from .src.application.services.analysis_trigger_service import AnalysisTriggerService
 from .src.application.services.comic_application_service import ComicApplicationService
 from .src.application.services.crash_recovery_service import CrashRecoveryService
+from .src.application.services.merged_forward_delivery import (
+    MergedForwardDeliveryService,
+)
 from .src.application.services.message_processing_service import (
     MessageProcessingService,
 )
@@ -217,6 +220,9 @@ class GroupDailyAnalysis(Star):
 
         # 调度与发送
         self.message_sender = MessageSender(self.bot_manager, self.config_manager)
+        self.merged_delivery = MergedForwardDeliveryService(
+            self.config_manager, self.bot_manager
+        )
         self.wordcloud_renderer = WordCloudRenderer(
             self.config_manager, plugin_data_dir, self.html_render
         )
@@ -227,6 +233,7 @@ class GroupDailyAnalysis(Star):
             self.wordcloud_store,
             self.message_sender,
         )
+        self.wordcloud_delivery.merged_delivery = self.merged_delivery
         self.wordcloud_command_handler = WordCloudCommandHandler(
             self.analysis_service, self.wordcloud_delivery
         )
@@ -290,6 +297,9 @@ class GroupDailyAnalysis(Star):
             plugin_data_dir=plugin_data_dir,
             plugin_instance=self,
         )
+        self.comic_command_handler.merged_delivery = self.merged_delivery
+        self.auto_scheduler.report_dispatcher.merged_delivery = self.merged_delivery
+        self.auto_scheduler.report_dispatcher.comic_handler = self.comic_command_handler
         self.analysis_command_handler = AnalysisCommandHandler(
             config_manager=self.config_manager,
             bot_manager=self.bot_manager,
@@ -303,6 +313,7 @@ class GroupDailyAnalysis(Star):
             plugin_data_dir=plugin_data_dir,
             plugin_instance=self,
             wordcloud_delivery=self.wordcloud_delivery,
+            report_dispatcher=self.auto_scheduler.report_dispatcher,
         )
 
         # 6. LLM Tool 业务服务
