@@ -283,6 +283,24 @@ class PluginPageWebUIBridge:
                 "Get preview image of a custom report template as base64 data URL",
             ),
             (
+                f"/{PLUGIN_NAME}/comic/templates/preview",
+                self.template_routes.api_get_comic_template_preview,
+                ["GET"],
+                "获取内置漫画模板示例图",
+            ),
+            (
+                f"/{PLUGIN_NAME}/comic/templates/rotation/status",
+                self.template_routes.api_get_comic_template_rotation_status,
+                ["GET"],
+                "只读获取漫画模板轮换状态",
+            ),
+            (
+                f"/{PLUGIN_NAME}/comic/templates/rotation/reset",
+                self.template_routes.api_reset_comic_template_rotation,
+                ["POST"],
+                "重置所选范围的漫画模板轮换进度",
+            ),
+            (
                 f"/{PLUGIN_NAME}/templates/install_from_url",
                 self.template_routes.api_install_template_from_url,
                 ["POST"],
@@ -538,6 +556,15 @@ class PluginPageWebUIBridge:
 
     async def api_get_template_preview(self) -> WebApiResponse:
         return await self.template_routes.api_get_template_preview()
+
+    async def api_get_comic_template_preview(self) -> WebApiResponse:
+        return await self.template_routes.api_get_comic_template_preview()
+
+    async def api_get_comic_template_rotation_status(self) -> WebApiResponse:
+        return await self.template_routes.api_get_comic_template_rotation_status()
+
+    async def api_reset_comic_template_rotation(self) -> WebApiResponse:
+        return await self.template_routes.api_reset_comic_template_rotation()
 
     async def api_install_template_from_url(self) -> WebApiResponse:
         return await self.template_routes.api_install_template_from_url()

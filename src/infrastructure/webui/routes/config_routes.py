@@ -10,13 +10,14 @@ import base64
 import json
 import re
 import time
-from collections.abc import Iterable
+from collections.abc import Iterable, Mapping
 from copy import deepcopy
 from pathlib import Path
 from typing import TYPE_CHECKING
 
 from astrbot.api.star import StarTools
 
+from ....shared.comic_prompts import COMIC_STORYBOARD_PROMPTS
 from ....shared.constants import PLUGIN_NAME
 from ....utils.cdn_utils import normalize_cdn_base_url
 from ....utils.logger import logger
@@ -53,6 +54,60 @@ def _config_key_to_folder(key_path: str) -> str:
     """与 AstrBot 官方核心完全一致的 config_key 到存储目录转换规则（以 / 分隔）"""
     parts = [_sanitize_path_segment(part) for part in key_path.split(".") if part]
     return "/".join(parts) if parts else "_"
+
+
+def validate_comic_template_rotation_config(config: Mapping[str, object]) -> None:
+    """校验漫画模板轮换配置，兼容没有新增字段的旧配置。
+
+    Args:
+        config: 将要保存的完整有效配置。
+
+    Raises:
+        ValueError: 模式、范围或候选模板配置不合法。
+    """
+    daily = config.get("daily_comic", {})
+    if not isinstance(daily, dict):
+        raise ValueError("每日漫画配置必须是对象")
+    mode = daily.get("comic_template_mode", "fixed")
+    if not isinstance(mode, str) or mode not in {
+        "fixed",
+        "sequential",
+        "daily_sequential",
+        "random",
+        "daily_random",
+        "shuffle",
+    }:
+        raise ValueError("漫画模板切换模式无效")
+    scope = daily.get("comic_template_scope", "global")
+    if not isinstance(scope, str) or scope not in {"global", "group"}:
+        raise ValueError("漫画模板切换范围无效")
+    candidates = daily.get("comic_template_candidates", list(COMIC_STORYBOARD_PROMPTS))
+    if not isinstance(candidates, list) or any(
+        not isinstance(item, str) for item in candidates
+    ):
+        raise ValueError("漫画模板候选池必须是模板标识列表")
+    if len(candidates) != len(set(candidates)):
+        raise ValueError("漫画模板候选池不能包含重复模板")
+    if any(
+        item not in COMIC_STORYBOARD_PROMPTS and item != "custom" for item in candidates
+    ):
+        raise ValueError("漫画模板候选池包含未知模板")
+    if mode != "fixed" and not candidates:
+        raise ValueError("启用漫画模板切换时，候选池至少需要一个模板")
+    if mode != "fixed" and "custom" in candidates:
+        prompts = config.get("prompts", {})
+        comic_prompts = (
+            prompts.get("comic_analysis_prompts", {})
+            if isinstance(prompts, dict)
+            else {}
+        )
+        custom = (
+            comic_prompts.get("comic_storyboard_prompt", "")
+            if isinstance(comic_prompts, dict)
+            else ""
+        )
+        if not isinstance(custom, str) or not custom.strip():
+            raise ValueError("候选池包含自定义模板时，必须填写自定义漫画场景分析提示词")
 
 
 class ConfigRoutes:
@@ -237,6 +292,13 @@ class ConfigRoutes:
                         )
 
             async with self._wordcloud_resource_lock:
+                # 与持久化共用锁，防止并发保存后使用过期的提示词校验候选池。
+                effective_config = {**dict(config_obj), **new_config}
+                try:
+                    validate_comic_template_rotation_config(effective_config)
+                except ValueError as exc:
+                    return error_response(str(exc), status_code=400)
+
                 if wordcloud is not None:
                     if self.wordcloud_renderer is None:
                         # 兼容旧装配入口，但仍使用正式目录进行资源校验。

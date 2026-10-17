@@ -361,6 +361,57 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/comic/templates/preview": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** 获取内置漫画模板示例图 */
+        get: operations["getComicTemplatePreview"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/comic/templates/rotation/status": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** 只读获取已保存配置的漫画模板轮换状态，不推进进度 */
+        get: operations["getComicTemplateRotationStatus"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/comic/templates/rotation/reset": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** 仅重置已保存配置中所选范围的漫画模板轮换进度 */
+        post: operations["resetComicTemplateRotation"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/logs": {
         parameters: {
             query?: never;
@@ -416,6 +467,27 @@ export interface paths {
 export type webhooks = Record<string, never>;
 export interface components {
     schemas: {
+        ComicTemplateRotationStatus: {
+            /** @enum {string} */
+            mode: "fixed" | "sequential" | "daily_sequential" | "random" | "daily_random" | "shuffle";
+            /** @enum {string} */
+            scope: "global" | "group";
+            scope_key: string;
+            candidates: string[];
+            current_template_id: string | null;
+            current_template_name: string | null;
+            next_template_id: string | null;
+            next_template_name: string | null;
+            /** @description 运行环境时区中的当天日期 YYYY-MM-DD */
+            date: string;
+            initialized: boolean;
+            warning: string | null;
+        };
+        ComicTemplateRotationResponse: {
+            /** @enum {string} */
+            status: "ok";
+            data: components["schemas"]["ComicTemplateRotationStatus"];
+        };
         TemplateCdnProbeRequest: {
             base_url: string;
         };
@@ -1409,6 +1481,152 @@ export interface operations {
                         data?: components["schemas"]["ReportTemplateItem"][];
                     };
                 };
+            };
+        };
+    };
+    getComicTemplatePreview: {
+        parameters: {
+            query: {
+                /** @description 内置漫画提示词目录中的模板标识 */
+                template_name: string;
+                /** @description 画廊使用缩略图，放大查看使用完整示例图 */
+                variant?: "thumbnail" | "full";
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description 示例图数据地址；没有配图的已知模板返回 null */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        status: string;
+                        data: {
+                            data_url: string | null;
+                        };
+                    };
+                };
+            };
+            /** @description 模板标识或预览图尺寸选项无效 */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description 模板预览图资源缺失 */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description 模板预览图读取失败 */
+            500: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    getComicTemplateRotationStatus: {
+        parameters: {
+            query?: {
+                group_id?: string;
+                /** @description 各群独立模式应传入完整群会话；未选择会话返回提示而不读取其他群进度 */
+                umo?: string;
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description 当前和下一模板，随机模式下一模板为空 */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ComicTemplateRotationResponse"];
+                };
+            };
+            /** @description 群会话参数无效 */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description 轮换状态读取失败 */
+            500: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description 配置管理器尚未初始化 */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    resetComicTemplateRotation: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": {
+                    /** @enum {string} */
+                    action: "reset";
+                    group_id?: string;
+                    umo?: string;
+                };
+            };
+        };
+        responses: {
+            /** @description 重置后的轮换状态 */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ComicTemplateRotationResponse"];
+                };
+            };
+            /** @description 参数无效或群独立模式没有完整会话 */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description 轮换状态写入失败 */
+            500: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description 配置管理器尚未初始化 */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
             };
         };
     };
