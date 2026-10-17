@@ -11,6 +11,7 @@ from typing import TYPE_CHECKING
 from ...domain.repositories.platform_adapter_repository import GroupAlbumSupportProtocol
 from ...shared.trace_context import TraceContext
 from ...utils.logger import logger
+from .merged_forward_delivery import PreparedForwardMessage
 
 if TYPE_CHECKING:
     from ...domain.value_objects.wordcloud import WordCloudData
@@ -18,6 +19,7 @@ if TYPE_CHECKING:
     from ...infrastructure.messaging.message_sender import MessageSender
     from ...infrastructure.persistence.wordcloud_store import WordCloudStore
     from ...infrastructure.reporting.wordcloud_renderer import WordCloudRenderer
+    from .merged_forward_delivery import MergedForwardDeliveryService
 
 
 class WordCloudDeliveryService:
@@ -35,6 +37,8 @@ class WordCloudDeliveryService:
         self.store = store
         self.message_sender = message_sender
         self._send_lock = asyncio.Lock()
+        self.merged_delivery: MergedForwardDeliveryService | None = None
+        self._forward_reservations: set[tuple[str, str]] = set()
 
     async def send(
         self,
@@ -55,7 +59,7 @@ class WordCloudDeliveryService:
             umo: 完整群会话标识，用于群配置及框架 T2I 选择。
 
         Returns:
-            是否发送成功，或同一快照此前已发送成功。
+            是否发送成功，或同一快照已发送、已由其他合并任务接管。
         """
         umo = umo or f"{platform_id}:GroupMessage:{group_id}"
         options = self.config_manager.get_wordcloud_options(umo)
@@ -69,6 +73,25 @@ class WordCloudDeliveryService:
         async with self._send_lock:
             if not force and self.store.is_sent(umo, fingerprint):
                 return True
+            if self.merged_delivery and self.merged_delivery.enabled_for(platform_id):
+                reservation = (umo, fingerprint)
+                if reservation in self._forward_reservations:
+                    # 同一快照已经加入另一条合并消息，不把等待投递误报为失败。
+                    return True
+
+                async def prepare() -> list[PreparedForwardMessage]:
+                    return await self._prepare_forward(
+                        data, group_id, platform_id, umo, force=force
+                    )
+
+                sent_kinds = await self.merged_delivery.deliver(
+                    group_id, platform_id, {"wordcloud": prepare}
+                )
+                return (
+                    "wordcloud" in sent_kinds
+                    or self.store.is_sent(umo, fingerprint)
+                    or reservation in self._forward_reservations
+                )
             self.store.save(umo, fingerprint, data, "pending")
             trace = TraceContext.current()
             try:
@@ -113,6 +136,128 @@ class WordCloudDeliveryService:
             # 发送成功状态先落库；相册只是附加归档，不能让失败导致群里重复发图。
             await self._try_upload_album(group_id, image_url, platform_id)
             return True
+
+    async def _prepare_forward(
+        self,
+        data: WordCloudData,
+        group_id: str,
+        platform_id: str,
+        umo: str,
+        *,
+        force: bool = False,
+    ) -> list[PreparedForwardMessage]:
+        """只渲染词云，实际合并发送成功后才标记成功并归档。
+
+        Args:
+            data: 完整词频快照。
+            group_id: 目标群号。
+            platform_id: 目标平台实例。
+            umo: 完整会话标识。
+            force: 显式重发时忽略成功记录。
+
+        Returns:
+            一个待发送节点，已发送或关闭时为空。
+        """
+        options = self.config_manager.get_wordcloud_options(umo)
+        if not options.enabled:
+            return []
+        fingerprint = hashlib.sha256(
+            json.dumps(
+                {"data": data.to_dict(), "options": options.to_dict()},
+                ensure_ascii=False,
+                sort_keys=True,
+            ).encode()
+        ).hexdigest()
+        if not force and self.store.is_sent(umo, fingerprint):
+            return []
+        reservation = (umo, fingerprint)
+        # 检查与占位之间没有 await，同一事件循环中的各投递入口共享预约。
+        if reservation in self._forward_reservations:
+            return []
+        self._forward_reservations.add(reservation)
+        trace = TraceContext.current()
+
+        async def failed() -> None:
+            try:
+                self.store.save(
+                    umo, fingerprint, data, "failed", "合并转发未确认发送成功"
+                )
+            finally:
+                self._forward_reservations.discard(reservation)
+
+        async def sent() -> None:
+            try:
+                self.store.save(umo, fingerprint, data, "sent")
+                if trace:
+                    trace.metadata["wordcloud"] = {
+                        "status": "sent",
+                        "fingerprint": fingerprint,
+                    }
+                await self._try_upload_album(group_id, image_url, platform_id)
+            finally:
+                self._forward_reservations.discard(reservation)
+
+        try:
+            self.store.save(umo, fingerprint, data, "pending")
+            image = await self.renderer.render(data, umo=umo, options=options)
+            image_url = (
+                "base64://" + base64.b64encode(image).decode()
+                if isinstance(image, bytes)
+                else image
+            )
+            return [
+                PreparedForwardMessage(
+                    kind="wordcloud",
+                    text=TraceContext.make_report_caption("wordcloud")
+                    if self.config_manager.get_show_report_caption()
+                    else "",
+                    image_url=image_url,
+                    after_send=sent,
+                    after_failure=failed,
+                )
+            ]
+        except asyncio.CancelledError:
+            try:
+                self.store.save(
+                    umo, fingerprint, data, "failed", "词云生成等待超时或任务已取消"
+                )
+            except Exception as exc:
+                logger.warning(f"取消词云准备时保存失败状态异常：{exc}")
+            finally:
+                self._forward_reservations.discard(reservation)
+            raise
+        except Exception as exc:
+            try:
+                self.store.save(umo, fingerprint, data, "failed", str(exc))
+            finally:
+                self._forward_reservations.discard(reservation)
+            raise
+
+    async def prepare_for_report(
+        self, data: WordCloudData | None, group_id: str, platform_id: str
+    ) -> list[PreparedForwardMessage]:
+        """合并模式下独立准备附送词云，不依赖报告是否成功。
+
+        Args:
+            data: 日报相同时间段的词频快照。
+            group_id: 目标群号。
+            platform_id: 平台实例。
+
+        Returns:
+            开启附送时的词云节点，否则只缓存词频并返回空列表。
+        """
+        if data is None:
+            return []
+        umo = f"{platform_id}:GroupMessage:{group_id}"
+        options = self.config_manager.get_wordcloud_options(umo)
+        if not options.enabled or not options.send_with_report:
+            if options.enabled:
+                fingerprint = hashlib.sha256(
+                    json.dumps(data.to_dict(), sort_keys=True).encode()
+                ).hexdigest()
+                self.store.save(umo, fingerprint, data, "cached")
+            return []
+        return await self._prepare_forward(data, group_id, platform_id, umo)
 
     async def _try_upload_album(
         self, group_id: str, image_url: str, platform_id: str
