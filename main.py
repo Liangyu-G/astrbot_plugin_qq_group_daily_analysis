@@ -16,6 +16,7 @@ from astrbot.api import AstrBotConfig
 from astrbot.api.event import AstrMessageEvent, MessageEventResult, filter
 from astrbot.api.event.filter import PermissionType
 from astrbot.api.star import Context, Star, StarTools
+from astrbot.core.star.filter.command import GreedyStr
 
 from .src.application.handlers.analysis_command_handler import (
     AnalysisCommandHandler,
@@ -669,6 +670,17 @@ class GroupDailyAnalysis(Star):
         platform_id = str(self._get_platform_id_from_event(event) or "")
         async for result in self.settings_command_handler.handle_view_templates(
             event, platform_id
+        ):
+            yield result
+
+    @filter.command("查看漫画模板", alias={"view_comic_templates"})
+    @filter.permission_type(PermissionType.ADMIN)
+    async def view_comic_templates(
+        self, event: AstrMessageEvent, template_input: GreedyStr
+    ) -> AsyncGenerator[MessageEventResult]:
+        """查看内置漫画风格示例，可指定序号、标识或完整名称。"""
+        async for result in self.settings_command_handler.handle_view_comic_templates(
+            event, template_input
         ):
             yield result
 
