@@ -232,6 +232,23 @@ class ConfigRoutes:
             if config_obj is None:
                 return error_response("配置管理器未初始化", status_code=500)
 
+            if "basic" in new_config:
+                basic = new_config["basic"]
+                if not isinstance(basic, dict):
+                    return error_response("基础设置必须是对象", status_code=400)
+                if (
+                    "enable_merged_forward" in basic
+                    and type(basic["enable_merged_forward"]) is not bool
+                ):
+                    return error_response("合并转发开关必须为布尔值", status_code=400)
+                if "merged_forward_timeout" in basic:
+                    timeout = basic["merged_forward_timeout"]
+                    if type(timeout) is not int or not 10 <= timeout <= 3600:
+                        return error_response(
+                            "合并转发等待超时必须为 10–3600 秒的整数",
+                            status_code=400,
+                        )
+
             wordcloud: dict[str, object] | None = None
             if "wordcloud" in new_config:
                 raw_wordcloud = new_config["wordcloud"]
