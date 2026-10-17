@@ -8,13 +8,24 @@ from __future__ import annotations
 import json
 import os
 import random
-from datetime import datetime
+from copy import deepcopy
+from dataclasses import replace
+from datetime import date, datetime
 from typing import TYPE_CHECKING
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from astrbot.api.star import StarTools
 
+from ...domain.value_objects.comic_template_rotation import (
+    ComicGenerationSnapshot,
+    ComicTemplateMode,
+    ComicTemplateRotationSettings,
+    ComicTemplateRotationStatus,
+    ComicTemplateScope,
+    ComicTemplateSelection,
+)
 from ...domain.value_objects.wordcloud import WordCloudOptions
+from ...shared.comic_prompts import COMIC_STORYBOARD_PROMPTS, COMIC_TEMPLATE_NAMES
 from ...shared.constants import (
     DEFAULT_ATRI_ASSETS_CDN_URL,
     DEFAULT_CDN_HOST,
@@ -25,6 +36,7 @@ from ...shared.constants import (
 )
 from ...utils.cdn_utils import normalize_cdn_base_url
 from ...utils.logger import logger
+from .comic_template_rotation import ComicTemplateRotationStore
 from .config_migrator import ConfigMigrator
 
 if TYPE_CHECKING:
@@ -1366,7 +1378,7 @@ class ConfigManager:
         if timezone_name:
             try:
                 current_time = datetime.now(ZoneInfo(timezone_name))
-            except ZoneInfoNotFoundError:
+            except (ZoneInfoNotFoundError, ValueError, OSError):
                 logger.warning(
                     f"环境变量 TZ={timezone_name!r} 不是有效 IANA 时区，"
                     "每日漫画角色将使用系统本地时区。"
@@ -1376,19 +1388,22 @@ class ConfigManager:
             current_time = datetime.now().astimezone()
         today = current_time.date().isoformat()
         state_path = self._get_comic_character_state_path()
-        state = self._read_comic_character_state(state_path)
-        selected_character = state.get("selected_character")
-        if state.get("date") == today and selected_character in enabled_characters:
-            return selected_character
+        with ComicTemplateRotationStore.lock_for_path(state_path):
+            state = self._read_comic_character_state(state_path)
+            selected_character = state.get("selected_character")
+            if state.get("date") == today and selected_character in enabled_characters:
+                return selected_character
 
-        selected_character = random.choice(enabled_characters)
-        self._save_comic_character_state(
-            state_path,
-            {"date": today, "selected_character": selected_character},
-        )
-        character_name = str(selected_character.get("name", "")).strip() or "未命名方案"
-        logger.info(f"今日漫画角色已随机选择: {character_name}")
-        return selected_character
+            selected_character = random.choice(enabled_characters)
+            self._save_comic_character_state(
+                state_path,
+                {"date": today, "selected_character": selected_character},
+            )
+            character_name = (
+                str(selected_character.get("name", "")).strip() or "未命名方案"
+            )
+            logger.info(f"今日漫画角色已随机选择: {character_name}")
+            return selected_character
 
     def get_comic_character_persona_id(self, character: dict | None) -> str:
         """获取角色方案绑定的漫画专用人格 ID。
@@ -1417,6 +1432,216 @@ class ConfigManager:
             if isinstance(prompt, str) and prompt.strip():
                 return prompt.strip()
         return self.get_comic_storyboard_prompt()
+
+    def _get_comic_template_rotation_settings(self) -> ComicTemplateRotationSettings:
+        """解析运行时设置；手工写入的无效配置回退固定模板并保留警告。"""
+        group = self._get_group("daily_comic")
+        prompts = self._get_group("prompts").get("comic_analysis_prompts", {})
+        prompts = prompts if isinstance(prompts, dict) else {}
+        raw_custom = prompts.get("comic_storyboard_prompt", "")
+        custom = raw_custom if isinstance(raw_custom, str) else ""
+        fixed_id = prompts.get("comic_storyboard_template", "custom")
+        if not isinstance(fixed_id, str) or fixed_id not in COMIC_STORYBOARD_PROMPTS:
+            fixed_id = "custom" if custom.strip() else "classic"
+        modes: dict[str, ComicTemplateMode] = {
+            mode: mode
+            for mode in (
+                "fixed",
+                "sequential",
+                "daily_sequential",
+                "random",
+                "daily_random",
+                "shuffle",
+            )
+        }
+        scopes: dict[str, ComicTemplateScope] = {"global": "global", "group": "group"}
+        raw_mode = group.get("comic_template_mode", "fixed")
+        raw_scope = group.get("comic_template_scope", "global")
+        mode = modes.get(raw_mode, "fixed") if isinstance(raw_mode, str) else "fixed"
+        scope = (
+            scopes.get(raw_scope, "global") if isinstance(raw_scope, str) else "global"
+        )
+        raw_candidates = group.get(
+            "comic_template_candidates", list(COMIC_STORYBOARD_PROMPTS)
+        )
+        warning: str | None = None
+        candidates: tuple[str, ...] = ()
+        if not isinstance(raw_mode, str) or raw_mode not in modes:
+            warning = "漫画模板切换模式无效，本次使用固定模板"
+        elif not isinstance(raw_scope, str) or raw_scope not in scopes:
+            warning = "漫画模板切换范围无效，本次使用固定模板"
+        if (
+            not isinstance(raw_candidates, list)
+            or any(
+                not isinstance(item, str)
+                or (item not in COMIC_STORYBOARD_PROMPTS and item != "custom")
+                for item in raw_candidates
+            )
+            or len(set(raw_candidates)) != len(raw_candidates)
+        ):
+            warning = warning or "漫画模板候选列表无效，本次使用固定模板"
+        else:
+            candidates = tuple(raw_candidates)
+            if mode != "fixed" and not candidates:
+                warning = warning or "漫画模板候选列表为空，本次使用固定模板"
+            elif mode != "fixed" and "custom" in candidates and not custom.strip():
+                warning = warning or "候选列表中的自定义提示词为空，本次使用固定模板"
+        return ComicTemplateRotationSettings(
+            mode="fixed" if warning else mode,
+            scope=scope,
+            candidates=candidates,
+            fixed_template_id=fixed_id,
+            custom_prompt=custom,
+            warning=warning,
+        )
+
+    @staticmethod
+    def _get_comic_template_today() -> date:
+        """沿用每日角色选择的 TZ 优先、系统本地时区兜底规则。"""
+        timezone_name = os.environ.get("TZ", "").strip()
+        if timezone_name:
+            try:
+                return datetime.now(ZoneInfo(timezone_name)).date()
+            except (ZoneInfoNotFoundError, ValueError, OSError):
+                logger.warning(
+                    f"环境变量 TZ={timezone_name!r} 不是有效 IANA 时区，"
+                    "每日漫画模板将使用系统本地时区。"
+                )
+        return datetime.now().astimezone().date()
+
+    @staticmethod
+    def _get_comic_template_rotation_store() -> ComicTemplateRotationStore:
+        """创建共享同一路径锁的轮换状态访问器。"""
+        return ComicTemplateRotationStore(
+            StarTools.get_data_dir(PLUGIN_NAME) / "comic_template_rotation_state.json"
+        )
+
+    def select_comic_template(
+        self, group_id: str = "", umo: str | None = None
+    ) -> ComicTemplateSelection:
+        """在新任务开始时预留模板；LLM 或绘图内部重试不得再次调用。
+
+        Args:
+            group_id: 群标识。
+            umo: 含平台和机器人身份的完整群会话标识。
+
+        Returns:
+            已冻结的模板标识、提示词和切换设置。
+
+        Raises:
+            OSError: 无法持久化本次轮换预留。
+        """
+        settings = self._get_comic_template_rotation_settings()
+        store = self._get_comic_template_rotation_store()
+        key = store.scope_key(settings, group_id, umo)
+        if settings.mode != "fixed" and not key:
+            settings = replace(
+                settings,
+                mode="fixed",
+                warning="群级漫画模板轮换缺少有效的完整群会话，本次使用固定模板",
+            )
+        if settings.warning:
+            logger.warning(settings.warning)
+        template_id = (
+            settings.fixed_template_id
+            if settings.mode == "fixed"
+            else store.reserve(settings, key, self._get_comic_template_today())
+        )
+        return ComicTemplateSelection(
+            template_id=template_id,
+            template_name=COMIC_TEMPLATE_NAMES.get(template_id, "自定义提示词"),
+            mode=settings.mode,
+            scope=settings.scope,
+            prompt=(
+                settings.custom_prompt
+                if template_id == "custom"
+                else COMIC_STORYBOARD_PROMPTS[template_id]
+            ),
+        )
+
+    def get_comic_generation_snapshot(
+        self, group_id: str, umo: str | None = None
+    ) -> ComicGenerationSnapshot:
+        """一次读取并冻结任务角色、人格、参考图与模板，角色专属提示词优先。
+
+        Args:
+            group_id: 群标识。
+            umo: 完整群会话标识。
+
+        Returns:
+            后续 LLM、供应商回退及重试共同使用的不可变快照。
+        """
+        character = deepcopy(self.get_selected_comic_character())
+        character_name = (
+            str(character.get("name", "")).strip() if character else ""
+        ) or "默认配置"
+        persona_id = self.get_comic_character_persona_id(character)
+        reference_images = (
+            character.get("reference_images", [])
+            if character
+            else deepcopy(
+                self._get_group("daily_comic").get("drawing_reference_image", [])
+            )
+        )
+        if isinstance(reference_images, str):
+            reference_images = [reference_images]
+        paths = (
+            tuple(
+                item.strip()
+                for item in reference_images
+                if isinstance(item, str) and item.strip()
+            )
+            if isinstance(reference_images, list)
+            else ()
+        )
+        override = character.get("storyboard_prompt") if character else None
+        if isinstance(override, str) and override.strip():
+            settings = self._get_comic_template_rotation_settings()
+            template = ComicTemplateSelection(
+                template_id="character",
+                template_name=f"{character_name}专属提示词",
+                mode=settings.mode,
+                scope=settings.scope,
+                prompt=override.strip(),
+                character_override=True,
+            )
+        else:
+            template = self.select_comic_template(group_id, umo)
+        return ComicGenerationSnapshot(character_name, persona_id, paths, template)
+
+    def get_comic_template_rotation_status(
+        self, group_id: str = "", umo: str | None = None
+    ) -> ComicTemplateRotationStatus:
+        """只读查询轮换状态；打开设置或预览不会选取随机模板。"""
+        settings = self._get_comic_template_rotation_settings()
+        store = self._get_comic_template_rotation_store()
+        return store.status(
+            settings,
+            store.scope_key(settings, group_id, umo),
+            self._get_comic_template_today(),
+            {**COMIC_TEMPLATE_NAMES, "custom": "自定义提示词"},
+        )
+
+    def reset_comic_template_rotation(
+        self, group_id: str = "", umo: str | None = None
+    ) -> ComicTemplateRotationStatus:
+        """清除当前全局或选定群的进度，随后返回不消耗进度的状态。
+
+        Args:
+            group_id: 群标识。
+            umo: 群级重置所需的完整会话标识。
+
+        Returns:
+            重置后的轮换状态。
+
+        Raises:
+            ValueError: 群级重置缺少有效完整会话标识。
+            OSError: 状态文件无法保存。
+        """
+        settings = self._get_comic_template_rotation_settings()
+        store = self._get_comic_template_rotation_store()
+        store.reset(store.scope_key(settings, group_id, umo))
+        return self.get_comic_template_rotation_status(group_id, umo)
 
     @staticmethod
     def _get_comic_character_state_path() -> Path:

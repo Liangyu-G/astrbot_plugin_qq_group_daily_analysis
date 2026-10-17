@@ -593,6 +593,117 @@
                 "default": false,
                 "hint": "开启后每天首次生成漫画时，会从下方已启用的角色方案随机选择一个，并按运行环境时区在当天持续使用；重启不会改变当天选择。关闭时固定使用第一个已启用方案。"
             },
+            "comic_template_mode": {
+                "description": "漫画模板切换模式",
+                "type": "string",
+                "default": "fixed",
+                "options": [
+                    "fixed",
+                    "sequential",
+                    "daily_sequential",
+                    "random",
+                    "daily_random",
+                    "shuffle"
+                ],
+                "labels": [
+                    "固定模板",
+                    "每次按顺序",
+                    "每日按顺序",
+                    "每次随机",
+                    "每日随机",
+                    "洗牌轮播"
+                ],
+                "hint": "固定模式沿用默认漫画提示词模板；每次按顺序在新任务开始时前进，失败任务也占用一次；每日按顺序按日历日期推进；每日随机当天保持一致；洗牌轮播每轮遍历候选池一次。内部重试、预览和重发不推进。"
+            },
+            "comic_template_scope": {
+                "description": "漫画模板切换范围",
+                "type": "string",
+                "default": "global",
+                "options": [
+                    "global",
+                    "group"
+                ],
+                "labels": [
+                    "全局共用进度",
+                    "各群独立进度"
+                ],
+                "hint": "全局共用同一轮换进度；各群独立按完整群会话区分，避免不同机器人下同号群混用。每日模式使用运行环境时区，进度持久化后重启仍保留。"
+            },
+            "comic_template_candidates": {
+                "description": "漫画模板候选池（按列表顺序）",
+                "type": "list",
+                "default": [
+                    "classic",
+                    "scp_dossier",
+                    "noir_detective",
+                    "pixel_rpg",
+                    "cyberpunk_hud",
+                    "showa_kidan",
+                    "steampunk_blueprint",
+                    "alchemist_botanical",
+                    "wasteland_radio",
+                    "ukiyo_e",
+                    "golden_age_comic",
+                    "deep_sea_log",
+                    "phantom_thief",
+                    "scrapbook_diary"
+                ],
+                "options": [
+                    "classic",
+                    "scp_dossier",
+                    "noir_detective",
+                    "pixel_rpg",
+                    "cyberpunk_hud",
+                    "showa_kidan",
+                    "steampunk_blueprint",
+                    "alchemist_botanical",
+                    "wasteland_radio",
+                    "ukiyo_e",
+                    "golden_age_comic",
+                    "deep_sea_log",
+                    "phantom_thief",
+                    "scrapbook_diary",
+                    "custom"
+                ],
+                "labels": [
+                    "原版漫画",
+                    "SCP 异常调查档案风",
+                    "黑色电影侦探风",
+                    "像素 RPG 每日冒险日志",
+                    "赛博朋克义体HUD日志",
+                    "复古昭和怪谈画报风",
+                    "蒸汽朋克发明家手稿",
+                    "炼金术士魔导植物志",
+                    "废土生存广播电台日志",
+                    "浮世绘锦绘町人见闻录",
+                    "美式黄金时代超英漫画",
+                    "深海科考潜航器观测录",
+                    "怪盗团预告信剪报拼贴",
+                    "手账剪贴簿拍立得日记",
+                    "自定义"
+                ],
+                "items": {
+                    "type": "string",
+                    "options": [
+                        "classic",
+                        "scp_dossier",
+                        "noir_detective",
+                        "pixel_rpg",
+                        "cyberpunk_hud",
+                        "showa_kidan",
+                        "steampunk_blueprint",
+                        "alchemist_botanical",
+                        "wasteland_radio",
+                        "ukiyo_e",
+                        "golden_age_comic",
+                        "deep_sea_log",
+                        "phantom_thief",
+                        "scrapbook_diary",
+                        "custom"
+                    ]
+                },
+                "hint": "选择参与切换的模板，顺序模式按此列表的先后顺序轮换；插件 WebUI 支持调整顺序。自定义不会自动加入，明确加入时必须填写自定义漫画场景分析提示词。角色专属提示词非空时优先使用，不占用轮换进度。"
+            },
             "comic_characters": {
                 "description": "漫画角色方案",
                 "type": "template_list",
@@ -1921,6 +2032,16 @@
                             "scp_dossier",
                             "noir_detective",
                             "pixel_rpg",
+                            "cyberpunk_hud",
+                            "showa_kidan",
+                            "steampunk_blueprint",
+                            "alchemist_botanical",
+                            "wasteland_radio",
+                            "ukiyo_e",
+                            "golden_age_comic",
+                            "deep_sea_log",
+                            "phantom_thief",
+                            "scrapbook_diary",
                             "custom"
                         ],
                         "labels": [
@@ -1928,9 +2049,19 @@
                             "SCP 异常调查档案风",
                             "黑色电影侦探风",
                             "像素 RPG 每日冒险日志",
+                            "赛博朋克义体HUD日志",
+                            "复古昭和怪谈画报风",
+                            "蒸汽朋克发明家手稿",
+                            "炼金术士魔导植物志",
+                            "废土生存广播电台日志",
+                            "浮世绘锦绘町人见闻录",
+                            "美式黄金时代超英漫画",
+                            "深海科考潜航器观测录",
+                            "怪盗团预告信剪报拼贴",
+                            "手账剪贴簿拍立得日记",
                             "自定义"
                         ],
-                        "hint": "四种内置风格和自定义模式。初始保留现有自定义内容；选择内置模板后直接使用该风格，不覆盖自定义文本。"
+                        "hint": "十四种内置风格和自定义模式。初始保留现有自定义内容；选择内置模板后直接使用该风格，不覆盖自定义文本。插件 WebUI 可查看已提供的风格示例图；角色专属提示词非空时仍优先使用角色内容。"
                     },
                     "comic_storyboard_prompt": {
                         "description": "自定义漫画场景分析提示词",
