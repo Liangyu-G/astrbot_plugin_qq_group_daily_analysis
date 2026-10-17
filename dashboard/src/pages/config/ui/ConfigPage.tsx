@@ -34,6 +34,8 @@ import { useTheme } from "../../../shared/lib/useTheme";
 import { MarkdownHint } from "../../../shared/ui/MarkdownHint";
 import { WordCloudEditor } from "../../../features/edit-wordcloud/ui/WordCloudEditor";
 import { WordCloudSettings } from "./WordCloudSettings";
+import { ComicTemplateRotationSettings } from "../../../features/edit-comic-prompt/ui/ComicTemplateRotationSettings";
+import { COMIC_ROTATION_FIELDS } from "../../../features/edit-comic-prompt/model/comicTemplateRotation";
 
 const { Title, Text, Paragraph } = Typography;
 
@@ -81,6 +83,8 @@ export const ConfigPage: React.FC<ConfigPageProps> = ({ viewModel }) => {
     handleReload,
     formData,
     wordCloudDirty,
+    comicDirty,
+    savedDailyComic,
     reloadConfirmationOpen,
     cancelReload,
     confirmReload,
@@ -109,6 +113,8 @@ export const ConfigPage: React.FC<ConfigPageProps> = ({ viewModel }) => {
     } else handleGroupPatch("wordcloud", patch);
   };
   const protectedFonts = [wordCloudValue.font, ...(groupOverrides && typeof groupOverrides === "object" && !Array.isArray(groupOverrides) ? Object.values(groupOverrides).map((entry: unknown) => entry && typeof entry === "object" && "font" in entry ? entry.font : undefined) : [])].filter((font): font is string => typeof font === "string");
+  const comicPrompts = formData.prompts?.comic_analysis_prompts;
+  const comicCustomPrompt = comicPrompts && typeof comicPrompts === "object" && "comic_storyboard_prompt" in comicPrompts ? comicPrompts.comic_storyboard_prompt : undefined;
 
   return (
     <div
@@ -407,7 +413,19 @@ export const ConfigPage: React.FC<ConfigPageProps> = ({ viewModel }) => {
                 <WordCloudSettings fields={currentGroupFields} value={formData.wordcloud} errors={errors.wordcloud} disabled={!configLoaded || saving} editorOpen={wordCloudEditorOpen} catalogRevision={wordCloudCatalogRevision} searching={!!searchQuery.trim()} dirty={wordCloudDirty} onRestoreSaved={restoreSavedWordCloud} onEditGroupAppearance={(umo) => { setWordCloudScope(umo); setWordCloudEditorOpen(true); }} onChange={(key, value) => handleFieldChange("wordcloud", key, value)} onOpenEditor={() => { setWordCloudScope(undefined); setWordCloudEditorOpen(true); }} />
               ) : (
                 <Row gutter={[16, 0]}>
-                  {currentGroupFields.map((field) => {
+                  {activeCategory === "daily_comic" && (!searchQuery.trim() || currentGroupFields.some(({ key }) => COMIC_ROTATION_FIELDS.includes(key))) && <Col span={24}>
+                    <ComicTemplateRotationSettings
+                      value={formData.daily_comic ?? {}}
+                      savedValue={savedDailyComic}
+                      dirty={comicDirty}
+                      disabled={!configLoaded || saving}
+                      customPrompt={comicCustomPrompt}
+                      errors={errors.daily_comic}
+                      onPatch={(patch) => handleGroupPatch("daily_comic", patch)}
+                      onOpenPromptSettings={() => { setSearchQuery(""); setActiveCategory("prompts"); requestAnimationFrame(() => document.getElementById("cfg-field-prompts-comic_analysis_prompts")?.scrollIntoView({ block: "center" })); }}
+                    />
+                  </Col>}
+                  {currentGroupFields.filter(({ key }) => activeCategory !== "daily_comic" || !COMIC_ROTATION_FIELDS.includes(key)).map((field) => {
                     const isLongField =
                       field.schema.type === "template_list" ||
                       field.schema.type === "object" ||

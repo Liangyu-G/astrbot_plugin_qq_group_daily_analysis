@@ -190,6 +190,8 @@ export function useConfigViewModel(onConfigSaved?: () => void) {
   }, [formData, originalConfig]);
 
   const wordCloudDirty = JSON.stringify(formData.wordcloud ?? {}) !== JSON.stringify(originalConfig.wordcloud ?? {});
+  const comicDirty = JSON.stringify(formData.daily_comic ?? {}) !== JSON.stringify(originalConfig.daily_comic ?? {}) ||
+    JSON.stringify(formData.prompts?.comic_analysis_prompts ?? {}) !== JSON.stringify(originalConfig.prompts?.comic_analysis_prompts ?? {});
 
   useEffect(() => {
     if (!isDirty) return;
@@ -234,6 +236,24 @@ export function useConfigViewModel(onConfigSaved?: () => void) {
       return next;
     });
   }, [formData.wordcloud, schema.wordcloud]);
+
+  // 模板模式、候选与跨分组的自定义提示词需要按整个漫画草稿校验。
+  useEffect(() => {
+    if (!schema.daily_comic) return;
+    const validation = validateConfigWithZod({ daily_comic: formData.daily_comic ?? {}, prompts: formData.prompts ?? {} }, { daily_comic: schema.daily_comic });
+    setErrors((previous) => {
+      const next = { ...previous };
+      if (validation.errorMap.daily_comic) next.daily_comic = validation.errorMap.daily_comic;
+      else delete next.daily_comic;
+      return next;
+    });
+    setGroupErrorCounts((previous) => {
+      const next = { ...previous };
+      if (validation.groupErrorCounts.daily_comic) next.daily_comic = validation.groupErrorCounts.daily_comic;
+      else delete next.daily_comic;
+      return next;
+    });
+  }, [formData.daily_comic, formData.prompts, schema.daily_comic]);
 
   const handleSave = async () => {
     if (!configLoaded || loading || saving) {
@@ -377,6 +397,8 @@ export function useConfigViewModel(onConfigSaved?: () => void) {
     saving,
     isDirty,
     wordCloudDirty,
+    comicDirty,
+    savedDailyComic: originalConfig.daily_comic ?? {},
     reloadConfirmationOpen,
     schema,
     formData,
