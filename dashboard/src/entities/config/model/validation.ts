@@ -2,6 +2,7 @@ import { cdnBaseUrlSchema } from "./renderingConfig";
 import { z } from "zod";
 import { PluginSchema, SchemaFieldItem } from "./types";
 import { wordCloudOptionsSchema } from "../../wordcloud/model/types";
+import { comicRotationConfigSchema, hasEmptyRotatingCustomPrompt } from "./comicRotationConfig";
 
 export interface ConfigValidationError {
   groupKey: string;
@@ -325,6 +326,18 @@ export function validateConfigWithZod(
         groupErrorCounts[groupKey] = (groupErrorCounts[groupKey] || 0) + 1;
       }
     });
+
+    if (groupKey === "daily_comic") {
+      const addError = (key: string, detail: string) => {
+        if (errorMap[groupKey]?.[key]) return;
+        errors.push({ groupKey, groupLabel, fieldKey: key, fieldLabel: groupItems[key]?.description || key, message: detail, path: `${groupKey}.${key}`, domId: `cfg-field-${groupKey}-${key}` });
+        errorMap[groupKey] = { ...errorMap[groupKey], [key]: detail };
+        groupErrorCounts[groupKey] = (groupErrorCounts[groupKey] || 0) + 1;
+      };
+      const parsed = comicRotationConfigSchema.safeParse(groupData);
+      if (!parsed.success) for (const issue of parsed.error.issues) addError(String(issue.path[0] || "comic_template_candidates"), issue.message);
+      if (hasEmptyRotatingCustomPrompt(groupData, formData.prompts)) addError("comic_template_candidates", "候选包含自定义，请先填写自定义漫画场景分析提示词");
+    }
 
     if (groupKey === "wordcloud") {
       const addError = (key: string, detail: string) => {
