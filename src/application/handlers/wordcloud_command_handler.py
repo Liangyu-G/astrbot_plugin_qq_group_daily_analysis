@@ -51,6 +51,10 @@ class WordCloudCommandHandler:
             yield event.plain_result("此群未启用日常分析功能。")
             return
         self.analysis_service.bot_manager.update_from_event(event)
+        merged_mode = bool(
+            self.delivery.merged_delivery
+            and self.delivery.merged_delivery.enabled_for(platform_id)
+        )
         try:
             if not config.get_wordcloud_options(umo).enabled:
                 yield event.plain_result(
@@ -80,6 +84,9 @@ class WordCloudCommandHandler:
                 yield event.plain_result(
                     "词云出图或发送失败，词频已保存。可使用 /重发词云 再试，或查看插件日志。"
                 )
+            elif merged_mode:
+                # 适配器直接转发不会更新宿主事件的发送标记，结束事件防止额外回复。
+                event.stop_event()
         except Exception as exc:
             logger.warning(f"群 {group_id} 独立词云失败：{exc}")
             yield event.plain_result(f"词云生成失败：{exc}")

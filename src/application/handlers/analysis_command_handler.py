@@ -45,6 +45,7 @@ if TYPE_CHECKING:
     from ...infrastructure.messaging.message_sender import MessageSender
     from ...infrastructure.persistence.trace_sqlite_store import TraceSQLiteStore
     from ...infrastructure.platform.bot_manager import BotManager
+    from ...infrastructure.reporting.dispatcher import ReportDispatcher
     from ...infrastructure.reporting.generators import ReportGenerator
     from ...infrastructure.webui.active_task_manager import ActiveTaskManager
     from ..services.wordcloud_delivery_service import WordCloudDeliveryService
@@ -81,6 +82,7 @@ class AnalysisCommandHandler:
         plugin_data_dir: Path | None = None,
         plugin_instance: PluginHostProtocol | None = None,
         wordcloud_delivery: WordCloudDeliveryService | None = None,
+        report_dispatcher: ReportDispatcher | None = None,
     ) -> None:
         self.config_manager = config_manager
         self.bot_manager = bot_manager
@@ -96,6 +98,7 @@ class AnalysisCommandHandler:
         )
         self.plugin_instance = plugin_instance
         self.wordcloud_delivery = wordcloud_delivery
+        self.report_dispatcher = report_dispatcher
         self.terminating: bool = False
 
     def set_terminating(self, terminating: bool) -> None:
@@ -202,7 +205,6 @@ class AnalysisCommandHandler:
                 adapter_platform_name in {"qq_official", "qq_official_webhook"}
                 or self.config_manager.get_enable_analysis_reply()
             )
-
             if use_text_reply:
                 yield event.plain_result("🔍 正在启动分析引擎，正在拉取最近消息...")
             elif adapter and orig_msg_id:
@@ -310,6 +312,23 @@ class AnalysisCommandHandler:
 
         if not adapter:
             logger.warning(f"群 {group_id} 未找到对应的平台适配器，无法发送报告")
+            return
+
+        if (
+            self.report_dispatcher
+            and self.report_dispatcher.merged_delivery
+            and self.report_dispatcher.merged_delivery.enabled_for(platform_id)
+        ):
+            sent = await self.report_dispatcher.dispatch(
+                group_id, analysis_result, platform_id
+            )
+            if not sent:
+                trace = TraceContext.current()
+                if trace and trace.status == "running":
+                    trace.finish(
+                        event=TaskEvent.WARN,
+                        error_message="合并转发中的分析报告未确认发送成功，请查看其他产物及日志",
+                    )
             return
 
         if self.comic_handler:
