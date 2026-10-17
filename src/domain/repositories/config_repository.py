@@ -210,6 +210,14 @@ class IConfigProvider(Protocol):
         """获取是否发送报告前缀文字"""
         ...
 
+    def get_enable_merged_forward(self) -> bool:
+        """获取是否通过合并转发发送报告、词云和漫画。"""
+        ...
+
+    def get_merged_forward_timeout(self) -> int:
+        """获取合并转发收集结果的等待秒数（10–3600 秒）。"""
+        ...
+
     def get_html_only_url(self) -> bool:
         """获取是否只发送 HTML 网页链接"""
         ...
