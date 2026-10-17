@@ -1413,9 +1413,9 @@ class ConfigManager:
             本次漫画分镜应使用的提示词模板。
         """
         if isinstance(character, dict):
-            prompt = str(character.get("storyboard_prompt", "")).strip()
-            if prompt:
-                return prompt
+            prompt = character.get("storyboard_prompt")
+            if isinstance(prompt, str) and prompt.strip():
+                return prompt.strip()
         return self.get_comic_storyboard_prompt()
 
     @staticmethod
@@ -1460,17 +1460,48 @@ class ConfigManager:
     def get_comic_storyboard_prompt(
         self, style: str = "comic_storyboard_prompt"
     ) -> str:
-        """获取分镜生成提示词模板"""
-        prompts_config = self._get_group("prompts").get("comic_analysis_prompts", {})
-        return prompts_config.get(style, "")
+        """解析内置模板选择，保留旧配置中的自定义提示词。
 
-    def save_config(self):
-        """保存配置到AstrBot配置系统"""
+        Args:
+            style: 提示词字段名，保留旧调用接口。
+
+        Returns:
+            选定的内置提示词或自定义文本；自定义留空时使用原版。
+        """
+        from ...shared.comic_prompts import (
+            COMIC_STORYBOARD_PROMPTS,
+            DEFAULT_COMIC_STORYBOARD_PROMPT,
+        )
+
+        prompts_config = self._get_group("prompts").get("comic_analysis_prompts", {})
+        if not isinstance(prompts_config, dict):
+            return DEFAULT_COMIC_STORYBOARD_PROMPT
+        if style != "comic_storyboard_prompt":
+            value = prompts_config.get(style, "")
+            return value if isinstance(value, str) else ""
+        selection = prompts_config.get("comic_storyboard_template", "custom")
+        if isinstance(selection, str) and selection in COMIC_STORYBOARD_PROMPTS:
+            return COMIC_STORYBOARD_PROMPTS[selection]
+        # 未知选项也按自定义处理，避免旧版本或手工配置导致用户文本丢失。
+        custom = prompts_config.get("comic_storyboard_prompt", "")
+        return (
+            custom
+            if isinstance(custom, str) and custom.strip()
+            else DEFAULT_COMIC_STORYBOARD_PROMPT
+        )
+
+    def save_config(self) -> None:
+        """保存配置到 AstrBot 配置系统，失败时通知调用方。
+
+        Raises:
+            Exception: 底层配置持久化失败，保留原始异常供调用方回滚。
+        """
         try:
             self.config.save_config()
             logger.info("配置已保存")
         except Exception as e:
             logger.error(f"保存配置失败: {e}")
+            raise
 
     def reload_config(self):
         """重新加载配置"""

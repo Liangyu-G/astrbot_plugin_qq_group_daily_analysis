@@ -532,8 +532,8 @@ def test_comic_generation_passes_character_storyboard_prompt():
     )
 
 
-def test_comic_character_schema_has_storyboard_prompt_default():
-    """新建角色方案时应自带可编辑的默认分镜提示词。"""
+def test_comic_character_schema_inherits_storyboard_prompt_default():
+    """新建角色留空继承全局风格，全局仍保留可编辑的原版全文。"""
     schema = json.loads(
         (Path(__file__).parents[1] / "_conf_schema.json").read_text(encoding="utf-8")
     )
@@ -545,8 +545,8 @@ def test_comic_character_schema_has_storyboard_prompt_default():
     ]["default"]
 
     assert schema["daily_comic"]["items"]["comic_characters"]["default"] == []
-    assert character_prompt.strip()
-    assert character_prompt == global_prompt
+    assert character_prompt == ""
+    assert global_prompt.strip()
 
 
 def test_daily_random_character_is_stable_and_recovers_from_disabled_choice(
@@ -1657,11 +1657,8 @@ def test_comic_legacy_prompt_auto_migration(tmp_path: Path):
         == DEFAULT_COMIC_STORYBOARD_PROMPT
     )
 
-    # 2. 角色列表中的旧版默认应被迁移为新版
-    assert (
-        raw_config["daily_comic"]["comic_characters"][0]["storyboard_prompt"]
-        == DEFAULT_COMIC_STORYBOARD_PROMPT
-    )
+    # 2. 角色旧默认升级后一次性转为留空继承，不再由运行时比较文本。
+    assert raw_config["daily_comic"]["comic_characters"][0]["storyboard_prompt"] == ""
 
     # 3. 用户的自定义专属提示词必须完好保留
     assert (
