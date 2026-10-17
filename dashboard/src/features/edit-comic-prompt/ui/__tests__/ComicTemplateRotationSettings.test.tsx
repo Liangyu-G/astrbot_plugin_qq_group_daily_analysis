@@ -1,4 +1,5 @@
 import { useState } from "react";
+import { ConfigProvider } from "antd";
 import { fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { ComicTemplateRotationSettings } from "../ComicTemplateRotationSettings";
@@ -17,12 +18,19 @@ const status: ComicTemplateRotationStatus = {
 const saved = { comic_template_mode: "sequential", comic_template_scope: "global", comic_template_candidates: ["classic", "pixel_rpg"] };
 const openPrompts = vi.fn();
 
+// 已有文本或 aria-label 的控件直接定位，避免 JSDOM 为整棵 AntD DOM 重算可见性。
+function buttonWithText(text: string | RegExp): HTMLButtonElement {
+  const button = screen.getByText(text).closest("button");
+  if (!button) throw new Error(`未找到按钮：${String(text)}`);
+  return button;
+}
+
 function Editor({ initial = saved, dirty = false }: { initial?: Record<string, unknown>; dirty?: boolean }) {
   const [value, setValue] = useState(initial);
-  return <>
+  return <ConfigProvider theme={{ token: { motion: false } }}>
     <ComicTemplateRotationSettings value={value} savedValue={initial} dirty={dirty || value !== initial} customPrompt="我的自定义提示词" onPatch={(patch) => setValue((previous) => ({ ...previous, ...patch }))} onOpenPromptSettings={openPrompts} />
     <output data-testid="comic-draft">{JSON.stringify(value)}</output>
-  </>;
+  </ConfigProvider>;
 }
 
 describe("漫画模板自动切换设置", () => {
@@ -42,8 +50,8 @@ describe("漫画模板自动切换设置", () => {
     for (const mode of COMIC_ROTATION_MODES) expect(screen.getAllByText(mode.label).length).toBeGreaterThan(0);
     fireEvent.click(screen.getByText("每次随机"));
     expect(screen.getByTestId("comic-draft").textContent).toContain('"comic_template_mode":"random"');
-    expect(screen.getByRole("list", { name: "漫画模板候选顺序" })).toBeInTheDocument();
-    fireEvent.click(screen.getByRole("button", { name: "编辑自定义提示词" }));
+    expect(screen.getByLabelText("漫画模板候选顺序")).toHaveProperty("tagName", "OL");
+    fireEvent.click(buttonWithText("编辑自定义提示词"));
     expect(openPrompts).toHaveBeenCalled();
     await waitFor(() => expect(fetchComicRotationStatus).toHaveBeenCalledTimes(1));
     expect(resetComicRotation).not.toHaveBeenCalled();
@@ -51,12 +59,13 @@ describe("漫画模板自动切换设置", () => {
 
   it("上下移动和移除改变候选 ID，显示已保存状态并锁定草稿重置", async () => {
     render(<Editor />);
-    await waitFor(() => expect(screen.getByRole("button", { name: /重置进度/ })).not.toBeDisabled());
-    fireEvent.click(screen.getByRole("button", { name: "下移原版漫画" }));
+    const reset = buttonWithText("重置进度");
+    await waitFor(() => expect(reset).not.toBeDisabled());
+    fireEvent.click(screen.getByLabelText("下移原版漫画"));
     expect(JSON.parse(screen.getByTestId("comic-draft").textContent!).comic_template_candidates).toEqual(["pixel_rpg", "classic"]);
     expect(screen.getByText("漫画配置有未保存修改")).toBeInTheDocument();
-    expect(screen.getByRole("button", { name: /重置进度/ })).toBeDisabled();
-    fireEvent.click(screen.getByRole("button", { name: "移除原版漫画" }));
+    expect(reset).toBeDisabled();
+    fireEvent.click(screen.getByLabelText("移除原版漫画"));
     expect(JSON.parse(screen.getByTestId("comic-draft").textContent!).comic_template_candidates).toEqual(["pixel_rpg"]);
     expect(screen.getByText("服务器日期")).toBeInTheDocument();
     expect(resetComicRotation).not.toHaveBeenCalled();
@@ -64,17 +73,17 @@ describe("漫画模板自动切换设置", () => {
 
   it("画廊添加到候选末尾，预览不推进且保留模板模式", async () => {
     render(<Editor />);
-    fireEvent.click(screen.getByRole("button", { name: /浏览模板画廊/ }));
-    const gallery = screen.getByRole("dialog", { name: "漫画模板视觉样式画廊" });
-    expect(within(gallery).getByRole("button", { name: "原版漫画已加入候选" })).toBeDisabled();
-    fireEvent.click(within(gallery).getByRole("button", { name: "添加候选黑色电影侦探风" }));
+    fireEvent.click(buttonWithText("浏览模板画廊"));
+    const gallery = screen.getByText("漫画模板视觉样式画廊").closest<HTMLElement>('[role="dialog"]')!;
+    expect(within(gallery).getByLabelText("原版漫画已加入候选")).toBeDisabled();
+    fireEvent.click(within(gallery).getByLabelText("添加候选黑色电影侦探风"));
     const draft = JSON.parse(screen.getByTestId("comic-draft").textContent!);
     expect(draft.comic_template_candidates).toEqual(["classic", "pixel_rpg", "noir_detective"]);
     expect(draft.comic_template_mode).toBe("sequential");
-    fireEvent.click(await within(gallery).findByRole("button", { name: "放大黑色电影侦探风示例图" }));
+    fireEvent.click(await within(gallery).findByLabelText("放大黑色电影侦探风示例图"));
     // rc-dialog 在测试环境复用 test-id，按弹窗实际内容区分叠加的两个对话框。
-    const preview = screen.getAllByRole("dialog").find((dialog) => dialog.textContent?.includes("黑色电影侦探风 · 风格示例"))!;
-    expect(await within(preview).findByRole("img", { name: "黑色电影侦探风漫画风格示例图" })).toBeInTheDocument();
+    const preview = screen.getByText("黑色电影侦探风 · 风格示例").closest<HTMLElement>('[role="dialog"]')!;
+    expect(await within(preview).findByAltText("黑色电影侦探风漫画风格示例图")).toBeInTheDocument();
     expect(resetComicRotation).not.toHaveBeenCalled();
     expect(fetchComicRotationStatus).toHaveBeenCalledTimes(1);
   });
@@ -83,13 +92,15 @@ describe("漫画模板自动切换设置", () => {
     vi.mocked(fetchComicRotationStatus).mockResolvedValue({ ...status, mode: "daily_sequential" });
     render(<Editor initial={{ ...saved, comic_template_mode: "daily_sequential" }} />);
     await screen.findByText("明日模板");
-    fireEvent.click(screen.getByRole("button", { name: /重置进度/ }));
-    fireEvent.click(await screen.findByRole("button", { name: /保\s*留/ }));
-    await waitFor(() => expect(screen.queryByRole("button", { name: /保\s*留/ })).not.toBeInTheDocument());
+    const reset = buttonWithText("重置进度");
+    fireEvent.click(reset);
+    const cancel = (await screen.findByText(/保\s*留/)).closest("button")!;
+    fireEvent.click(cancel);
+    await waitFor(() => expect(cancel).not.toBeVisible());
     expect(resetComicRotation).not.toHaveBeenCalled();
-    fireEvent.click(screen.getByRole("button", { name: /重置进度/ }));
-    const buttons = await screen.findAllByRole("button", { name: "重置进度" });
-    fireEvent.click(buttons[buttons.length - 1]);
+    fireEvent.click(reset);
+    const buttons = await screen.findAllByText("重置进度");
+    fireEvent.click(buttons[buttons.length - 1].closest("button")!);
     await waitFor(() => expect(resetComicRotation).toHaveBeenCalledTimes(1));
   });
 });
