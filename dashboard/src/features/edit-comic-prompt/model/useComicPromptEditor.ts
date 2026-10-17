@@ -1,6 +1,14 @@
 import catalog from "../../../../../src/shared/comic_prompt_templates.json";
 
-export const comicPromptTemplates = Object.entries(catalog).map(([id, entry]) => ({
+export interface ComicPromptTemplate {
+  id: string;
+  name: string;
+  description: string;
+  prompt: string;
+  preview?: string;
+}
+
+export const comicPromptTemplates: ComicPromptTemplate[] = Object.entries(catalog).map(([id, entry]) => ({
   id,
   ...entry,
 }));
