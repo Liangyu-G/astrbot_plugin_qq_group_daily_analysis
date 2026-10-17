@@ -3,6 +3,7 @@ import { z } from "zod";
 import { PluginSchema, SchemaFieldItem } from "./types";
 import { wordCloudOptionsSchema } from "../../wordcloud/model/types";
 import { comicRotationConfigSchema, hasEmptyRotatingCustomPrompt } from "./comicRotationConfig";
+import { mergedForwardEnabledSchema, mergedForwardTimeoutSchema } from "./mergedForwardConfig";
 
 export interface ConfigValidationError {
   groupKey: string;
@@ -31,6 +32,8 @@ export function buildFieldZodSchema(
   field: SchemaFieldItem,
   groupKey?: string,
 ): z.ZodType {
+  if (groupKey === "basic" && fieldKey === "enable_merged_forward") return mergedForwardEnabledSchema;
+  if (groupKey === "basic" && fieldKey === "merged_forward_timeout") return mergedForwardTimeoutSchema;
   if (fieldKey === "t2i_cdn_base_url") return cdnBaseUrlSchema.optional();
   // 宿主的静态下拉只列出内置项；控制台目录还包含上传字体和新增主题。
   if (groupKey === "wordcloud" && fieldKey === "font") {
@@ -258,6 +261,16 @@ export function validateConfigWithZod(
 
   Object.entries(schema).forEach(([groupKey, group]) => {
     const groupLabel = group.description || groupKey;
+    const rawGroupData = formData[groupKey];
+    if (groupKey === "basic" && rawGroupData !== undefined &&
+        (!rawGroupData || typeof rawGroupData !== "object" || Array.isArray(rawGroupData))) {
+      const fieldKey = "enable_merged_forward";
+      const message = "基础设置必须是对象";
+      errors.push({ groupKey, groupLabel, fieldKey, fieldLabel: groupLabel, message, path: groupKey, domId: `cfg-field-${groupKey}-${fieldKey}` });
+      errorMap[groupKey] = { [fieldKey]: message };
+      groupErrorCounts[groupKey] = 1;
+      return;
+    }
     const groupData = formData[groupKey] || {};
     const groupItems = group.items || {};
 
