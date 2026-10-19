@@ -507,14 +507,16 @@ export const FieldRenderer: React.FC<FieldRendererProps> = ({
         <Select
           mode="multiple"
           allowClear
+          aria-label={title}
+          optionFilterProp="label"
           style={{ width: "100%" }}
           status={error ? "error" : undefined}
-          placeholder="请选择配置项（支持多选）"
+          placeholder={fieldKey === "enable_merged_forward" ? "选择需要打包的结果，留空时全部普通发送" : "请选择配置项（支持多选）"}
           value={selectedVals}
           onChange={(vals) => onChange(vals)}
           options={listOptions.map((opt: string) => {
-            let optLabel = opt;
-            if (fieldKey === "output_format") {
+            let optLabel = resolveOptionLabel(opt, listOptions, fieldSchema.labels);
+            if (fieldKey === "output_format" && optLabel === opt) {
               if (opt === "image") optLabel = "图片报告 (image)";
               else if (opt === "text") optLabel = "纯文本摘要 (text)";
               else if (opt === "html") optLabel = "HTML网页报告 (html)";
