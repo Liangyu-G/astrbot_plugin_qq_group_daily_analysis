@@ -11,7 +11,7 @@ import random
 from copy import deepcopy
 from dataclasses import replace
 from datetime import date, datetime
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Literal
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from astrbot.api.star import StarTools
@@ -960,9 +960,30 @@ class ConfigManager:
         self.config.save_config()
 
     def get_enable_merged_forward(self) -> bool:
-        """获取是否合并转发报告、词云和漫画，非法配置按关闭处理。"""
+        """获取是否至少选择一种结果进行合并转发。"""
+        return bool(self.get_merged_forward_types())
+
+    def get_merged_forward_types(self) -> list[Literal["report", "wordcloud", "comic"]]:
+        """读取合并转发类型，兼容旧布尔值且不修改原配置。
+
+        Returns:
+            按固定顺序返回选中类型；非法或重复的列表按未选择处理。
+        """
         value = self._get_group("basic").get("enable_merged_forward", False)
-        return value if type(value) is bool else False
+        options: tuple[Literal["report", "wordcloud", "comic"], ...] = (
+            "report",
+            "wordcloud",
+            "comic",
+        )
+        if type(value) is bool:
+            return list(options) if value else []
+        if not isinstance(value, list) or any(
+            not isinstance(item, str) or item not in options for item in value
+        ):
+            return []
+        if len(value) != len(set(value)):
+            return []
+        return [option for option in options if option in value]
 
     def get_merged_forward_timeout(self) -> int:
         """获取合并转发收集结果的等待秒数，非法配置回退为 600 秒。"""

@@ -14,6 +14,7 @@ import hashlib
 import json
 import re
 import shutil
+from copy import deepcopy
 from datetime import datetime
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -51,6 +52,7 @@ class ConfigMigrator:
 
     def run_all_migrations(self) -> None:
         """执行所有版本升级、数据结构迁移与结构保护检查。"""
+        self.migrate_merged_forward_selection()
         self.migrate_legacy_configs()
         self.upgrade_prompt_templates()
         self.migrate_daily_comic_character_references()
@@ -58,6 +60,40 @@ class ConfigMigrator:
         self.migrate_legacy_comic_storyboard_prompts()
         self.migrate_comic_prompt_template_inheritance()
         self.protect_upgrade_data()
+
+    def migrate_merged_forward_selection(self) -> bool:
+        """备份后将旧合并转发布尔开关转换为结果类型多选。
+
+        Returns:
+            旧配置成功保存为多选时返回 True；无需迁移或备份、保存失败返回 False。
+        """
+        basic = self.cm._get_group("basic")
+        previous = basic.get("enable_merged_forward")
+        if type(previous) is not bool:
+            return False
+        try:
+            if not self.write_upgrade_config_backup(
+                deepcopy(dict(self.cm.config)),
+                self.get_plugin_version(self.get_plugin_root()),
+                star_tools=self.star_tools,
+            ):
+                logger.warning(
+                    "合并转发多选迁移备份失败，保留原开关并在下次重载时重试。"
+                )
+                return False
+            basic["enable_merged_forward"] = (
+                ["report", "wordcloud", "comic"] if previous else []
+            )
+            try:
+                self.cm.save_config()
+            except Exception:
+                basic["enable_merged_forward"] = previous
+                raise
+            logger.info("已将合并转发开关迁移为结果类型多选，原配置已备份。")
+            return True
+        except Exception as exc:
+            logger.warning(f"合并转发多选迁移失败，将在下次重载时重试: {exc}")
+            return False
 
     def migrate_legacy_configs(self) -> bool:
         """升级旧版配置项的类型与数据结构，确保兼容新 Schema。
