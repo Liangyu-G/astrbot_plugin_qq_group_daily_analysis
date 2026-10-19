@@ -5,7 +5,7 @@
 
 from __future__ import annotations
 
-from typing import Protocol, runtime_checkable
+from typing import Literal, Protocol, runtime_checkable
 
 
 @runtime_checkable
@@ -211,7 +211,11 @@ class IConfigProvider(Protocol):
         ...
 
     def get_enable_merged_forward(self) -> bool:
-        """获取是否通过合并转发发送报告、词云和漫画。"""
+        """获取是否至少选择一种结果进行合并转发。"""
+        ...
+
+    def get_merged_forward_types(self) -> list[Literal["report", "wordcloud", "comic"]]:
+        """获取参与合并转发的生成结果类型，未选类型仍普通发送。"""
         ...
 
     def get_merged_forward_timeout(self) -> int:
