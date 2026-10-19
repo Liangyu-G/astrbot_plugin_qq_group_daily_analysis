@@ -73,7 +73,9 @@ class WordCloudDeliveryService:
         async with self._send_lock:
             if not force and self.store.is_sent(umo, fingerprint):
                 return True
-            if self.merged_delivery and self.merged_delivery.enabled_for(platform_id):
+            if self.merged_delivery and self.merged_delivery.enabled_for(
+                platform_id, "wordcloud"
+            ):
                 reservation = (umo, fingerprint)
                 if reservation in self._forward_reservations:
                     # 同一快照已经加入另一条合并消息，不把等待投递误报为失败。
@@ -98,6 +100,10 @@ class WordCloudDeliveryService:
                 if not options.enabled:
                     raise ValueError("词云功能已关闭")
                 image = await self.renderer.render(data, umo=umo, options=options)
+                current_task = asyncio.current_task()
+                if current_task and current_task.cancelling():
+                    # 渲染器可能吞掉取消，超时后的普通产物仍不能迟到发送。
+                    raise asyncio.CancelledError
                 image_url = (
                     "base64://" + base64.b64encode(image).decode()
                     if isinstance(image, bytes)

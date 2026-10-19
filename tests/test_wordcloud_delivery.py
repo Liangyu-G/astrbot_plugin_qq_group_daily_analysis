@@ -84,6 +84,37 @@ async def test_concurrent_duplicate_snapshot_sent_once(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_cancel_resistant_renderer_cannot_send_late_ordinary_wordcloud(tmp_path):
+    """普通词云超时取消后，即使渲染器返回图片也不得迟到投递。"""
+    started = asyncio.Event()
+
+    async def render(*_args, **_kwargs):
+        started.set()
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            return b"late-image"
+
+    sender = SimpleNamespace(send_image_smart=AsyncMock(return_value=True))
+    delivery = WordCloudDeliveryService(
+        config(),
+        SimpleNamespace(render=render),
+        WordCloudStore(tmp_path / "cancel-wordcloud.db"),
+        sender,
+    )
+    delivery._try_upload_album = AsyncMock()
+    task = asyncio.create_task(
+        delivery.send(WordCloudData((WordFrequency("高性能", 10, 5),)), "1", "p")
+    )
+    await asyncio.wait_for(started.wait(), timeout=1)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    sender.send_image_smart.assert_not_awaited()
+    delivery._try_upload_album.assert_not_awaited()
+
+
+@pytest.mark.asyncio
 async def test_report_success_survives_wordcloud_failure_and_order():
     calls = []
 
@@ -187,6 +218,41 @@ def latest_delivery_record(store, umo):
             "WHERE umo = ? ORDER BY updated_at DESC LIMIT 1",
             (umo,),
         ).fetchone()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "selected",
+    [
+        [],
+        ["report"],
+        ["wordcloud"],
+        ["comic"],
+        ["report", "wordcloud"],
+        ["report", "comic"],
+        ["wordcloud", "comic"],
+        ["report", "wordcloud", "comic"],
+    ],
+)
+async def test_standalone_wordcloud_respects_only_its_selection(
+    merged_wordcloud, selected
+):
+    """其他内容被勾选不改变词云方式，投递成功均只落库和归档一次。"""
+    env = merged_wordcloud
+    env.manager.config["basic"]["enable_merged_forward"] = selected
+    env.sender.send_image_smart.return_value = True
+
+    assert await env.delivery.send(env.data, "1", "onebot", force=True)
+
+    if "wordcloud" in selected:
+        env.adapter.send_forward_msg.assert_awaited_once()
+        env.sender.send_image_smart.assert_not_awaited()
+    else:
+        env.adapter.send_forward_msg.assert_not_awaited()
+        env.sender.send_image_smart.assert_awaited_once()
+    env.renderer.render.assert_awaited_once()
+    env.delivery._try_upload_album.assert_awaited_once()
+    assert latest_delivery_record(env.store, env.umo)[0] == "sent"
 
 
 @pytest.mark.asyncio

@@ -13,7 +13,9 @@ from src.application.services.merged_forward_delivery import (
 )
 
 
-def setup_service(*, timeout=0.03, success=True, enabled=True, supported=True):
+def setup_service(
+    *, timeout=0.03, success=True, enabled=True, supported=True, selected=None
+):
     """创建只记录合并调用的适配器，普通发送必须保持未调用。"""
     adapter = SimpleNamespace(
         capabilities=SimpleNamespace(supports_forward_message=supported),
@@ -24,6 +26,11 @@ def setup_service(*, timeout=0.03, success=True, enabled=True, supported=True):
     )
     config = SimpleNamespace(
         get_enable_merged_forward=lambda: enabled,
+        get_merged_forward_types=lambda: (
+            (selected if selected is not None else ["report", "wordcloud", "comic"])
+            if enabled
+            else []
+        ),
         get_merged_forward_timeout=lambda: timeout,
     )
     return MergedForwardDeliveryService(
@@ -483,3 +490,25 @@ async def test_all_failed_or_empty_never_sends_empty_forward():
 def test_unsupported_platform_preserves_normal_delivery(enabled, supported, expected):
     service, _ = setup_service(enabled=enabled, supported=supported)
     assert service.enabled_for("p") is expected
+
+
+@pytest.mark.parametrize("supported", [True, False])
+@pytest.mark.parametrize(
+    "selected",
+    [
+        [],
+        ["report"],
+        ["wordcloud"],
+        ["comic"],
+        ["report", "wordcloud"],
+        ["report", "comic"],
+        ["wordcloud", "comic"],
+        ["report", "wordcloud", "comic"],
+    ],
+)
+def test_selection_is_scoped_to_artifact_and_platform(selected, supported):
+    """同一次配置可区分产物，平台无转发能力时全部使用普通投递。"""
+    service, _ = setup_service(selected=selected, supported=supported)
+    assert service.enabled_for("p") is (bool(selected) and supported)
+    for kind in ("report", "wordcloud", "comic"):
+        assert service.enabled_for("p", kind) is (kind in selected and supported)

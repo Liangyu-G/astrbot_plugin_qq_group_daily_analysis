@@ -40,9 +40,22 @@ class MergedForwardDeliveryService:
         self.bot_manager = bot_manager
         self._cleanup_tasks: set[asyncio.Task[None]] = set()
 
-    def enabled_for(self, platform_id: str | None) -> bool:
-        """只有用户启用且目标平台支持完整图文转发时使用合并发送。"""
-        if not self.config_manager.get_enable_merged_forward():
+    def enabled_for(
+        self,
+        platform_id: str | None,
+        kind: Literal["report", "wordcloud", "comic"] | None = None,
+    ) -> bool:
+        """只为用户选中的产物及支持图文转发的平台启用合并发送。
+
+        Args:
+            platform_id: 目标平台实例。
+            kind: 指定产物类型；留空时检查是否选择了任意类型。
+
+        Returns:
+            当前产物是否应通过合并转发投递。
+        """
+        selected = self.config_manager.get_merged_forward_types()
+        if not selected or (kind is not None and kind not in selected):
             return False
         adapter = self.bot_manager.get_adapter(platform_id)
         return bool(adapter and adapter.capabilities.supports_forward_message)
