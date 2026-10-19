@@ -431,16 +431,30 @@ async def test_standalone_merged_comic_failure_keeps_plain_error(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "selected",
+    [
+        [],
+        ["report"],
+        ["wordcloud"],
+        ["comic"],
+        ["report", "wordcloud"],
+        ["report", "comic"],
+        ["wordcloud", "comic"],
+        ["report", "wordcloud", "comic"],
+    ],
+)
 async def test_standalone_comic_real_coordinator_sends_one_forward_node(
-    comic_environment,
+    comic_environment, selected
 ):
-    """真实协调器即使只有漫画一种产物，也只调用一次合并转发。"""
+    """独立漫画只遵循自身选择，未勾选时正常发送且只生成一次。"""
     from src.application.services.merged_forward_delivery import (
         MergedForwardDeliveryService,
     )
 
     env = comic_environment
     env.config.get_enable_merged_forward = Mock(return_value=True)
+    env.config.get_merged_forward_types = Mock(return_value=selected)
     env.config.get_merged_forward_timeout = Mock(return_value=5)
     env.adapter.capabilities = SimpleNamespace(supports_forward_message=True)
     env.adapter.bot_self_ids = ["10000"]
@@ -455,15 +469,20 @@ async def test_standalone_comic_real_coordinator_sends_one_forward_node(
     )
     await env.handler._comic_group_tasks["onebot:123"]
 
-    env.adapter.send_forward_msg.assert_awaited_once()
-    group_id, nodes = env.adapter.send_forward_msg.await_args.args
-    assert group_id == "123" and len(nodes) == 1
-    image_segments = [
-        part for part in nodes[0]["data"]["content"] if part["type"] == "image"
-    ]
-    assert len(image_segments) == 1
-    assert image_segments[0]["data"]["file"].startswith("base64://")
-    env.adapter.send_image.assert_not_awaited()
+    if "comic" in selected:
+        env.adapter.send_forward_msg.assert_awaited_once()
+        group_id, nodes = env.adapter.send_forward_msg.await_args.args
+        assert group_id == "123" and len(nodes) == 1
+        image_segments = [
+            part for part in nodes[0]["data"]["content"] if part["type"] == "image"
+        ]
+        assert len(image_segments) == 1
+        assert image_segments[0]["data"]["file"].startswith("base64://")
+        env.adapter.send_image.assert_not_awaited()
+    else:
+        env.adapter.send_forward_msg.assert_not_awaited()
+        env.adapter.send_image.assert_awaited_once()
+    env.generator.generate_comic.assert_awaited_once()
     env.upload.assert_awaited_once()
 
 

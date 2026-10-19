@@ -589,7 +589,9 @@ class ComicCommandHandler:
 
             _current_trace.set(cur_trace)
 
-        if self.merged_delivery and self.merged_delivery.enabled_for(platform_id):
+        if self.merged_delivery and self.merged_delivery.enabled_for(
+            platform_id, "comic"
+        ):
 
             async def prepare() -> list[PreparedForwardMessage]:
                 """复用已通过检查的独立漫画任务，避免再次触发生成。"""

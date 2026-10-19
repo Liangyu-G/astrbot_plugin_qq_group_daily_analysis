@@ -53,7 +53,7 @@ class WordCloudCommandHandler:
         self.analysis_service.bot_manager.update_from_event(event)
         merged_mode = bool(
             self.delivery.merged_delivery
-            and self.delivery.merged_delivery.enabled_for(platform_id)
+            and self.delivery.merged_delivery.enabled_for(platform_id, "wordcloud")
         )
         try:
             if not config.get_wordcloud_options(umo).enabled:

@@ -319,15 +319,29 @@ class AnalysisCommandHandler:
             and self.report_dispatcher.merged_delivery
             and self.report_dispatcher.merged_delivery.enabled_for(platform_id)
         ):
-            sent = await self.report_dispatcher.dispatch(
-                group_id, analysis_result, platform_id
-            )
+            if self.report_dispatcher.merged_delivery.enabled_for(
+                platform_id, "report"
+            ):
+                sent = await self.report_dispatcher.dispatch(
+                    group_id, analysis_result, platform_id
+                )
+            else:
+                # 手动普通报告保持只使用第一个格式，附属产物仍按选择分别投递。
+                formats = self.config_manager.get_output_format()
+                if isinstance(formats, str):
+                    formats = [formats]
+                sent = await self.report_dispatcher.dispatch(
+                    group_id,
+                    analysis_result,
+                    platform_id,
+                    output_formats=formats[:1] or ["image"],
+                )
             if not sent:
                 trace = TraceContext.current()
                 if trace and trace.status == "running":
                     trace.finish(
                         event=TaskEvent.WARN,
-                        error_message="合并转发中的分析报告未确认发送成功，请查看其他产物及日志",
+                        error_message="分析报告未确认发送成功，请查看其他生成结果及投递日志",
                     )
             return
 

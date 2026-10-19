@@ -31,9 +31,13 @@ def group_event() -> SimpleNamespace:
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("enable_reply", [True, False], ids=["text", "reaction"])
+@pytest.mark.parametrize(
+    "merge_report", [True, False], ids=["merge-report", "normal-report"]
+)
 async def test_manual_analysis_merged_entrypoint_dispatches_without_normal_sends(
     tmp_path,
     enable_reply,
+    merge_report,
 ):
     """只合并日报产物；启动提示仍服从原有文本与表情回应配置。"""
     event = group_event()
@@ -50,6 +54,7 @@ async def test_manual_analysis_merged_entrypoint_dispatches_without_normal_sends
     manager = SimpleNamespace(
         is_group_allowed=Mock(return_value=True),
         get_enable_analysis_reply=Mock(return_value=enable_reply),
+        get_output_format=Mock(return_value=["image", "html", "text"]),
     )
     bots = SimpleNamespace(
         update_from_event=Mock(), get_adapter=Mock(return_value=adapter)
@@ -66,7 +71,13 @@ async def test_manual_analysis_merged_entrypoint_dispatches_without_normal_sends
         execute_daily_analysis=AsyncMock(return_value=result),
     )
     dispatcher = SimpleNamespace(
-        merged_delivery=SimpleNamespace(enabled_for=Mock(return_value=True)),
+        merged_delivery=SimpleNamespace(
+            enabled_for=Mock(
+                side_effect=lambda _platform, kind=None: (
+                    kind != "report" or merge_report
+                )
+            )
+        ),
         dispatch=AsyncMock(return_value=True),
     )
     comic = SimpleNamespace(try_trigger_comic_generation=Mock())
@@ -108,7 +119,12 @@ async def test_manual_analysis_merged_entrypoint_dispatches_without_normal_sends
     service.execute_daily_analysis.assert_awaited_once_with(
         group_id="123456", platform_id="onebot-main", manual=True, days=None
     )
-    dispatcher.dispatch.assert_awaited_once_with("123456", analysis, "onebot-main")
+    if merge_report:
+        dispatcher.dispatch.assert_awaited_once_with("123456", analysis, "onebot-main")
+    else:
+        dispatcher.dispatch.assert_awaited_once_with(
+            "123456", analysis, "onebot-main", output_formats=["image"]
+        )
     comic.try_trigger_comic_generation.assert_not_called()
     cloud.send_with_report.assert_not_awaited()
     adapter.send_image.assert_not_awaited()
@@ -154,6 +170,9 @@ async def test_wordcloud_success_stops_event_only_for_direct_merged_send(retry, 
         umo="onebot-main:GroupMessage:123456",
     )
     event.should_call_llm.assert_called_once_with(False)
+    delivery.merged_delivery.enabled_for.assert_called_once_with(
+        "onebot-main", "wordcloud"
+    )
     if retry:
         service.collect_wordcloud.assert_not_awaited()
     else:

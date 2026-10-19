@@ -26,6 +26,7 @@ def environment(monkeypatch):
     monkeypatch.setattr(auto_scheduler, "_SCHEDULED_ANALYSIS_TIMEOUT_SECONDS", 0.04)
     config = SimpleNamespace(
         get_enable_merged_forward=Mock(return_value=True),
+        get_merged_forward_types=Mock(return_value=["report", "wordcloud", "comic"]),
         get_merged_forward_timeout=Mock(return_value=600),
         get_output_format=Mock(return_value=["text"]),
         get_incremental_fallback_enabled=Mock(return_value=False),
@@ -189,6 +190,7 @@ async def test_normal_delivery_keeps_original_total_timeout(
         environment.adapter.capabilities.supports_forward_message = False
     else:
         environment.config.get_enable_merged_forward.return_value = False
+        environment.config.get_merged_forward_types.return_value = []
     cancelled = asyncio.Event()
 
     async def blocked_text(*_args):
