@@ -217,6 +217,9 @@ class ConfigRoutes:
             if not isinstance(new_config, dict):
                 return error_response("缺少有效的 config 配置数据", status_code=400)
 
+            # 兼容旧版已打开的配置页，规范化时保留请求对象本身。
+            new_config = deepcopy(new_config)
+
             save_dto: ConfigSaveDTO = {"config": new_config}
 
             cfg_mgr = (
@@ -236,11 +239,25 @@ class ConfigRoutes:
                 basic = new_config["basic"]
                 if not isinstance(basic, dict):
                     return error_response("基础设置必须是对象", status_code=400)
-                if (
-                    "enable_merged_forward" in basic
-                    and type(basic["enable_merged_forward"]) is not bool
-                ):
-                    return error_response("合并转发开关必须为布尔值", status_code=400)
+                if "enable_merged_forward" in basic:
+                    selected = basic["enable_merged_forward"]
+                    if type(selected) is bool:
+                        basic["enable_merged_forward"] = (
+                            ["report", "wordcloud", "comic"] if selected else []
+                        )
+                    elif not isinstance(selected, list) or any(
+                        not isinstance(item, str)
+                        or item not in {"report", "wordcloud", "comic"}
+                        for item in selected
+                    ):
+                        return error_response(
+                            "合并转发内容必须是分析报告、词云、漫画的类型列表",
+                            status_code=400,
+                        )
+                    elif len(selected) != len(set(selected)):
+                        return error_response(
+                            "合并转发内容不能重复选择", status_code=400
+                        )
                 if "merged_forward_timeout" in basic:
                     timeout = basic["merged_forward_timeout"]
                     if type(timeout) is not int or not 10 <= timeout <= 3600:

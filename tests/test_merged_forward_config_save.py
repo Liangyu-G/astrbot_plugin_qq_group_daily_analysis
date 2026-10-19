@@ -24,7 +24,14 @@ from src.infrastructure.webui.routes.config_routes import ConfigRoutes
         {"enable_merged_forward": 0},
         {"enable_merged_forward": 1},
         {"enable_merged_forward": None},
-        {"enable_merged_forward": []},
+        {"enable_merged_forward": {}},
+        {"enable_merged_forward": ["report", "unknown"]},
+        {"enable_merged_forward": ["report", "report"]},
+        {"enable_merged_forward": [True]},
+        {"enable_merged_forward": [1]},
+        {"enable_merged_forward": [None]},
+        {"enable_merged_forward": [[]]},
+        {"enable_merged_forward": [{}]},
         {"merged_forward_timeout": True},
         {"merged_forward_timeout": False},
         {"merged_forward_timeout": "600"},
@@ -81,13 +88,21 @@ async def test_invalid_merge_settings_rejected_before_any_mutation(basic: object
         {"basic": {"show_report_caption": False}},
         {"basic": {"enable_merged_forward": True}},
         {"basic": {"enable_merged_forward": False}},
+        {"basic": {"enable_merged_forward": []}},
+        {"basic": {"enable_merged_forward": ["report"]}},
+        {"basic": {"enable_merged_forward": ["wordcloud"]}},
+        {"basic": {"enable_merged_forward": ["comic"]}},
+        {"basic": {"enable_merged_forward": ["report", "wordcloud"]}},
+        {"basic": {"enable_merged_forward": ["report", "comic"]}},
+        {"basic": {"enable_merged_forward": ["wordcloud", "comic"]}},
+        {"basic": {"enable_merged_forward": ["report", "wordcloud", "comic"]}},
         {"basic": {"merged_forward_timeout": 10}},
         {"basic": {"merged_forward_timeout": 3600}},
         {"basic": {"enable_merged_forward": True, "merged_forward_timeout": 600}},
     ],
 )
 async def test_valid_and_legacy_merge_settings_preserve_save_flow(update: dict):
-    """旧配置无需补新字段；有效输入及不相关字段原样通过既有保存流程。"""
+    """旧配置无需补新字段；布尔值规范化为列表且不修改请求对象。"""
     original = {"basic": {"show_report_caption": True}, "future": {"keep": [1]}}
     manager = MagicMock(config=deepcopy(original))
     scheduler = MagicMock()
@@ -107,7 +122,14 @@ async def test_valid_and_legacy_merge_settings_preserve_save_flow(update: dict):
         else response.status_code
     )
     assert status == 200
-    assert manager.config == {**original, **before_update}
+    expected_update = deepcopy(before_update)
+    basic = expected_update.get("basic", {})
+    selected = basic.get("enable_merged_forward")
+    if type(selected) is bool:
+        basic["enable_merged_forward"] = (
+            ["report", "wordcloud", "comic"] if selected else []
+        )
+    assert manager.config == {**original, **expected_update}
     assert update == before_update
     manager.save_config.assert_called_once()
     scheduler.schedule_jobs.assert_called_once()
