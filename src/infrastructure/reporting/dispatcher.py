@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import base64
 import os
 import tempfile
@@ -47,6 +48,9 @@ class ReportDispatcher:
     report_generator: ReportGenerator | None
     message_sender: MessageSender
 
+    # 普通投递与合并准备独立计时，防止慢普通任务无限占用本次分发。
+    _ORDINARY_DELIVERY_TIMEOUT_SECONDS = 1800
+
     def __init__(
         self,
         config_manager: ConfigManager,
@@ -89,10 +93,22 @@ class ReportDispatcher:
         group_id: str,
         analysis_result: AnalysisResultPayload,
         platform_id: str | None = None,
+        *,
+        output_formats: Sequence[str] | None = None,
     ) -> bool:
-        """分发分析报告，并返回至少一种格式是否实际发送成功。"""
-        trace_id = TraceContext.get()
-        output_formats = self.config_manager.get_output_format()
+        """分发分析报告，允许入口保留其原有的格式选择范围。
+
+        Args:
+            group_id: 目标群号。
+            analysis_result: 同一次分析的完整结果。
+            platform_id: 平台实例标识。
+            output_formats: 本次发送的格式；未指定时使用全部已配置格式。
+
+        Returns:
+            至少一种报告格式是否实际发送成功。
+        """
+        if output_formats is None:
+            output_formats = self.config_manager.get_output_format()
         if isinstance(output_formats, str):
             output_formats = [output_formats]
 
@@ -101,6 +117,36 @@ class ReportDispatcher:
                 group_id, analysis_result, platform_id, output_formats
             )
 
+        sent_any = await self._dispatch_report_formats(
+            group_id, analysis_result, platform_id, output_formats
+        )
+        if sent_any and self.wordcloud_delivery:
+            adapter = self.message_sender.bot_manager.get_adapter(platform_id)
+            resolved_platform = platform_id or (adapter.platform_id if adapter else "")
+            await self.wordcloud_delivery.send_with_report(
+                analysis_result.get("wordcloud"), group_id, resolved_platform
+            )
+        return sent_any
+
+    async def _dispatch_report_formats(
+        self,
+        group_id: str,
+        analysis_result: AnalysisResultPayload,
+        platform_id: str | None,
+        output_formats: Sequence[str],
+    ) -> bool:
+        """沿用普通报告各格式的生成、文件发送和回退方式。
+
+        Args:
+            group_id: 目标群号。
+            analysis_result: 同一次分析的完整结果。
+            platform_id: 平台实例标识。
+            output_formats: 本次请求的报告格式。
+
+        Returns:
+            至少一种报告格式是否发送成功。
+        """
+        trace_id = TraceContext.get()
         logger.info(
             f"[{trace_id}] 正在分发群 {group_id} 的报告 (格式: {', '.join(output_formats)})"
         )
@@ -111,8 +157,6 @@ class ReportDispatcher:
             "text": self._dispatch_text,
         }
         sent_any = False
-        format_results: dict[str, bool] = {}
-
         for fmt in output_formats:
             handler = dispatch_map.get(fmt)
             if not handler:
@@ -120,27 +164,17 @@ class ReportDispatcher:
                 continue
             try:
                 ok = bool(await handler(group_id, analysis_result, platform_id))
-                format_results[fmt] = ok
                 sent_any = ok or sent_any
             except Exception as e:
                 logger.error(
                     f"[{trace_id}] 群 {group_id} 的 {fmt} 报告发送异常: {e}",
                     exc_info=True,
                 )
-                format_results[fmt] = False
 
         if sent_any:
             logger.info(
                 f"[{trace_id}] 群 {group_id} 的报告分发完成，至少一种格式发送成功"
             )
-            if self.wordcloud_delivery:
-                adapter = self.message_sender.bot_manager.get_adapter(platform_id)
-                resolved_platform = platform_id or (
-                    adapter.platform_id if adapter else ""
-                )
-                await self.wordcloud_delivery.send_with_report(
-                    analysis_result.get("wordcloud"), group_id, resolved_platform
-                )
         else:
             logger.error(f"[{trace_id}] 群 {group_id} 的报告分发失败，未发送任何报告")
         return sent_any
@@ -152,7 +186,7 @@ class ReportDispatcher:
         platform_id: str | None,
         output_formats: Sequence[str],
     ) -> bool:
-        """将每个报告格式及附属内容交给统一准备、合并与发送流程。
+        """只合并选中的结果，并行启动未选中结果的普通发送。
 
         Args:
             group_id: 目标群号。
@@ -161,35 +195,63 @@ class ReportDispatcher:
             output_formats: 本次请求的报告格式。
 
         Returns:
-            合并发送成功的内容是否至少包含一种报告格式。
+            报告是否通过其配置的发送方式至少成功发送一种格式。
+
+        Raises:
+            asyncio.CancelledError: 上层任务取消，停止本次尚未完成的投递。
         """
         if not self.merged_delivery:
             return False
         adapter = self.message_sender.bot_manager.get_adapter(platform_id)
         resolved_platform = platform_id or (adapter.platform_id if adapter else "")
         producers: dict[str, Callable[[], Awaitable[list[PreparedForwardMessage]]]] = {}
-        for fmt in output_formats:
-            if fmt not in {"image", "html", "text"}:
-                logger.warning(f"不支持的合并报告格式：{fmt}")
-                continue
-            # 每种格式独立交给总超时管理，慢图片不能吞掉已完成的文本。
-            producers[f"report:{fmt}"] = partial(
-                self.prepare_report, fmt, group_id, analysis_result, platform_id
+        ordinary_tasks: dict[str, asyncio.Task[bool]] = {}
+        merge_report = self.merged_delivery.enabled_for(platform_id, "report")
+        if merge_report:
+            for fmt in output_formats:
+                if fmt not in {"image", "html", "text"}:
+                    logger.warning(f"不支持的合并报告格式：{fmt}")
+                    continue
+                # 每种格式独立交给总超时管理，慢图片不能吞掉已完成的文本。
+                producers[f"report:{fmt}"] = partial(
+                    self.prepare_report, fmt, group_id, analysis_result, platform_id
+                )
+        else:
+            ordinary_tasks["report"] = asyncio.create_task(
+                self._dispatch_report_formats(
+                    group_id, analysis_result, platform_id, output_formats
+                )
             )
         if self.wordcloud_delivery:
-            producers["wordcloud"] = partial(
-                self.wordcloud_delivery.prepare_for_report,
-                analysis_result.get("wordcloud"),
-                group_id,
-                resolved_platform,
-            )
+            if self.merged_delivery.enabled_for(platform_id, "wordcloud"):
+                producers["wordcloud"] = partial(
+                    self.wordcloud_delivery.prepare_for_report,
+                    analysis_result.get("wordcloud"),
+                    group_id,
+                    resolved_platform,
+                )
+            else:
+                ordinary_tasks["wordcloud"] = asyncio.create_task(
+                    self.wordcloud_delivery.send_with_report(
+                        analysis_result.get("wordcloud"), group_id, resolved_platform
+                    )
+                )
         if self.comic_handler:
-            producers["comic"] = partial(
-                self.comic_handler.prepare_for_report,
-                group_id,
-                platform_id,
-                analysis_result,
-            )
+            if self.merged_delivery.enabled_for(platform_id, "comic"):
+                producers["comic"] = partial(
+                    self.comic_handler.prepare_for_report,
+                    group_id,
+                    platform_id,
+                    analysis_result,
+                )
+            else:
+                # 普通漫画继续使用后台生成入口，不占用合并收集的等待期限。
+                try:
+                    self.comic_handler.try_trigger_comic_generation(
+                        group_id, platform_id, analysis_result
+                    )
+                except Exception as exc:
+                    logger.warning(f"群 {group_id} 普通漫画启动失败：{exc}")
         trace = TraceContext.current()
         with (
             trace.span(
@@ -204,19 +266,65 @@ class ReportDispatcher:
             if trace
             else nullcontext()
         ) as dispatch_span:
-            delivered = await self.merged_delivery.deliver(
-                group_id, platform_id, producers
+            merged_task = asyncio.create_task(
+                self.merged_delivery.deliver(group_id, platform_id, producers)
             )
+            ordinary_sent: set[str] = set()
+            try:
+                if ordinary_tasks:
+                    done, pending = await asyncio.wait(
+                        ordinary_tasks.values(),
+                        timeout=self._ORDINARY_DELIVERY_TIMEOUT_SECONDS,
+                    )
+                    for task in pending:
+                        task.cancel()
+                    if pending:
+                        logger.warning(
+                            f"群 {group_id} 普通结果投递超时，合并结果继续独立发送"
+                        )
+                        await asyncio.wait(pending, timeout=1.0)
+                    for kind, task in ordinary_tasks.items():
+                        if task not in done or task.cancelled():
+                            continue
+                        try:
+                            if task.result():
+                                ordinary_sent.add(kind)
+                        except Exception as exc:
+                            logger.warning(f"群 {group_id} 普通 {kind} 投递失败：{exc}")
+                try:
+                    delivered = await merged_task
+                except Exception as exc:
+                    logger.warning(f"群 {group_id} 合并结果投递失败：{exc}")
+                    delivered = set()
+            finally:
+                unfinished = {
+                    task
+                    for task in (merged_task, *ordinary_tasks.values())
+                    if not task.done()
+                }
+                for task in (merged_task, *ordinary_tasks.values()):
+                    if task in unfinished:
+                        task.cancel()
+                    # 外层取消时也消费已经失败的兄弟任务，避免未读取异常。
+                    task.add_done_callback(
+                        lambda completed: (
+                            None if completed.cancelled() else completed.exception()
+                        )
+                    )
+                if unfinished:
+                    await asyncio.wait(unfinished, timeout=1.0)
+            report_sent = "report" in (delivered if merge_report else ordinary_sent)
             if dispatch_span:
                 dispatch_span["payload"].update(
                     {
-                        "success": "report" in delivered,
+                        "success": report_sent,
                         "merged_sent_kinds": sorted(delivered),
+                        "ordinary_sent_kinds": sorted(ordinary_sent),
                     }
                 )
-                if "report" not in delivered:
+                if not report_sent:
                     dispatch_span["status"] = "warning"
-        return "report" in delivered
+        return report_sent
 
     async def prepare_report(
         self,
@@ -495,6 +603,11 @@ class ReportDispatcher:
             logger.error(f"[{trace_id}] Failed to generate image report: {e}")
             # image_url and html_content remain None
 
+        # 渲染器可能吞掉取消信号，已超时的普通报告不得继续发送迟到结果。
+        current_task = asyncio.current_task()
+        if current_task and current_task.cancelling():
+            raise asyncio.CancelledError
+
         # 4. 发送图片
         sent = False
         dest_filename: str | None = None
@@ -710,6 +823,10 @@ class ReportDispatcher:
         except Exception as e:
             logger.error(f"[{trace_id}] Failed to generate HTML report: {e}")
 
+        current_task = asyncio.current_task()
+        if current_task and current_task.cancelling():
+            raise asyncio.CancelledError
+
         html_filename: str | None = None
         sent = False
         if html_path:
@@ -859,6 +976,9 @@ class ReportDispatcher:
             )
         else:
             text_report = self.report_generator.generate_text_report(analysis_result)
+        current_task = asyncio.current_task()
+        if current_task and current_task.cancelling():
+            raise asyncio.CancelledError
         adapter = self.message_sender.bot_manager.get_adapter(platform_id)
         # 尝试通过适配器发送文本报告
         logger.info(f"[分发器] 正在尝试通过适配器发送文本报告。群: {group_id}")
