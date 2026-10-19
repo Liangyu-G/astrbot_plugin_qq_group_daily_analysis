@@ -2,9 +2,10 @@ import { describe, expect, it } from "vitest";
 import { mergedForwardConfigSchema } from "../mergedForwardConfig";
 import { validateConfigWithZod, validateSingleFieldWithZod } from "../validation";
 import type { PluginSchema } from "../types";
+import { pluginConfigResponseSchema, pluginConfigSaveSchema } from "../configContract";
 
 const schema: PluginSchema = { basic: { type: "object", description: "基础设置", items: {
-  enable_merged_forward: { type: "bool", default: false },
+  enable_merged_forward: { type: "list", default: [], options: ["report", "wordcloud", "comic"], labels: ["分析报告", "词云", "漫画"] },
   merged_forward_timeout: { type: "int", default: 600, min: 10, max: 3600 },
 } } };
 
@@ -16,18 +17,29 @@ describe("合并转发严格配置契约", () => {
     expect(validateConfigWithZod({ basic: legacy }, schema).isValid).toBe(true);
   });
 
-  it.each([false, true])("实际布尔开关 %s 可保存", (enabled) => {
-    const config = { basic: { enable_merged_forward: enabled } };
+  it.each([[], ["report"], ["wordcloud", "comic"], ["comic", "report", "wordcloud"]].map((items) => ({ items })))("空选、部分及全选 $items 可保存且保持顺序", ({ items }) => {
+    const config = { basic: { enable_merged_forward: items } };
     expect(mergedForwardConfigSchema.safeParse(config.basic).success).toBe(true);
     expect(validateConfigWithZod(config, schema).isValid).toBe(true);
+    expect(pluginConfigSaveSchema.parse(config)).toEqual(config);
   });
 
-  it.each(["false", "true", 0, 1, null, [], {}])("开关拒绝隐式类型转换：%j", (enabled) => {
+  it.each(["false", "true", true, false, 0, 1, null, {}, ["unknown"], ["Report"], [1], ["report", "report"]].map((enabled) => ({ enabled })))("多选拒绝错误类型、无效值及重复值：$enabled", ({ enabled }) => {
     const config = { basic: { enable_merged_forward: enabled } };
     expect(mergedForwardConfigSchema.safeParse(config.basic).success).toBe(false);
+    expect(pluginConfigSaveSchema.safeParse(config).success).toBe(false);
     const result = validateConfigWithZod(config, schema);
-    expect(result.errorMap.basic.enable_merged_forward).toContain("布尔");
+    expect(result.errorMap.basic.enable_merged_forward).toBeTruthy();
     expect(result.groupErrorCounts.basic).toBe(1);
+  });
+
+  it.each([true, false])("旧布尔开关 %s 读取时迁移，保存为明确的多选列表", (enabled) => {
+    const config = { basic: { enable_merged_forward: enabled, show_report_caption: false } };
+    const response = pluginConfigResponseSchema.parse({ config, schema });
+    const expected = { basic: { ...config.basic, enable_merged_forward: enabled ? ["report", "wordcloud", "comic"] : [] } };
+    expect(response.config).toEqual(expected);
+    expect(pluginConfigSaveSchema.parse(response.config)).toEqual(expected);
+    expect(config.basic.enable_merged_forward).toBe(enabled);
   });
 
   it.each([10, 11, 600, 3599, 3600])("范围内整数超时 %s 可保存", (timeout) => {
@@ -53,8 +65,8 @@ describe("合并转发严格配置契约", () => {
   });
 
   it("单字段即时校验使用严格规则，不影响其他分组同名字段", () => {
-    const field = { type: "bool" };
-    expect(validateSingleFieldWithZod("enable_merged_forward", field, "false", "basic")).toBeTruthy();
-    expect(validateSingleFieldWithZod("enable_merged_forward", field, "false", "future")).toBeNull();
+    const field = { type: "list" };
+    expect(validateSingleFieldWithZod("enable_merged_forward", field, ["report", "report"], "basic")).toBeTruthy();
+    expect(validateSingleFieldWithZod("enable_merged_forward", field, ["report", "report"], "future")).toBeNull();
   });
 });

@@ -3,6 +3,7 @@ import type { SchemaFieldItem, SchemaGroupItem } from "./types";
 import { renderingConfigLoadSchema, renderingSaveSchema } from "./renderingConfig";
 import { wordCloudOptionsSchema } from "../../wordcloud/model/types";
 import { comicRotationConfigSchema, hasEmptyRotatingCustomPrompt } from "./comicRotationConfig";
+import { mergedForwardConfigLoadSchema, mergedForwardConfigSchema } from "./mergedForwardConfig";
 
 const schemaField: z.ZodType<SchemaFieldItem> = z.lazy(() => z.object({
   type: z.string(),
@@ -30,6 +31,7 @@ const schemaGroup: z.ZodType<SchemaGroupItem> = z.object({
 
 // 未声明的分组及字段原样保留，避免动态表单保存时丢失扩展配置。
 export const pluginConfigSchema = z.object({
+  basic: mergedForwardConfigLoadSchema.optional(),
   t2i_rendering: renderingConfigLoadSchema.optional(),
 }).catchall(z.record(z.string(), z.unknown()));
 
@@ -39,6 +41,7 @@ export const pluginConfigResponseSchema = z.object({
 }).catchall(z.unknown());
 
 export const pluginConfigSaveSchema = pluginConfigSchema.extend({
+  basic: mergedForwardConfigSchema.optional(),
   t2i_rendering: renderingSaveSchema.optional(),
   wordcloud: wordCloudOptionsSchema.optional(),
   daily_comic: comicRotationConfigSchema.optional(),
