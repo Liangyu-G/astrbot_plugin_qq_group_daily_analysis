@@ -94,18 +94,25 @@ class _RequestProxy:
         """获取当前活跃的底层请求对象。
 
         Returns:
-            若定位到测试 Mock 或核心请求对象则返回其实例，否则返回 None。
+            优先返回核心的上下文请求代理；无核心接口时查找本插件的测试
+            Mock，否则返回 None。
         """
-        for mod_name, mod in list(sys.modules.items()):
-            if mod and "infrastructure.webui" in mod_name:
+        # 正式请求必须直接使用宿主上下文，避免扫描全局模块及误选其他插件。
+        if _real_request is not None:
+            return _real_request
+
+        # 仅离线测试保留桥接模块 Mock，兼容完整包名和 src 两种导入路径。
+        bridge_modules = (
+            f"{__package__}.plugin_page_bridge",
+            "src.infrastructure.webui.plugin_page_bridge",
+            "astrbot_plugin_qq_group_daily_analysis.src.infrastructure.webui.plugin_page_bridge",
+        )
+        for module_name in bridge_modules:
+            mod = sys.modules.get(module_name)
+            if mod:
                 req = getattr(mod, "request", None)
                 if req is not None and type(req).__name__ != "_RequestProxy":
                     return req
-        if (
-            _real_request is not None
-            and type(_real_request).__name__ != "_RequestProxy"
-        ):
-            return _real_request
         return None
 
     @property
