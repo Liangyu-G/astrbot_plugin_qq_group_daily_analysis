@@ -19,6 +19,7 @@ from ...domain.value_objects import (
     GroupStatistics,
     TokenUsage,
 )
+from ...infrastructure.reporting.html_renderer import bind_group_html_renderer
 from ...shared.constants import PLUGIN_NAME, AnalysisStage
 from ...shared.trace_context import TraceContext
 from ...utils.logger import logger
@@ -216,7 +217,9 @@ class AnalysisRecoveryService:
         image_res = await self.report_generator.generate_image_report(
             analysis_result=analysis_result,
             group_id=group_id,
-            html_render_func=self.html_render,
+            html_render_func=bind_group_html_renderer(
+                self.html_render, group_id, platform_id
+            ),
             template_theme=template_name,
         )
         image_url = image_res[0]
