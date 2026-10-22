@@ -26,6 +26,7 @@ from ...domain.repositories.platform_adapter_repository import (
     PlatformAdapterProtocol,
 )
 from ...domain.value_objects.task_event import TaskEvent
+from ...infrastructure.reporting.html_renderer import bind_group_html_renderer
 from ...shared.constants import PLUGIN_NAME, AnalysisStage
 from ...shared.trace_context import TraceContext
 from ...utils.logger import logger
@@ -348,6 +349,9 @@ class AnalysisCommandHandler:
         template_theme = str(raw_theme) if raw_theme else "default"
 
         if output_format == "image":
+            html_render = bind_group_html_renderer(
+                self.html_render, group_id, platform_id
+            )
             if trace:
                 with trace.span(
                     "RENDER_REPORT",
@@ -359,7 +363,7 @@ class AnalysisCommandHandler:
                     ) = await self.report_generator.generate_image_report(
                         analysis_result,
                         group_id,
-                        self.html_render,
+                        html_render,
                         avatar_url_getter=avatar_url_getter,
                         nickname_getter=nickname_getter,
                         avatar_cache_namespace=platform_id,
@@ -373,7 +377,7 @@ class AnalysisCommandHandler:
                 ) = await self.report_generator.generate_image_report(
                     analysis_result,
                     group_id,
-                    self.html_render,
+                    html_render,
                     avatar_url_getter=avatar_url_getter,
                     nickname_getter=nickname_getter,
                     avatar_cache_namespace=platform_id,
@@ -546,7 +550,11 @@ class AnalysisCommandHandler:
                     text_report,
                     fallback_report,
                 ) = await self.report_generator.generate_markdown_report(
-                    analysis_result, self.html_render, mention_style="qq"
+                    analysis_result,
+                    bind_group_html_renderer(
+                        self.html_render, group_id, adapter.platform_id
+                    ),
+                    mention_style="qq",
                 )
                 await adapter.send_text_report(
                     group_id, text_report, fallback_content=fallback_report
