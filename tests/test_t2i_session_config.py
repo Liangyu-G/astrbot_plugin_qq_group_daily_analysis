@@ -11,7 +11,83 @@ from src.application.services.analysis_recovery_service import AnalysisRecoveryS
 from src.domain.value_objects import GroupStatistics
 from src.infrastructure.reporting import html_renderer
 from src.infrastructure.reporting.dispatcher import ReportDispatcher
-from src.infrastructure.reporting.html_renderer import bind_group_html_renderer
+from src.infrastructure.reporting.html_renderer import (
+    bind_group_html_renderer,
+    describe_html_renderer,
+)
+
+
+@pytest.mark.parametrize(
+    "endpoint,expected",
+    [
+        ("http://t2i:8999/text2img", "http://t2i:8999/text2img"),
+        (
+            "https://user:password@render.example:8443/api?token=secret#private",
+            "https://render.example:8443/api",
+        ),
+        ("http://[::1]:8999/text2img", "http://[::1]:8999/text2img"),
+        ("", "使用宿主默认地址池"),
+        ("not-a-url", "配置地址格式异常"),
+        ("http://host:invalid", "无法读取配置地址（ValueError）"),
+        (123, "配置地址不是字符串"),
+    ],
+)
+def test_render_diagnostics_reads_bound_config_without_changing_it(endpoint, expected):
+    """诊断按原会话查询地址，保留主机端口并隐藏 URL 中的认证信息。"""
+    config = {"t2i_endpoint": endpoint, "t2i": False}
+
+    class Host:
+        context = SimpleNamespace(get_config=MagicMock(return_value=config))
+
+        async def html_render(
+            self, tmpl, data, return_url=True, options=None, umo=None
+        ):
+            raise AssertionError("读取诊断信息不应调用渲染服务")
+
+    host = Host()
+    callback = bind_group_html_renderer(host.html_render, "123", "bot-a")
+    info = describe_html_renderer(callback)
+    host.context.get_config.assert_called_once_with("bot-a:GroupMessage:123")
+    assert expected in info["configured_endpoint"]
+    assert "按群聊会话查询" in info["config_lookup"]
+    assert all(secret not in str(info) for secret in ("password", "secret", "private"))
+    assert config == {"t2i_endpoint": endpoint, "t2i": False}
+
+
+def test_render_diagnostics_distinguishes_default_and_unavailable_context():
+    """默认配置查询与未知回调分开说明，不冒充已知的实际请求地址。"""
+
+    class Host:
+        context = SimpleNamespace(get_config=MagicMock(return_value={}))
+
+        async def html_render(self, tmpl, data, umo=None):
+            return None
+
+    host = Host()
+    info = describe_html_renderer(host.html_render)
+    assert info["config_lookup"] == "默认配置"
+    assert "实际请求地址由宿主选择" in info["configured_endpoint"]
+    host.context.get_config.assert_called_once_with(None)
+    host.context.get_config.side_effect = RuntimeError("private config")
+    info = describe_html_renderer(host.html_render)
+    assert "RuntimeError" in info["configured_endpoint"]
+    assert "private config" not in str(info)
+    assert "未知" in describe_html_renderer(AsyncMock())["configured_endpoint"]
+
+
+def test_render_diagnostics_does_not_guess_legacy_endpoint():
+    """旧版回调不按会话读配置时，诊断也不能假装读取了绑定地址。"""
+
+    class Host:
+        context = SimpleNamespace(get_config=MagicMock())
+
+        async def html_render(self, tmpl, data, return_url=True, options=None):
+            return None
+
+    host = Host()
+    info = describe_html_renderer(host.html_render)
+    assert "旧版" in info["config_lookup"]
+    host.context.get_config.assert_not_called()
 
 
 @pytest.mark.asyncio

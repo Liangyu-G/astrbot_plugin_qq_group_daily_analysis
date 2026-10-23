@@ -15,7 +15,7 @@ import time
 from datetime import datetime
 from io import BytesIO
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, cast
 from urllib.parse import quote
 
 from PIL import Image
@@ -30,6 +30,7 @@ from ..visualization.activity_charts import ActivityVisualizer
 from .avatar_service import (
     AvatarService,
 )
+from .html_renderer import describe_html_renderer
 from .markdown_report_generator import (
     MarkdownReportGenerator,
 )
@@ -326,11 +327,26 @@ class ReportGenerator(IReportGenerator):
 
             async with self._render_semaphore:
                 logger.debug(f"[T2I] 已进入渲染队列 (群: {group_id})")
+                renderer_info = describe_html_renderer(html_render_func)
+                logger.debug(
+                    "[T2I诊断 v2] 开始生成图片；"
+                    f"配置读取：{renderer_info['config_lookup']}；"
+                    f"配置地址：{renderer_info['configured_endpoint']}"
+                )
+                trace_ctx = TraceContext.current()
+                if trace_ctx:
+                    for span in reversed(trace_ctx._spans):
+                        if span.get("stage_name") == AnalysisStage.RENDER_REPORT.value:
+                            span.setdefault("payload", {})["render_service"] = (
+                                renderer_info
+                            )
+                            break
                 last_error = "没有可用的渲染策略。"
 
                 for attempt, image_options in enumerate(render_strategies, 1):
                     viewport_description = "default"
                     render_error = "渲染服务返回了空内容。"
+                    response_info: dict[str, object] = {"return_type": "未返回"}
                     attempt_start_ts = time.perf_counter()
                     try:
                         image_options, viewport_description = (
@@ -352,17 +368,41 @@ class ReportGenerator(IReportGenerator):
                         )
 
                         t2i_start_ts = time.perf_counter()
-                        image_data = await html_render_func(
-                            html_content,
-                            {},
-                            False,
-                            image_options,
+                        # 宿主或第三方包装器的运行时返回值仍需在接口边界检查。
+                        image_data = cast(
+                            "object",
+                            await html_render_func(
+                                html_content,
+                                {},
+                                False,
+                                image_options,
+                            ),
                         )
                         t2i_render_ms = round(
                             (time.perf_counter() - t2i_start_ts) * 1000, 2
                         )
+                        response_info["return_type"] = type(image_data).__name__
+                        if image_data is None:
+                            render_error = (
+                                "AstrBot 渲染接口返回了 None，未提供图片或具体原因。"
+                                "请同时查看 AstrBot 和 T2I 服务日志。"
+                            )
+                        elif isinstance(image_data, bytes):
+                            response_info["returned_bytes"] = len(image_data)
+                            if not image_data:
+                                render_error = (
+                                    "AstrBot 渲染接口返回了空字节数据（0 字节）。"
+                                )
+                        elif isinstance(image_data, str):
+                            if not image_data:
+                                render_error = "AstrBot 渲染接口返回了空文件路径。"
+                        else:
+                            render_error = (
+                                "AstrBot 渲染接口返回了不支持的数据类型："
+                                f"{type(image_data).__name__}。"
+                            )
 
-                        if image_data:
+                        if image_data and isinstance(image_data, (str, bytes)):
                             is_valid = False
                             raw_sample = b""
                             if isinstance(image_data, bytes):
@@ -370,8 +410,13 @@ class ReportGenerator(IReportGenerator):
                             else:
                                 try:
                                     with Path(image_data).open("rb") as image_file:
+                                        response_info["file_exists"] = True
                                         raw_sample = image_file.read(4096)
+                                        response_info["returned_bytes"] = (
+                                            image_file.seek(0, 2)
+                                        )
                                 except FileNotFoundError:
+                                    response_info["file_exists"] = False
                                     render_error = (
                                         "渲染接口返回了文件路径，但图片文件不存在。"
                                     )
@@ -384,6 +429,10 @@ class ReportGenerator(IReportGenerator):
                                     render_error = self._diagnose_non_image_payload(
                                         raw_sample
                                     )
+                                    if not raw_sample:
+                                        render_error = (
+                                            "渲染接口返回的图片文件为空（0 字节）。"
+                                        )
 
                             if isinstance(image_data, bytes):
                                 render_error = self._diagnose_non_image_payload(
@@ -538,7 +587,8 @@ class ReportGenerator(IReportGenerator):
                     last_error = render_error
                     logger.warning(
                         f"第 {attempt} 次图片生成失败，耗时 {duration_ms / 1000:.1f} 秒："
-                        f"{render_error}"
+                        f"{render_error}（返回类型：{response_info['return_type']}；"
+                        f"返回大小：{response_info.get('returned_bytes', '未知')} 字节）"
                     )
                     trace_ctx = TraceContext.current()
                     if trace_ctx:
@@ -560,11 +610,16 @@ class ReportGenerator(IReportGenerator):
                                             "duration_ms": duration_ms,
                                             "status": "failed",
                                             "error": render_error,
+                                            **response_info,
                                         }
                                     )
                                 break
 
-                logger.error(f"图片生成未成功，最后一次失败原因：{last_error}")
+                logger.error(
+                    f"图片生成未成功，最后一次失败原因：{last_error}\n"
+                    f"配置读取：{renderer_info['config_lookup']}；"
+                    f"配置地址：{renderer_info['configured_endpoint']}"
+                )
                 return None, html_content
 
         except Exception as e:

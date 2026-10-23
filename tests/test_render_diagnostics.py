@@ -3,6 +3,7 @@
 import asyncio
 from io import BytesIO
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -10,6 +11,7 @@ from PIL import Image
 
 from src.infrastructure.reporting import generators
 from src.infrastructure.reporting.generators import ReportGenerator
+from src.infrastructure.reporting.html_renderer import bind_group_html_renderer
 from src.infrastructure.reporting.render_diagnostics import (
     diagnose_non_image_payload,
     summarize_render_error,
@@ -130,6 +132,9 @@ def render_setup(monkeypatch):
         "html",
         "json",
         "empty",
+        "empty_bytes",
+        "empty_path",
+        "unexpected",
         "empty_file",
         "missing",
         "unreadable",
@@ -149,10 +154,16 @@ async def test_failed_attempts_preserve_reason_and_duration(
     elif kind == "json":
         response, expected = b'{"detail":"render failed"}', "render failed"
     elif kind == "empty":
-        response, expected = None, "空内容"
+        response, expected = None, "返回了 None"
+    elif kind == "empty_bytes":
+        response, expected = b"", "空字节数据"
+    elif kind == "empty_path":
+        response, expected = "", "空文件路径"
+    elif kind == "unexpected":
+        response, expected = {"error": "private response"}, "不支持的数据类型：dict"
     elif kind == "empty_file":
         path.write_bytes(b"")
-        response, expected = str(path), "空内容"
+        response, expected = str(path), "图片文件为空"
     elif kind == "missing":
         response, expected = str(path), "文件不存在"
     elif kind == "unreadable":
@@ -165,9 +176,11 @@ async def test_failed_attempts_preserve_reason_and_duration(
     else:
         response, expected = RuntimeError(), "RuntimeError：未提供具体原因"
     callback = AsyncMock(side_effect=[response, response])
-    with TraceContext(group_id="123", trigger_type="manual") as trace:
-        with trace.span("RENDER_REPORT"):
-            result = await generator.generate_image_report({}, "123", callback)
+    with (
+        TraceContext(group_id="123", trigger_type="manual") as trace,
+        trace.span("RENDER_REPORT"),
+    ):
+        result = await generator.generate_image_report({}, "123", callback)
     assert result == (None, "<html>report</html>")
     attempts = trace._spans[0]["payload"]["render_attempts"]
     assert len(attempts) == 2
@@ -178,8 +191,19 @@ async def test_failed_attempts_preserve_reason_and_duration(
         assert attempt["status"] == "failed"
         assert attempt["error"] in log.warning.call_args_list[index - 1].args[0]
     assert attempts[-1]["error"] in log.error.call_args.args[0]
-    assert "None" not in log.error.call_args.args[0]
+    assert "最后一个错误: None" not in log.error.call_args.args[0]
+    assert "private response" not in log.error.call_args.args[0]
     assert callback.await_count == 2
+    assert attempts[-1]["return_type"] == (
+        "未返回" if isinstance(response, Exception) else type(response).__name__
+    )
+    if kind in ("empty_file", "empty_bytes"):
+        assert attempts[-1]["returned_bytes"] == 0
+    if kind == "missing":
+        assert attempts[-1]["file_exists"] is False
+    assert "render_service" in trace._spans[0]["payload"]
+    assert any("[T2I诊断 v2]" in call.args[0] for call in log.debug.call_args_list)
+    log.info.assert_not_called()
     if isinstance(response, Exception):
         assert log.debug.call_args.kwargs["exc_info"] is True
     if kind in ("html", "timeout"):
@@ -201,14 +225,64 @@ async def test_retry_can_still_succeed(render_setup, tmp_path, as_file):
         path.write_bytes(image)
         image = str(path)
     callback = AsyncMock(side_effect=[b'{"detail":"temporary failure"}', image])
-    with TraceContext(group_id="123", trigger_type="manual") as trace:
-        with trace.span("RENDER_REPORT"):
-            result, _ = await generator.generate_image_report({}, "123", callback)
+    with (
+        TraceContext(group_id="123", trigger_type="manual") as trace,
+        trace.span("RENDER_REPORT"),
+    ):
+        result, _ = await generator.generate_image_report({}, "123", callback)
     assert result == image if as_file else result.startswith("base64://")
     attempts = trace._spans[0]["payload"]["render_attempts"]
     assert [attempt["status"] for attempt in attempts] == ["failed", "success"]
     assert "temporary failure" in attempts[0]["error"]
     log.error.assert_not_called()
+    log.info.assert_called_once()
+    assert "图片生成成功" in log.info.call_args.args[0]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("config_error", [False, True])
+async def test_service_diagnostics_are_logged_without_blocking_render(
+    render_setup, config_error
+):
+    """地址进入日志和任务详情，诊断查询失败也不会阻断原渲染调用。"""
+    generator, log = render_setup
+    calls = []
+
+    class Host:
+        context = SimpleNamespace(
+            get_config=MagicMock(
+                return_value={
+                    "t2i_endpoint": "http://user:secret@t2i:8999/text2img?token=private",
+                }
+            )
+        )
+
+        async def html_render(
+            self, tmpl, data, return_url=True, options=None, umo=None
+        ):
+            calls.append(umo)
+
+    host = Host()
+    if config_error:
+        host.context.get_config.side_effect = RuntimeError("private config")
+    callback = bind_group_html_renderer(host.html_render, "123", "bot-a")
+    with (
+        TraceContext(group_id="123", trigger_type="manual") as trace,
+        trace.span("RENDER_REPORT"),
+    ):
+        await generator.generate_image_report({}, "123", callback)
+    assert calls == ["bot-a:GroupMessage:123"] * 2
+    service = trace._spans[0]["payload"]["render_service"]
+    expected = "RuntimeError" if config_error else "http://t2i:8999/text2img"
+    assert expected in service["configured_endpoint"]
+    logged = "\n".join(call.args[0] for call in log.debug.call_args_list)
+    assert expected in logged
+    assert "secret" not in logged and "private" not in logged
+    log.info.assert_not_called()
+    log.error.assert_called_once()
+    assert expected in log.error.call_args.args[0]
+    assert "secret" not in log.error.call_args.args[0]
+    assert "private" not in log.error.call_args.args[0]
 
 
 @pytest.mark.asyncio
