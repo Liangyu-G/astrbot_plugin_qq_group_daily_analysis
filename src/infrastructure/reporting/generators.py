@@ -45,6 +45,7 @@ from .render_diagnostics import (
     diagnose_non_image_payload,
     resolve_t2i_viewport_options,
     sanitize_path_component,
+    summarize_render_error,
 )
 from .templates import HTMLTemplates
 
@@ -325,11 +326,12 @@ class ReportGenerator(IReportGenerator):
 
             async with self._render_semaphore:
                 logger.debug(f"[T2I] 已进入渲染队列 (群: {group_id})")
-                last_exception = None
+                last_error = "没有可用的渲染策略。"
 
                 for attempt, image_options in enumerate(render_strategies, 1):
                     viewport_description = "default"
-                    html_error = None
+                    render_error = "渲染服务返回了空内容。"
+                    attempt_start_ts = time.perf_counter()
                     try:
                         image_options, viewport_description = (
                             self._resolve_t2i_viewport_options(
@@ -362,39 +364,32 @@ class ReportGenerator(IReportGenerator):
 
                         if image_data:
                             is_valid = False
-                            actual_data_head = None
+                            raw_sample = b""
+                            if isinstance(image_data, bytes):
+                                raw_sample = image_data[:4096]
+                            else:
+                                try:
+                                    with Path(image_data).open("rb") as image_file:
+                                        raw_sample = image_file.read(4096)
+                                except FileNotFoundError:
+                                    render_error = (
+                                        "渲染接口返回了文件路径，但图片文件不存在。"
+                                    )
+                                except OSError as e:
+                                    render_error = (
+                                        "无法读取渲染接口返回的图片文件："
+                                        f"{type(e).__name__}：{summarize_render_error(str(e))}"
+                                    )
+                                else:
+                                    render_error = self._diagnose_non_image_payload(
+                                        raw_sample
+                                    )
 
                             if isinstance(image_data, bytes):
-                                actual_data_head = image_data[:10]
-                            elif os.path.exists(image_data):
-                                try:
-                                    with open(image_data, "rb") as f:
-                                        actual_data_head = f.read(10)
-                                except Exception as e:
-                                    logger.warning(f"读取图片临时文件失败: {e}")
-
-                            if actual_data_head:
-                                if actual_data_head.startswith(
-                                    (b"\xff\xd8", b"\x89PNG")
-                                ):
-                                    is_valid = True
-                                else:
-                                    raw_sample = b""
-                                    if isinstance(image_data, bytes):
-                                        raw_sample = image_data[:4096]
-                                    elif os.path.exists(image_data):
-                                        try:
-                                            with open(image_data, "rb") as f:
-                                                raw_sample = f.read(4096)
-                                        except Exception:
-                                            pass
-
-                                    diag_info = self._diagnose_non_image_payload(
-                                        raw_sample or actual_data_head
-                                    )
-                                    logger.warning(
-                                        f"[T2I] 渲染引擎返回了非图片数据: {diag_info}"
-                                    )
+                                render_error = self._diagnose_non_image_payload(
+                                    raw_sample
+                                )
+                            is_valid = raw_sample.startswith((b"\xff\xd8", b"\x89PNG"))
 
                             if is_valid:
                                 image_size = (
@@ -519,64 +514,57 @@ class ReportGenerator(IReportGenerator):
                                 )
                                 return image_data, html_content
 
-                        logger.warning(
-                            f"渲染轮次 {attempt} ({image_options['type']}) 返回了无效或空数据"
-                        )
-                        trace_ctx = TraceContext.current()
-                        if trace_ctx:
-                            for s in reversed(trace_ctx._spans):
-                                if (
-                                    s.get("stage_name")
-                                    == AnalysisStage.RENDER_REPORT.value
-                                ):
-                                    payload = s.setdefault("payload", {})
-                                    attempts = payload.setdefault("render_attempts", [])
-                                    if isinstance(attempts, list):
-                                        attempts.append(
-                                            {
-                                                "attempt": attempt,
-                                                "type": str(
-                                                    image_options.get("type", "jpeg")
-                                                ),
-                                                "viewport": viewport_description,
-                                                "status": "failed",
-                                                "error": html_error
-                                                or "返回数据非合法图片头",
-                                            }
-                                        )
-                                    break
-
                     except Exception as e:
-                        logger.warning(f"渲染轮次 {attempt} 失败: {e}")
-                        last_exception = e
-                        trace_ctx = TraceContext.current()
-                        if trace_ctx:
-                            for s in reversed(trace_ctx._spans):
-                                if (
-                                    s.get("stage_name")
-                                    == AnalysisStage.RENDER_REPORT.value
-                                ):
-                                    payload = s.setdefault("payload", {})
-                                    attempts = payload.setdefault("render_attempts", [])
-                                    if isinstance(attempts, list):
-                                        attempts.append(
-                                            {
-                                                "attempt": attempt,
-                                                "type": str(
-                                                    image_options.get("type", "jpeg")
-                                                ),
-                                                "viewport": viewport_description,
-                                                "status": "failed",
-                                                "error": str(e),
-                                            }
-                                        )
-                                    break
-                                    break
-                        if attempt < len(render_strategies):
-                            logger.debug("准备尝试下一轮回退策略")
-                        continue
+                        detail = summarize_render_error(str(e))
+                        if not detail:
+                            detail = (
+                                "请求超时，未提供更多信息"
+                                if isinstance(e, TimeoutError)
+                                else "未提供具体原因"
+                            )
+                        render_error = f"{type(e).__name__}：{detail}"
+                        if isinstance(e, TimeoutError):
+                            render_error += (
+                                "\n排查建议：请先确认 AstrBot 能否连接 T2I 服务，并查看"
+                                "同一时间的服务日志。如果日志显示页面资源加载超时，"
+                                "再检查模板图片、字体等 CDN 资源在渲染服务所在环境中能否访问。"
+                            )
+                        # 堆栈留在调试日志中，任务详情仅展示简短原因。
+                        logger.debug("图片渲染异常的调用堆栈", exc_info=True)
 
-                logger.error(f"所有渲染尝试都失败。最后一个错误: {last_exception}")
+                    duration_ms = round(
+                        (time.perf_counter() - attempt_start_ts) * 1000, 2
+                    )
+                    last_error = render_error
+                    logger.warning(
+                        f"第 {attempt} 次图片生成失败，耗时 {duration_ms / 1000:.1f} 秒："
+                        f"{render_error}"
+                    )
+                    trace_ctx = TraceContext.current()
+                    if trace_ctx:
+                        for span in reversed(trace_ctx._spans):
+                            if (
+                                span.get("stage_name")
+                                == AnalysisStage.RENDER_REPORT.value
+                            ):
+                                payload = span.setdefault("payload", {})
+                                attempts = payload.setdefault("render_attempts", [])
+                                if isinstance(attempts, list):
+                                    attempts.append(
+                                        {
+                                            "attempt": attempt,
+                                            "type": str(
+                                                image_options.get("type", "jpeg")
+                                            ),
+                                            "viewport": viewport_description,
+                                            "duration_ms": duration_ms,
+                                            "status": "failed",
+                                            "error": render_error,
+                                        }
+                                    )
+                                break
+
+                logger.error(f"图片生成未成功，最后一次失败原因：{last_error}")
                 return None, html_content
 
         except Exception as e:

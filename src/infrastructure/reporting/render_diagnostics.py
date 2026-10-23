@@ -16,96 +16,99 @@ from ...shared.trace_context import TraceContext
 from ...utils.template_utils import render_template
 
 
-def diagnose_non_image_payload(data: bytes) -> str:
-    """从非图片响应（文本/HTML/JSON/错误流/未知二进制）中提取可读的诊断排查指引。
+def summarize_render_error(text: str) -> str:
+    """整理渲染错误摘要，隐藏常见凭据并限制输出长度。
 
     Args:
-        data: 渲染服务返回的原始响应前置或全量字节流。
+        text: 响应片段或异常消息。
 
     Returns:
-        人类可读的错误描述与排查指引文本。
+        适合日志和任务详情展示的单行摘要。
+    """
+    text = re.sub(r"https?://[^\s<>\"']+", "[地址已隐藏]", text, flags=re.I)
+    text = re.sub(r"\b(Bearer|Basic)\s+[^\s,;\"']+", r"\1 [已隐藏]", text, flags=re.I)
+    text = re.sub(
+        r"""(?ix)(["']?(?:authorization|cookie|set-cookie|token|access_token|
+        refresh_token|api[_-]?key|password|secret)["']?\s*[:=]\s*)
+        (?:"[^"]*"|'[^']*'|[^\s,;}]+)""",
+        r"\1[已隐藏]",
+        text,
+    )
+    text = re.sub(r"\s+", " ", text).strip()
+    return text[:300] + ("…" if len(text) > 300 else "")
+
+
+def diagnose_non_image_payload(data: bytes) -> str:
+    """从非图片响应中提取有限的错误信息，不推断 HTTP 状态或故障原因。
+
+    Args:
+        data: 服务响应的前置片段。
+
+    Returns:
+        错误摘要，以及与已知信息分开标注的排查建议。
     """
     if not data:
-        return "返回数据为空 (0 字节)"
+        return "渲染服务返回了空内容。"
 
-    # 尝试将前置数据解码为可读文本
     text = ""
-    for encoding in ("utf-8", "gbk", "latin-1"):
+    for encoding in ("utf-8", "gbk"):
         try:
             text = data.decode(encoding).strip()
             break
-        except Exception:
+        except UnicodeDecodeError:
             continue
+    if not text or any(ord(char) < 32 and char not in "\t\r\n" for char in text):
+        return "渲染服务返回了无法识别的数据，未得到可用图片。"
 
-    # 1. 成功解码为可读文本
-    if text:
-        # 1.1 JSON 格式错误处理
-        if (text.startswith("{") and text.endswith("}")) or (
-            text.startswith("[") and text.endswith("]")
+    response_kind = "文字"
+    try:
+        payload = json.loads(text)
+    except ValueError:
+        payload = None
+    if isinstance(payload, (dict, list)):
+        response_kind = "JSON"
+        if isinstance(payload, dict):
+            detail = (
+                payload.get("detail") or payload.get("error") or payload.get("message")
+            )
+            text = str(detail) if detail else json.dumps(payload, ensure_ascii=False)
+    elif "<html" in text.lower() or "<!doctype html" in text.lower():
+        response_kind = "网页"
+        heading = re.search(
+            r"<(?:title|h1)[^>]*>(.*?)</(?:title|h1)>", text, re.I | re.S
+        )
+        # 不输出整个错误页，避免混入页面正文或脚本。
+        text = re.sub(r"<[^>]+>", "", heading.group(1)) if heading else ""
+
+    summary = summarize_render_error(text)
+    if summary:
+        diagnosis = f"渲染服务返回了{response_kind}内容，未得到图片：{summary}"
+        # 只把响应中的线索作为排查方向，不据此认定状态码或根因。
+        hint = ""
+        normalized = summary.casefold()
+        if "bad gateway" in normalized or "gateway timeout" in normalized:
+            hint = (
+                "请查看同一时间的反向代理和 T2I 服务日志，"
+                "确认渲染服务是否正常运行，以及代理能否连接到它。"
+            )
+        elif "internal server error" in normalized:
+            hint = (
+                "请先查看同一时间的 T2I 服务日志。"
+                "如果日志提到浏览器退出、内存不足或文件不存在，"
+                "再检查浏览器运行情况、可用内存或文件挂载。"
+            )
+        elif (
+            "timeout" in normalized or "timed out" in normalized or "超时" in normalized
         ):
-            try:
-                payload = json.loads(text)
-                if isinstance(payload, dict):
-                    detail = (
-                        payload.get("detail")
-                        or payload.get("error")
-                        or payload.get("message")
-                        or str(payload)
-                    )
-                    if isinstance(detail, str):
-                        if "Timeout" in detail or "timeout" in detail:
-                            return (
-                                f"T2I 渲染超时 (JSON 错误: {detail}) - "
-                                f"通常因外链 CDN 资源/大字体包下载过慢引起，建议在配置中切换访问环境为 Overseas 或调大渲染超时 (ms)"
-                            )
-                        return f"T2I 接口返回 JSON 错误: {detail}"
-            except Exception:
-                pass
-
-        # 1.2 HTML 页面错误处理
-        text_lower = text.lower()
-        if "<html" in text_lower or "<!doctype html" in text_lower:
-            title_match = re.search(
-                r"<title>(.*?)</title>", text, re.IGNORECASE | re.DOTALL
+            hint = (
+                "请先查看同一时间的 T2I 服务日志。"
+                "如果日志显示页面资源加载超时，再检查模板图片、字体等 CDN 资源"
+                "在渲染服务所在环境中能否访问；确认资源可达后，再考虑调整渲染超时时间。"
             )
-            h1_match = re.search(r"<h1>(.*?)</h1>", text, re.IGNORECASE | re.DOTALL)
-            title = (
-                title_match.group(1).strip()
-                if title_match
-                else (h1_match.group(1).strip() if h1_match else "")
-            )
-            if title:
-                return f"HTML 错误页:「{title}」(T2I 渲染端点返回了网页响应而非图片)"
-            clean_snippet = re.sub(r"\s+", " ", text[:120]).strip()
-            return f"HTML 响应内容: {clean_snippet}..."
-
-        # 1.3 常见纯文本错误模式识别
-        if "Internal Server Error" in text:
-            return (
-                f"HTTP 500 (Internal Server Error) - T2I 服务内部发生异常。"
-                f"常见根因: Playwright 页面超时（外部大字体包/图片 CDN 握手丢包）、"
-                f"数据卷未挂载共享（找不到 /app/data/*.html）或容器 Chromium 沙箱/内存不足崩溃。"
-                f"原始返回:「{text[:100].strip()}」"
-            )
-        if "Bad Gateway" in text:
-            return "HTTP 502 (Bad Gateway) - T2I 反向代理网关未收到上游服务响应"
-        if "Gateway Timeout" in text:
-            return "HTTP 504 (Gateway Timeout) - T2I 服务网关请求超时"
-        if "Timeout" in text or "TimeoutError" in text:
-            return (
-                f"T2I 页面加载超时 (Playwright Timeout): {text[:150].strip()} - "
-                f"建议检查外链 CDN 连通性、配置 IPv4 优先或放宽超时时间"
-            )
-
-        clean_text = re.sub(r"\s+", " ", text[:150]).strip()
-        return f"纯文本响应 (非图片):「{clean_text}」"
-
-    # 2. 无法解码为文本的未知二进制数据
-    head_hex = data[:16].hex()
-    return (
-        f"未知二进制数据 (大小: {len(data)} 字节, 头部 Hex: {head_hex}) - "
-        f"如持续出现，建议检查 T2I 容器日志 (podman/docker logs) 或向社区提交反馈并附带该 Hex 头部"
-    )
+        if hint:
+            diagnosis += f"\n排查建议：{hint}"
+        return diagnosis
+    return f"渲染服务返回了{response_kind}内容，未得到图片。"
 
 
 def resolve_t2i_viewport_options(
