@@ -76,12 +76,10 @@
             background-image:
                 linear-gradient(rgba(240, 250, 250, 0.95), rgba(240, 250, 250, 0.95)),
                 linear-gradient(rgba(57, 197, 187, 0.04) 1px, transparent 1px),
-                linear-gradient(90deg, rgba(57, 197, 187, 0.04) 1px, transparent 1px),
-                url("uploaded:1000085447.jpg-3b0f6c59-ab08-439d-8677-540b0f863dd4"),
-                url("uploaded:1000085458.jpg-b0f7380c-d0a5-4741-acb2-9d2e53618190");
-            background-size: initial, 30px 30px, 30px 30px, cover, cover;
-            background-repeat: repeat, repeat, repeat, no-repeat, no-repeat;
-            background-position: center, center, center, left top, right bottom;
+                linear-gradient(90deg, rgba(57, 197, 187, 0.04) 1px, transparent 1px);
+            background-size: initial, 30px 30px, 30px 30px;
+            background-repeat: repeat, repeat, repeat;
+            background-position: center, center, center;
             background-attachment: fixed;
 
             padding: 40px 20px;
@@ -143,22 +141,6 @@
             color: var(--miku-dark);
             opacity: 0.1;
             letter-spacing: 2px;
-            z-index: -1;
-            pointer-events: none;
-        }
-
-        .deco-image {
-            position: absolute;
-            bottom: -50px;
-            right: -50px;
-            width: 400px;
-            height: 400px;
-            background-image: url("uploaded:1000086171.jpg-732c113a-d6b5-4526-8cb8-edc6d9b9ab19");
-            background-size: cover;
-            background-position: center;
-            opacity: 0.05;
-            border-radius: 50%;
-            filter: blur(2px) grayscale(20%) sepia(50%) hue-rotate(130deg);
             z-index: -1;
             pointer-events: none;
         }
@@ -1522,7 +1504,6 @@
         <div class="deco-01">01</div>
         <div class="deco-39">39</div>
         <div class="deco-sys">[ SYSTEM_VOCALOID_INITIALIZED ]<br>HATSUNE MIKU v4X</div>
-        <div class="deco-image"></div>
 
         <div class="header">
             <h1>{{ T.title[REPORT_LANG] }}</h1>

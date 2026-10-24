@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 from typing import TYPE_CHECKING
+from urllib.parse import urlsplit
 
 from ...utils.logger import logger
 
@@ -188,14 +189,19 @@ def resolve_profile_info(
     name_zh = str(base_info.get("name_zh", "")).strip()
     asset_code = str(base_info.get("asset_code", code)).strip() or code
     image = str(base_info.get("image", "")).strip()
+    system_manifest = manifest.get(profile_mode, {})
+    asset_item = system_manifest.get(asset_code)
+    manifest_image = (
+        str(asset_item.get("file", "")).strip() if isinstance(asset_item, dict) else ""
+    )
+    # 旧配置会填入默认图片地址；只有与清单相同的地址才视为内置图片。
+    builtin_image = not image or image == manifest_image
 
     # 2. 图片与属性补全 (基于 manifest.json 可信源)
     if not image:
-        system_manifest = manifest.get(profile_mode, {})
         # A. 优先按 asset_code 索引
-        asset_item = system_manifest.get(asset_code)
         if isinstance(asset_item, dict):
-            image = str(asset_item.get("file", "")).strip()
+            image = manifest_image
             if not name_zh:
                 name_zh = str(asset_item.get("name", "")).strip()
 
@@ -216,6 +222,11 @@ def resolve_profile_info(
                     name_zh = str(fallback_item.get("name", "")).strip()
                 if not code or code == normalized_mbti:
                     code = str(fallback_item.get("code", code)).strip()
+
+    if builtin_image and image:
+        image_path = urlsplit(image).path
+        if image_path.startswith(f"/gh/SXP-Simon/profile_assets@main/{profile_mode}/"):
+            image = f"{config_manager.get_t2i_cdn_base_url()}{image_path}"
 
     # 3. 构造显示文本 (Code + 中文名)
     display = str(base_info.get("display", "")).strip()
