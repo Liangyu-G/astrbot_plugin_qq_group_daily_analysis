@@ -4,6 +4,8 @@ export const DEFAULT_TEMPLATE_CDN_BASE_URL = "https://cdn.jsdmirror.com";
 export const TEMPLATE_CDN_PRESETS = [
   { value: DEFAULT_TEMPLATE_CDN_BASE_URL, label: "国内可先试 · JSDMirror（默认） · https://cdn.jsdmirror.com" },
   { value: "https://cdn.jsdmirror.cn", label: "国内备选 · JSDMirror CN · https://cdn.jsdmirror.cn" },
+  { value: "https://jsd.cdn.noisework.cn", label: "备选 · NOISE · https://jsd.cdn.noisework.cn" },
+  { value: "https://cdn.bili33.top", label: "备选 · 哔哩 CDN · https://cdn.bili33.top" },
   { value: "https://cdn.jsdelivr.net", label: "海外可先试 · jsDelivr · https://cdn.jsdelivr.net" },
   { value: "https://fastly.jsdelivr.net", label: "海外备选 · Fastly · https://fastly.jsdelivr.net" },
   { value: "https://gcore.jsdelivr.net", label: "海外备选 · Gcore · https://gcore.jsdelivr.net" },
