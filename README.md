@@ -567,7 +567,7 @@ AstrBot 更新插件时会先删除旧插件目录，再解压或移动新目录
 
 > [!IMPORTANT]
 > **排查手段 1：外链大字体包/图片 CDN 下载阻塞（国内服务器高发）**
-> - **模板图片加载慢时，可以换个 CDN**：在插件 WebUI 的「图片渲染策略 → 模板资源 CDN 基础地址」选择预设，也可以手填支持 `/gh/` 和 `/npm/` 的网站地址。国内网络可先试 JSDMirror（`https://cdn.jsdmirror.com/`、`https://cdn.jsdmirror.cn/`）；海外网络可先试 jsDelivr（`https://cdn.jsdelivr.net/`），或 Fastly、Gcore 入口（`https://fastly.jsdelivr.net/`、`https://gcore.jsdelivr.net/`）。每次使用一个地址，使用前请测试实际网络的速度和可达性。点「检测可用性」会检查机器人所在服务器能否访问模板资源及 npm 链接，只请求响应头，不下载文件；使用远程图片渲染服务时，请再生成一份报告确认。内置 SBTI、ACGTI 图片也使用所选 CDN，用户自定义图片和 Google 字体仍按各自设置加载。
+> - **模板图片加载慢时，可以换个 CDN**：在插件 WebUI 的「图片渲染策略 → 模板资源 CDN 基础地址」选择预设，也可以手填支持 `/gh/` 和 `/npm/` 的网站地址。国内网络可先试 JSDMirror（`https://cdn.jsdmirror.com/`、`https://cdn.jsdmirror.cn/`），另提供 NOISE（`https://jsd.cdn.noisework.cn/`）和哔哩 CDN（`https://cdn.bili33.top/`）备选，请按实际网络检测选用。海外网络可先试 jsDelivr（`https://cdn.jsdelivr.net/`），或 Fastly、Gcore 入口（`https://fastly.jsdelivr.net/`、`https://gcore.jsdelivr.net/`）。每次使用一个地址，使用前请测试实际网络的速度和可达性。点「检测可用性」会检查机器人所在服务器能否访问模板资源及 npm 链接，只请求响应头，不下载文件；使用远程图片渲染服务时，请再生成一份报告确认。内置 SBTI、ACGTI 图片也使用所选 CDN，用户自定义图片和 Google 字体仍按各自设置加载。
 > - **原因**：Playwright `page.goto` 默认使用 `wait_until="load"` 策略，会阻塞等待 HTML 报告中引入的所有外链 CSS、字体包及角色立绘图片全部下载完毕。部分精美模板包含 30MB+ 的中文字体文件或引用的海外 CDN（如 jsDelivr/Fastly），若国内服务器网络波动，50 秒内未全部下载完毕便会触发超时抛出 500。
 > - **解决方案**：
 >   1. **优先走 IPv4 路由（推荐）**：国内云服务器（如腾讯云/阿里云）默认启用了 IPv6，但访问海外 CDN 经常遭遇 IPv6 握手黑洞（超时等待 15~30s）。在宿主机编辑 `/etc/gai.conf`，追加 `precedence ::ffff:0:0/96 100` 强制系统优先走 IPv4。
