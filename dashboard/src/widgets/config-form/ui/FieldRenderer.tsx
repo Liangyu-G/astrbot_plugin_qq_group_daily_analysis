@@ -26,6 +26,7 @@ import {
   ExclamationCircleFilled,
 } from "@ant-design/icons";
 import { resolveOptionLabel } from "../../../entities/config/model/optionLabel";
+import { TEMPLATE_CDN_PRESETS } from "../../../entities/config/model/renderingConfig";
 import { SchemaFieldItem } from "../../../entities/config/model/types";
 import {
   AvailableProvider,
@@ -174,13 +175,18 @@ export const FieldRenderer: React.FC<FieldRendererProps> = ({
         : String(value);
       return (
         <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
-          <Input
+          <AutoComplete
             value={currentValue}
-            onChange={(event) => onChange(event.target.value)}
-            placeholder="https://fastly.jsdelivr.net/"
+            options={TEMPLATE_CDN_PRESETS}
+            onChange={onChange}
             status={error ? "error" : undefined}
-            allowClear
-          />
+          >
+            <Input
+              aria-label={title}
+              placeholder="选择一个预设地址，也可以自己填写"
+              allowClear
+            />
+          </AutoComplete>
           <TemplateCdnProbe baseUrl={currentValue} />
         </div>
       );

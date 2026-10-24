@@ -1,6 +1,13 @@
 import { z } from "zod";
 
 export const DEFAULT_TEMPLATE_CDN_BASE_URL = "https://cdn.jsdmirror.com";
+export const TEMPLATE_CDN_PRESETS = [
+  { value: DEFAULT_TEMPLATE_CDN_BASE_URL, label: "国内可先试 · JSDMirror（默认） · https://cdn.jsdmirror.com" },
+  { value: "https://cdn.jsdmirror.cn", label: "国内备选 · JSDMirror CN · https://cdn.jsdmirror.cn" },
+  { value: "https://cdn.jsdelivr.net", label: "海外可先试 · jsDelivr · https://cdn.jsdelivr.net" },
+  { value: "https://fastly.jsdelivr.net", label: "海外备选 · Fastly · https://fastly.jsdelivr.net" },
+  { value: "https://gcore.jsdelivr.net", label: "海外备选 · Gcore · https://gcore.jsdelivr.net" },
+];
 export const CDN_FORMAT_ERROR = "请填完整的网站地址，例如 https://fastly.jsdelivr.net/，不要带账号密码、文件路径或 ?、# 后面的内容";
 
 // 与后端 cdn_utils 共用边界用例；仅接受域名（国际化域名用 Punycode）或 IPv6。
