@@ -1407,13 +1407,18 @@ class ConfigManager:
         prompts_config = self._get_group("prompts").get("comic_analysis_prompts", {})
         return prompts_config.get(style, "")
 
-    def save_config(self):
-        """保存配置到AstrBot配置系统"""
+    def save_config(self) -> None:
+        """保存配置到 AstrBot 配置系统，失败时交由调用方处理。
+
+        Raises:
+            Exception: AstrBot 保存配置时发生的原始异常。
+        """
         try:
             self.config.save_config()
             logger.info("配置已保存")
         except Exception as e:
             logger.error(f"保存配置失败: {e}")
+            raise
 
     def reload_config(self):
         """重新加载配置"""
